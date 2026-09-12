@@ -1,0 +1,5 @@
+{
+    "EnableCheckVersion": false,
+    "EnableAutoUpdateResource": false,
+    "EnableAutoUpdateMFA": false
+}

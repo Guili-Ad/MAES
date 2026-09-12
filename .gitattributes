@@ -1,0 +1,16 @@
+* text=auto
+
+*.whl binary
+*.zip binary
+*.dll binary
+*.pyd binary
+*.node binary
+*.exe binary
+*.onnx binary
+*.png binary
+*.ico binary
+
+*.ps1 text
+*.py text
+*.json text
+*.md text

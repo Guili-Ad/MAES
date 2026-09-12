@@ -1,0 +1,65 @@
+{
+    "interface_version": 2,
+    "name": "MAES",
+    "label": "MAES 偶像梦幻祭2助手",
+    "title": "MAES v1.0.0-Stable",
+    "version": "1.0.0-Stable",
+    "description": "基于 MaaFramework 5.12.2 独立实现的《偶像梦幻祭2》打歌自动化项目，当前聚焦临时打歌与点位校准。",
+    "license": "LICENSE.md",
+    "welcome": "首次使用临时打歌前必须建立 V4 点位校准；7轨直接进入实时跟踪，9轨仅做候选识别实验。若打歌出现触控异常，可在歌曲暂停页手动运行“打歌触控能力检测”诊断。",
+    "agent": {
+        "child_exec": "runtime/python/python.exe",
+        "child_args": [
+            "-B",
+            "-u",
+            "agent/main.py"
+        ],
+        "timeout": 8
+    },
+    "controller": [
+        {
+            "name": "AndroidAdb",
+            "label": "安卓模拟器",
+            "description": "通过通用 ADB 自动发现设备；不保存固定安装路径或端口。",
+            "type": "Adb",
+            "display_short_side": 720,
+            "display_raw": false
+        }
+    ],
+    "resource": [
+        {
+            "name": "Official",
+            "label": "官服",
+            "path": [
+                "resource/base"
+            ],
+            "controller": [
+                "AndroidAdb"
+            ]
+        }
+    ],
+    "task": [
+        {
+            "name": "打歌触控能力检测",
+            "entry": "MusicTouchProbe",
+            "default_check": false,
+            "description": "触控异常时的诊断工具：仅在歌曲暂停窗口和安全区域运行，检测原生 Touch 基础动作、多指触控与延迟。正常打歌无需预先运行；打歌触控异常时用它定位问题。"
+        },
+        {
+            "name": "打歌点位校准",
+            "entry": "MusicCalibration",
+            "description": "必须在 1280x720 进行页且判定点清晰可见时执行。V4 按“7/9轨@1280x720”保存轨道折线、候选 ROI 和视觉基线；V3 会被明确拒绝。"
+        },
+        {
+            "name": "临时打歌",
+            "entry": "MusicPlayStage",
+            "description": "7轨 V4 入口，从已恢复的演唱会进行页开始。运行前请确认 MFAAvalonia 设备输入模式为 Default 或 Maatouch（MuMu 模拟器默认即满足；若设为 AdbShell 会导致点击延迟与长按失效）。页面与校准检查后立即进入实时跟踪，运行性能超出目标时只记录告警、不丢弃开场音符；Tap/Flick 使用原生动作，Hold/多触点默认启用。若打歌时触控异常，可在歌曲暂停页手动运行“打歌触控能力检测”诊断。"
+        },
+        {
+            "name": "临时打歌（9轨实验）",
+            "entry": "MusicPlayStage9Experimental",
+            "default_check": false,
+            "description": "9轨 V4 实验入口仅执行校准、候选回归和 Provider 兼容性预检，不发送正式打歌动作。"
+        }
+    ]
+}

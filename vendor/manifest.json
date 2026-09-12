@@ -1,0 +1,14 @@
+{
+    "gui": {
+        "name": "MFAAvalonia",
+        "version": "2.12.2",
+        "platform": "win-x64",
+        "source": "https://github.com/MaaXYZ/MFAAvalonia/releases/tag/v2.12.2",
+        "archive": "MFAAvalonia-v2.12.2-win-x64.zip",
+        "archive_sha256": "AC589E7F1EF4393B546186B71AA6A8A51DD5B459111E4A181E26B9107B582033",
+        "license": "GPL-3.0",
+        "bundled_maafw": "5.11.1",
+        "packaging_override_maafw": "5.12.2"
+    }
+}
+

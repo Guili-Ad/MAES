@@ -1,0 +1,41 @@
+{
+    "policy": "music-only scope: lane judge-point template is self-captured; OCR models are PaddleOCR Apache-2.0.",
+    "release_blocked": false,
+    "assets": [
+        {
+            "path": "resource/base/image/music_lane_judge_point.png",
+            "source": "MAES self-captured 2026-09-12",
+            "sha256": "a2b350bb70a470412d6fc1a18df9ba1b392152b492883bd737ae63d8aa11f969",
+            "status": "self_captured",
+            "release_allowed": true
+        },
+        {
+            "path": "resource/base/model/ocr/det.onnx",
+            "source": "PaddleOCR PP-OCRv4 (ch_PP-OCRv4_det / ch_PP-OCRv4_rec / ppocr_keys_v1.txt)",
+            "sha256": "767e663dded50813dca0abc9a49859e345e0f74a48b387661188f096a9211d74",
+            "status": "upstream_apache2",
+            "release_allowed": true
+        },
+        {
+            "path": "resource/base/model/ocr/rec.onnx",
+            "source": "PaddleOCR PP-OCRv4 (ch_PP-OCRv4_det / ch_PP-OCRv4_rec / ppocr_keys_v1.txt)",
+            "sha256": "da4815ea386ee8083be319da8d20e70f4fdb0b6404ba0d2da7f675831e1b37fa",
+            "status": "upstream_apache2",
+            "release_allowed": true
+        },
+        {
+            "path": "resource/base/model/ocr/keys.txt",
+            "source": "PaddleOCR PP-OCRv4 (ch_PP-OCRv4_det / ch_PP-OCRv4_rec / ppocr_keys_v1.txt)",
+            "sha256": "d917d7489d2c20d2e4cee8c17068f8ac54f6ee406a04bf5ac3b1ff5dc38e1e52",
+            "status": "upstream_apache2",
+            "release_allowed": true
+        },
+        {
+            "path": "resource/base/model/ocr/README.md",
+            "source": "PaddleOCR PP-OCRv4 (ch_PP-OCRv4_det / ch_PP-OCRv4_rec / ppocr_keys_v1.txt)",
+            "sha256": "0524b253496b3e225f10ff24dad5d47456e0b1022e2449d8f8794e7b93a59d4c",
+            "status": "upstream_apache2",
+            "release_allowed": true
+        }
+    ]
+}

@@ -1,0 +1,14 @@
+{
+  "UseSeparateScreenshotTasker": true,
+  "UI.LiveView.EnableLiveView": true,
+  "InstanceName": "music",
+  "CurrentTasks": [
+    "MusicCalibration",
+    "MusicPlayStage",
+    "MusicTouchProbe",
+    "MusicPlayStage9Experimental"
+  ],
+  "TaskItems": [],
+  "Resource": "Official",
+  "CurrentControllerName": "AndroidAdb"
+}

@@ -1,0 +1,501 @@
+{
+    "MusicCalibration": {
+        "doc": "V4 calibration only transforms built-in 7/9-lane geometry from confirmed lane targets.",
+        "recognition": {
+            "type": "Or",
+            "param": {
+                "any_of": [
+                    "MusicLiveScreen",
+                    "MusicLiveClearScreen"
+                ]
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "MusicCalibrate"
+            }
+        },
+        "on_error": [
+            "MusicCalibrationFailed"
+        ]
+    },
+    "MusicCalibrationFailed": {
+        "focus": "[ERR] 打歌 V4 校准失败",
+        "recognition": {
+            "type": "DirectHit"
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportTaskFailure",
+                "custom_action_param": {
+                    "message": "打歌 V4 校准失败：必须确认 1280x720 进行页并明确识别 7 或 9 个判定点；V3 配置不会继续使用"
+                }
+            }
+        }
+    },
+    "MusicTouchProbe": {
+        "doc": "Probe direct Click/Swipe and advanced contacts only on a confirmed pause dialog and safe area.",
+        "recognition": {
+            "type": "OCR",
+            "param": {
+                "roi": [
+                    580,
+                    155,
+                    120,
+                    70
+                ],
+                "only_rec": true,
+                "expected": [
+                    "暂停"
+                ]
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "MusicTouchProbe"
+            }
+        },
+        "on_error": [
+            "MusicTouchProbeFailed"
+        ]
+    },
+    "MusicTouchProbeFailed": {
+        "focus": "[ERR] 打歌触控能力检测失败",
+        "recognition": {
+            "type": "DirectHit"
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportTaskFailure",
+                "custom_action_param": {
+                    "message": "触控探针失败：请保持歌曲暂停窗口可见并重新连接模拟器；普通打歌仍会在未熔断时使用原生 Touch 兼容模式（Tap/Flick 走 Touch 事件）"
+                }
+            }
+        }
+    },
+    "MusicPlayStage": {
+        "doc": "Stable 7-lane V4 stage: enter live tracking immediately, then handle result/reward screens.",
+        "recognition": {
+            "type": "DirectHit"
+        },
+        "action": {
+            "type": "DoNothing"
+        },
+        "next": [
+            "MusicPlayRun7"
+        ],
+        "on_error": [
+            "MusicPlayFailureDispatch"
+        ]
+    },
+    "MusicPlayPreflight7": {
+        "recognition": {
+            "type": "DirectHit"
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "MusicPreflight",
+                "custom_action_param": {
+                    "lane_count": 7
+                }
+            }
+        },
+        "next": [
+            "MusicPlayRun7"
+        ],
+        "on_error": [
+            "MusicPlayFailureDispatch"
+        ]
+    },
+    "MusicPlayRun7": {
+        "recognition": {
+            "type": "DirectHit"
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "MusicPlay",
+                "custom_action_param": {
+                    "lane_count": 7,
+                    "enable_holds": true
+                }
+            }
+        },
+        "timeout": 600000,
+        "next": [],
+        "on_error": [
+            "MusicPlayFailureDispatch"
+        ]
+    },
+    "MusicPlayStage9Experimental": {
+        "doc": "9-lane V4 remains recognition/preflight only and sends no formal music actions.",
+        "recognition": {
+            "type": "DirectHit"
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "MusicPreflight",
+                "custom_action_param": {
+                    "lane_count": 9,
+                    "experimental_only": true
+                }
+            }
+        },
+        "next": [],
+        "on_error": [
+            "MusicPlayFailureDispatch"
+        ]
+    },
+    "MusicPlayFailureDispatch": {
+        "recognition": {
+            "type": "DirectHit"
+        },
+        "action": {
+            "type": "DoNothing"
+        },
+        "next": [
+            "MusicPlayPausedFailure",
+            "MusicPlayCalibrationFailure",
+            "MusicPlayPerformanceFailure",
+            "MusicPlayRecognitionFailure",
+            "MusicPlayTouchFailure",
+            "MusicPlayCancelledFailure",
+            "MusicPlayTimeoutFailure",
+            "MusicPlayInternalFailure"
+        ]
+    },
+    "MusicPlayPausedFailure": {
+        "focus": "[ERR] 临时打歌被暂停页拒绝",
+        "recognition": {
+            "type": "Custom",
+            "param": {
+                "custom_recognition": "MusicFailureCodeRecognition",
+                "custom_recognition_param": {
+                    "codes": [
+                        "paused_before_start",
+                        "invalid_live_screen"
+                    ]
+                }
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportMusicFailure"
+            }
+        }
+    },
+    "MusicPlayCalibrationFailure": {
+        "focus": "[ERR] 临时打歌 V4 校准无效",
+        "recognition": {
+            "type": "Custom",
+            "param": {
+                "custom_recognition": "MusicFailureCodeRecognition",
+                "custom_recognition_param": {
+                    "code": "invalid_calibration"
+                }
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportMusicFailure"
+            }
+        }
+    },
+    "MusicPlayPerformanceFailure": {
+        "focus": "[ERR] 临时打歌性能闸门拒绝",
+        "recognition": {
+            "type": "Custom",
+            "param": {
+                "custom_recognition": "MusicFailureCodeRecognition",
+                "custom_recognition_param": {
+                    "code": "performance_rejected"
+                }
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportMusicFailure"
+            }
+        }
+    },
+    "MusicPlayRecognitionFailure": {
+        "focus": "[ERR] 临时打歌识别后端失败",
+        "recognition": {
+            "type": "Custom",
+            "param": {
+                "custom_recognition": "MusicFailureCodeRecognition",
+                "custom_recognition_param": {
+                    "codes": [
+                        "capture_failure",
+                        "candidate_failure"
+                    ]
+                }
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportMusicFailure"
+            }
+        }
+    },
+    "MusicPlayTouchFailure": {
+        "focus": "[ERR] 临时打歌触控后端已熔断",
+        "recognition": {
+            "type": "Custom",
+            "param": {
+                "custom_recognition": "MusicFailureCodeRecognition",
+                "custom_recognition_param": {
+                    "code": "touch_backend_fused"
+                }
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportMusicFailure"
+            }
+        }
+    },
+    "MusicPlayCancelledFailure": {
+        "focus": "[ERR] 临时打歌已取消",
+        "recognition": {
+            "type": "Custom",
+            "param": {
+                "custom_recognition": "MusicFailureCodeRecognition",
+                "custom_recognition_param": {
+                    "code": "cancelled"
+                }
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportMusicFailure"
+            }
+        }
+    },
+    "MusicPlayTimeoutFailure": {
+        "focus": "[ERR] 临时打歌超时",
+        "recognition": {
+            "type": "Custom",
+            "param": {
+                "custom_recognition": "MusicFailureCodeRecognition",
+                "custom_recognition_param": {
+                    "code": "song_timeout"
+                }
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportMusicFailure"
+            }
+        }
+    },
+    "MusicPlayInternalFailure": {
+        "focus": "[ERR] 临时打歌内部异常",
+        "recognition": {
+            "type": "Custom",
+            "param": {
+                "custom_recognition": "MusicFailureCodeRecognition",
+                "custom_recognition_param": {
+                    "codes": [
+                        "internal_error",
+                        "none"
+                    ]
+                }
+            }
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ReportMusicFailure"
+            }
+        }
+    },
+    "MusicLaneTargets": {
+        "doc": "Calibration-only lane target recognition; never used by the realtime note loop.",
+        "recognition": {
+            "type": "TemplateMatch",
+            "param": {
+                "order_by": "Horizontal",
+                "threshold": 0.7,
+                "roi": [
+                    0,
+                    166,
+                    1280,
+                    554
+                ],
+                "template": "music_lane_judge_point.png"
+            }
+        },
+        "action": {
+            "type": "DoNothing"
+        }
+    },
+    "MusicNoteCandidates": {
+        "doc": "Realtime native ColorMatch candidate provider. V4 overrides ROI, HSV ranges and count once per call.",
+        "rate_limit": 0,
+        "pre_delay": 0,
+        "post_delay": 0,
+        "recognition": {
+            "type": "ColorMatch",
+            "param": {
+                "roi": [
+                    0,
+                    166,
+                    1280,
+                    554
+                ],
+                "method": 40,
+                "lower": [
+                    [
+                        0,
+                        45,
+                        110
+                    ]
+                ],
+                "upper": [
+                    [
+                        179,
+                        255,
+                        255
+                    ]
+                ],
+                "count": 12,
+                "order_by": "Area",
+                "connected": true
+            }
+        },
+        "action": {
+            "type": "DoNothing"
+        }
+    },
+    "MusicPauseDialog": {
+        "doc": "Reliable dedicated pause-dialog ROI, polled at 250 ms by MusicPlay.",
+        "recognition": {
+            "type": "OCR",
+            "param": {
+                "roi": [
+                    580,
+                    155,
+                    120,
+                    70
+                ],
+                "only_rec": true,
+                "expected": [
+                    "暂停"
+                ]
+            }
+        },
+        "action": {
+            "type": "DoNothing"
+        }
+    },
+    "MusicLiveScreen": {
+        "doc": "Dedicated live-screen heartbeat ROI.",
+        "recognition": {
+            "type": "OCR",
+            "param": {
+                "roi": [
+                    7,
+                    7,
+                    416,
+                    71
+                ],
+                "expected": [
+                    "演唱会热度"
+                ]
+            }
+        },
+        "action": {
+            "type": "DoNothing"
+        }
+    },
+    "MusicLiveClearScreen": {
+        "doc": "Dedicated live-screen heartbeat for CLEAR-labelled layouts.",
+        "recognition": {
+            "type": "OCR",
+            "param": {
+                "roi": [
+                    7,
+                    7,
+                    416,
+                    71
+                ],
+                "expected": [
+                    "CLEAR"
+                ]
+            }
+        },
+        "action": {
+            "type": "DoNothing"
+        }
+    },
+    "MusicResultLoading": {
+        "doc": "Strict temporary-play finish signal: bottom-right loading text only.",
+        "recognition": {
+            "type": "OCR",
+            "param": {
+                "roi": [
+                    960,
+                    540,
+                    320,
+                    180
+                ],
+                "only_rec": true,
+                "expected": "^载入中.*$"
+            }
+        },
+        "action": {
+            "type": "DoNothing"
+        }
+    },
+    "MusicResultLive": {
+        "doc": "Strict temporary-play finish signal: giant black LIVE text on the central white card of the black transition screen.",
+        "recognition": {
+            "type": "OCR",
+            "param": {
+                "threshold": 0.7,
+                "roi": [
+                    360,
+                    280,
+                    560,
+                    170
+                ],
+                "only_rec": true,
+                "expected": [
+                    "LIVE"
+                ]
+            }
+        },
+        "action": {
+            "type": "DoNothing"
+        }
+    },
+    "MusicTerminalState": {
+        "doc": "Low-frequency Or aggregation of independent terminal ROIs; no stitched OCR image.",
+        "recognition": {
+            "type": "Or",
+            "param": {
+                "any_of": [
+                    "MusicResultLoading",
+                    "MusicResultLive"
+                ]
+            }
+        },
+        "action": {
+            "type": "DoNothing"
+        }
+    }
+}

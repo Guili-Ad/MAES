@@ -1,0 +1,37 @@
+{
+    "platform": "windows-x64",
+    "python": {
+        "version": "3.12.10",
+        "distribution": "official-embeddable",
+        "source": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
+        "archive_sha256": "4ACBED6DD1C744B0376E3B1CF57CE906F9DC9E95E68824584C8099A63025A3C3"
+    },
+    "packages": [
+        {
+            "name": "maafw",
+            "version": "5.12.2",
+            "file": "maafw-5.12.2-py3-none-win_amd64.whl",
+            "sha256": "2B3F9426536529021AD6A91AF93CD44B8C647D1862EA2217689C052D7A7615F0"
+        },
+        {
+            "name": "numpy",
+            "version": "2.2.6",
+            "file": "numpy-2.2.6-cp312-cp312-win_amd64.whl",
+            "sha256": "C1F9540BE57940698ED329904DB803CF7A402F3FC200BFE599334C9BD84A40B2"
+        },
+        {
+            "name": "MaaAgentBinary",
+            "version": "1.0.1",
+            "file": "MaaAgentBinary-1.0.1-py3-none-any.whl",
+            "sha256": "D97BCC9F35B52ADD199B287932511ECFCDDCB83930C6B532D1C7010B432EC8BF"
+        },
+        {
+            "name": "StrEnum",
+            "version": "0.4.15",
+            "file": "StrEnum-0.4.15-py3-none-any.whl",
+            "sha256": "A30CDA4AF7CC6B5BF52C8055BC4BF4B2B6B14A93B574626DA33DF53CF7740659"
+        }
+    ],
+    "startup_installs_packages": false
+}
+

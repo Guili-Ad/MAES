@@ -1,0 +1,225 @@
+"""Failure shapes from Test1, with no runtime song timings/actions."""
+import sys
+import unittest
+from pathlib import Path
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from test_longtap_branch import calibration, candidate_at
+from test_tap_identity_v3 import history
+from agent.music.models import MusicConfig, MusicFrame, NoteGesture, NoteTrack, TrackState, MusicActionEvent
+from agent.music.tracking import MusicVisionEngine, assign_lane, project_to_polyline
+from agent.music.tap_recovery import recover_masked_taps
+from agent.music.runtime import MusicRuntime, RuntimeMetrics
+from agent.music.executor import MusicActionExecutor
+from agent.music.vision import VisualMask
+from agent.music.holds import HoldTailDetection
+from agent.music.tap_identity import stationary_with_moving_witness
+
+
+class SupportV4Tests(unittest.TestCase):
+    def test_local_components_match_shared_implementation_exactly(self):
+        from agent.music.tap_components import local_components
+        from agent.music.vision import connected_components
+        rng=np.random.default_rng(479)
+        for shape in [(0,0),(1,1),(6,9),(64,80)]:
+            for density in (0.,.10,.40,.85,1.):
+                for minimum in (1,12,60):
+                    mask=rng.random(shape)<density
+                    self.assertEqual(local_components(mask,minimum),connected_components(mask,minimum))
+
+    def scene(self, progress=.50):
+        cal = calibration()
+        track = history([(0., progress-.08), (.05, progress-.04), (.10, progress)])
+        track.observations = type(track.observations)(
+            [replace(o, candidate=candidate_at(cal, 3, o.progress, 56)) for o in track.observations],
+            maxlen=track.observations.maxlen)
+        note = candidate_at(cal, 3, progress+.04, 60)
+        image = np.zeros((720,1280,3), np.uint8)
+        yy, xx = np.ogrid[:720,:1280]
+        d=(xx-note.center[0])**2+(yy-note.center[1])**2
+        image[d<30**2]=(180,220,20)
+        image[d<7**2]=255
+        engine=MusicVisionEngine(cal,MusicConfig())
+        engine.tracks[1], engine.next_track_id=track,2
+        frame=MusicFrame(3,.15,.15,.15,image)
+        return engine,track,note,frame
+
+    def test_confirmed_head_survives_provider_loss_before_judgement_mask(self):
+        e,t,c,f=self.scene()
+        recovered=recover_masked_taps(e.tracks,f,e.calibration,lambda c:assign_lane(c,e.calibration))
+        e._associate_lane(3,[],f,VisualMask.from_image(f.image,e.calibration),recovered)
+        self.assertEqual(t.observations[-1].frame_sequence,3)
+        self.assertAlmostEqual(t.observations[-1].progress,.54,delta=.005)
+        self.assertEqual(len(e.tracks),1)
+
+    def test_recovery_never_creates_a_new_head(self):
+        e,t,c,f=self.scene()
+        self.assertEqual(recover_masked_taps({},f,e.calibration,lambda c:assign_lane(c,e.calibration)),{})
+
+    def test_quarter_second_occlusion_can_rejoin_only_real_pixels(self):
+        e,t,c,f=self.scene()
+        image=np.zeros_like(f.image)
+        note=candidate_at(e.calibration,3,.77,78)
+        yy,xx=np.ogrid[:720,:1280]
+        d=(xx-note.center[0])**2+(yy-note.center[1])**2
+        image[d<39**2]=(180,220,20)
+        image[d<8**2]=255
+        f=MusicFrame(10,.35,.35,.35,image)
+        recovered=recover_masked_taps(e.tracks,f,e.calibration,lambda c:assign_lane(c,e.calibration))
+        self.assertIn(1,recovered)
+        self.assertAlmostEqual(recovered[1][1].progress,.77,delta=.005)
+        self.assertNotIn(1,recover_masked_taps(e.tracks,replace(f,image=np.zeros_like(image)),e.calibration,lambda c:assign_lane(c,e.calibration)))
+
+    def test_missing_owner_does_not_recover_a_following_circle_behind_prediction(self):
+        e,t,c,f=self.scene()
+        f=replace(f,sequence=10,midpoint=.35)
+        self.assertEqual(recover_masked_taps(e.tracks,f,e.calibration,lambda c:assign_lane(c,e.calibration)),{})
+
+    def test_small_centroid_wobble_does_not_disable_recovery(self):
+        e,t,c,f=self.scene()
+        old=t.observations[-1]
+        shifted=replace(old.candidate,center=(old.center[0],old.center[1]-1))
+        t.observations.append(replace(old,frame_sequence=3,timestamp=.12,
+                                     center=shifted.center,candidate=shifted,progress=old.progress-.0017))
+        f=replace(f,sequence=4)
+        self.assertIn(1,recover_masked_taps(e.tracks,f,e.calibration,lambda c:assign_lane(c,e.calibration)))
+
+    def test_acquired_cap_rejects_unconnected_unknown_on_foreign_ray(self):
+        cal=calibration();e=MusicVisionEngine(cal,MusicConfig(enable_holds=True))
+        t=NoteTrack(1,2,gesture=NoteGesture.HOLD_START,state=TrackState.HOLDING,predicted_hit_time=0.)
+        e.tracks[1]=t
+        tail=HoldTailDetection(.22,.9,160,1,(555.,172.),0.,1,'terminal',(2,))
+        f=MusicFrame(1,.25,.25,.25,np.zeros((720,1280,3),np.uint8))
+        e._record_active_hold_tail(t,f,tail)
+        noise=replace(tail,center=(624.,178.),lane=3,topology='unknown',owner_lanes=())
+        with patch('agent.music.tracking.detect_hold_tails',return_value=[noise]),patch('agent.music.tracking.hold_ribbon_present',return_value=False):
+            e._update_active_hold_tails(replace(f,sequence=2,midpoint=.31))
+        self.assertEqual(len(t.hold_tail_observations),1)
+
+    def test_static_glyph_is_distinguished_from_repeated_screenshot(self):
+        glyph=history([(0.,.65),(.05,.65),(.10,.65)],2)
+        moving=history([(0.,.46),(.05,.50),(.10,.54)])
+        self.assertTrue(stationary_with_moving_witness(glyph,moving))
+        repeated=history([(0.,.50),(.05,.50),(.10,.50)])
+        self.assertFalse(stationary_with_moving_witness(glyph,repeated))
+        glyph.gesture=NoteGesture.HOLD_START
+        self.assertFalse(stationary_with_moving_witness(glyph,moving))
+
+    def test_real_pixel_owner_wins_over_glyph_without_changing_provider_center(self):
+        e,t,c,f=self.scene(.61)
+        glyph=history([(0.,.65),(.05,.65),(.10,.65)],2)
+        e.tracks[2]=glyph
+        recovered=recover_masked_taps(e.tracks,f,e.calibration,lambda c:assign_lane(c,e.calibration))
+        self.assertIn(1,recovered)
+        e._associate_lane(3,[(c,assign_lane(c,e.calibration))],f,VisualMask.from_image(f.image,e.calibration),recovered)
+        self.assertEqual(t.observations[-1].candidate,c)
+        self.assertEqual(glyph.observations[-1].frame_sequence,2)
+        self.assertEqual(len(e.tracks),2)
+
+    def test_white_core_is_required_even_in_score_region(self):
+        e,t,c,f=self.scene()
+        f.image[(f.image[:,:,0]==255)]=(180,220,20)
+        self.assertEqual(recover_masked_taps(e.tracks,f,e.calibration,lambda c:assign_lane(c,e.calibration)),{})
+
+    def test_two_missing_owners_cannot_both_claim_one_visible_circle(self):
+        e,t,c,f=self.scene()
+        other=history([(0.,.44),(.05,.48),(.10,.52)],2)
+        other.observations=type(other.observations)([
+            replace(o,candidate=candidate_at(e.calibration,3,o.progress,56)) for o in other.observations],maxlen=12)
+        e.tracks[2]=other
+        image=np.zeros_like(f.image)
+        note=candidate_at(e.calibration,3,.76,78)
+        yy,xx=np.ogrid[:720,:1280]
+        d=(xx-note.center[0])**2+(yy-note.center[1])**2
+        image[d<39**2]=(180,220,20);image[d<8**2]=255
+        f=replace(f,sequence=10,midpoint=.35,image=image)
+        self.assertEqual(recover_masked_taps(e.tracks,f,e.calibration,lambda c:assign_lane(c,e.calibration)),{})
+
+    def test_hold_bonus_and_executed_heads_are_not_recovered(self):
+        for change in ('hold','bonus','sent'):
+            e,t,c,f=self.scene()
+            if change=='hold': t.gesture=NoteGesture.HOLD_START
+            if change=='bonus': t.bonus_star=True
+            if change=='sent': t.tap_input_started=.12
+            self.assertEqual(recover_masked_taps(e.tracks,f,e.calibration,lambda c:assign_lane(c,e.calibration)),{})
+
+    def test_two_initial_cap_samples_must_not_lock_a_noisy_velocity(self):
+        cal=calibration()
+        e=MusicVisionEngine(cal,MusicConfig(enable_holds=True))
+        t=NoteTrack(1,2,gesture=NoteGesture.HOLD_START,state=TrackState.HOLDING,
+                    predicted_hit_time=0.,hold_release_time=2.)
+        e.tracks[1]=t
+        # The second point follows three missed frames and a biased centroid.
+        # Geometry relative to the test calibration, with exactly the recorded
+        # displacements/time intervals, not a fixed chart action sequence.
+        points=[(.254,(555.,172.)),(.515,(498.,206.5)),(.575,(495.,239.5)),
+                (.644,(480.,257.5)),(.720,(457.5,281.5))]
+        for seq,(stamp,center) in enumerate(points,1):
+            progress,distance,_=project_to_polyline(center,cal.lane_centerlines[1])
+            tail=HoldTailDetection(progress,.9,160,1,center,distance,1,'terminal',(2,))
+            frame=MusicFrame(seq,stamp,stamp,stamp,np.zeros((720,1280,3),np.uint8))
+            if seq==1: e._record_active_hold_tail(t,frame,tail)
+            else:
+                with patch('agent.music.tracking.detect_hold_tails',return_value=[tail]), patch('agent.music.tracking.hold_ribbon_present',return_value=False):
+                    e._update_active_hold_tails(frame)
+        self.assertEqual(t.hold_tail_observations[-1].center,points[-1][1])
+        self.assertGreaterEqual(len(t.hold_tail_observations),4)
+
+    def test_fresh_frame_service_must_not_sleep_on_future_ordinary_tap(self):
+        config=MusicConfig()
+        runtime=MusicRuntime(SimpleNamespace(),config,clock=lambda:1.)
+        executor=MusicActionExecutor(SimpleNamespace(),1280,720,config,advanced=False)
+        event=MusicActionEvent('ordinary',1,3,NoteGesture.TAP,1.08,(640,620))
+        with patch.object(runtime,'sleeper',side_effect=AssertionError('fresh pixels must be processed first')):
+            # Capability default lets the old implementation demonstrate the
+            # defect by its actual sleep, rather than a missing-method error.
+            kwargs={'fresh_frame':True} if 'fresh_frame' in runtime._execute_due.__code__.co_varnames else {}
+            runtime._execute_due(executor,[event],1.,RuntimeMetrics(),**kwargs)
+
+    def test_fresh_frame_executes_overdue_tap_without_postponement(self):
+        config=MusicConfig()
+        runtime=MusicRuntime(SimpleNamespace(),config,clock=lambda:1.)
+        executor=MusicActionExecutor(SimpleNamespace(),1280,720,config,advanced=False)
+        pending=[MusicActionEvent('ordinary',1,3,NoteGesture.TAP,.999,(640,620))]
+        with patch.object(executor,'tap_many',return_value=[]) as send:
+            runtime._execute_due(executor,pending,1.,RuntimeMetrics(),fresh_frame=True)
+        send.assert_called_once()
+        self.assertEqual(pending,[])
+
+    def test_fresh_frame_keeps_existing_twenty_ms_freeze_precision(self):
+        for deadline,frozen in [(1.015,False),(1.08,True)]:
+            config=MusicConfig();time=[1.]
+            def clock():
+                time[0]+=.0001
+                return time[0]
+            runtime=MusicRuntime(SimpleNamespace(),config,clock=clock,sleeper=lambda dt:time.__setitem__(0,time[0]+dt))
+            executor=MusicActionExecutor(SimpleNamespace(),1280,720,config,advanced=False)
+            pending=[MusicActionEvent('frozen',1,3,NoteGesture.TAP,deadline,(640,620),tap_frozen=frozen)]
+            with patch.object(executor,'tap_many',return_value=[]) as send:
+                runtime._execute_due(executor,pending,time[0],RuntimeMetrics(),fresh_frame=True)
+            send.assert_called_once()
+            self.assertEqual(pending,[])
+            self.assertLess(abs(time[0]-deadline),.001)
+
+    def test_fresh_frame_hold_wait_and_due_tap_have_one_shared_removal_set(self):
+        config=MusicConfig(enable_holds=True)
+        time=[1.]
+        def clock():
+            time[0]+=.0001
+            return time[0]
+        runtime=MusicRuntime(SimpleNamespace(),config,clock=clock,sleeper=lambda dt:time.__setitem__(0,time[0]+dt))
+        executor=MusicActionExecutor(SimpleNamespace(),1280,720,config,advanced=True)
+        pending=[MusicActionEvent('hold',2,2,NoteGesture.HOLD_START,1.04,(430,620)),
+                 MusicActionEvent('tap',1,3,NoteGesture.TAP,1.03,(640,620))]
+        with patch.object(executor,'tap_many',return_value=[]) as send, patch.object(executor,'touch_down') as hold:
+            runtime._execute_due(executor,pending,time[0],RuntimeMetrics(),fresh_frame=True)
+        send.assert_called_once()
+        hold.assert_called_once()
+        self.assertEqual(pending,[])
+
+
+if __name__=='__main__': unittest.main()

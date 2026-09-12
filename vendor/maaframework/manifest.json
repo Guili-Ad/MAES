@@ -1,0 +1,73 @@
+{
+    "name": "MaaFramework",
+    "version": "5.12.2",
+    "platform": "windows-x64",
+    "source": "https://github.com/MaaXYZ/MaaFramework",
+    "license": "LGPL-3.0",
+    "files": [
+        {
+            "file": "DirectML.dll",
+            "sha256": "9C9E6D822561C6C41B90E6994B3E8857CF1D66DBFB1E0C4C799C7C89B4E92DA1"
+        },
+        {
+            "file": "fastdeploy_ppocr_maa.dll",
+            "sha256": "ADAC69446655D20B65CBCB207415EE6A14133585E25A0884053BA0A871B5559D"
+        },
+        {
+            "file": "MaaAdbControlUnit.dll",
+            "sha256": "0E72A8B054A759FD6F6CF6072B864B0AA5285C5798D21CDD046B9C56EBA0ADA2"
+        },
+        {
+            "file": "MaaAgentClient.dll",
+            "sha256": "8DDAF9BA18CAA565F1C1AF20406A7514BFE24C3DAA4D62E4833F76EE43CC7178"
+        },
+        {
+            "file": "MaaAgentServer.dll",
+            "sha256": "78BD879E30D2AE11767CEC6AC7487B4038AE5FD0538479904FF1B6526625A31D"
+        },
+        {
+            "file": "MaaCustomControlUnit.dll",
+            "sha256": "8CFE518E9C3F645E1B6B5FF3A08622361BC6EBB3671558455847158135F846E2"
+        },
+        {
+            "file": "MaaFramework.dll",
+            "sha256": "B22E9AC36F9FE6FFADD13AFA405D6CC6759F1FDD7ED763E0A88E2E5C8F8D4E06"
+        },
+        {
+            "file": "MaaGamepadControlUnit.dll",
+            "sha256": "DCC81CC8F757B2D65D05044AD7FB8BB360914CD973E1D037B6CD987623618EBF"
+        },
+        {
+            "file": "MaaRecordControlUnit.dll",
+            "sha256": "A45E0C892FD70C8517DF53DB19A106E623CF19E2B596C4B1165E7FDD894B6CCD"
+        },
+        {
+            "file": "MaaReplayControlUnit.dll",
+            "sha256": "B05ADBBE26D88FD3010546187559B73D70BA5135ACED98B15D470181941DE7BC"
+        },
+        {
+            "file": "MaaToolkit.dll",
+            "sha256": "E0908690C9B269AEF4CF7748E9EF157F8B7E17CEAE4923BAE7F04A771287081A"
+        },
+        {
+            "file": "MaaUtils.dll",
+            "sha256": "25C94CFF78AD7F9EFB4AFA9732DB8F6C7280EF02CB28B6E3F9AB2191F83B1610"
+        },
+        {
+            "file": "MaaWin32ControlUnit.dll",
+            "sha256": "82A02186F60D54A94AA7A444E4AB8AAB2BF88AEF5B9E5F1F1600231AA5150D35"
+        },
+        {
+            "file": "onnxruntime_maa.dll",
+            "sha256": "654C5D82DCE491BEFDBEDB57E1457F5AF49F6FB3D967A8C74CB4ADA545ED09F2"
+        },
+        {
+            "file": "opencv_world4_maa.dll",
+            "sha256": "9F5564DE8731520E6DF80C662D1FD0B95C6B0783F09A6DFAC75EAE50AFD16133"
+        },
+        {
+            "file": "ViGEmClient.dll",
+            "sha256": "2BF0CB1D809039573C922737D298A1653D4DBC61408060FF45A9BCFDE82E97D2"
+        }
+    ]
+}

@@ -1,0 +1,24 @@
+{
+    "schema_version": 1,
+    "ffmpeg": {
+        "version": "7.1.1",
+        "distribution": "Windows x64 essentials build",
+        "source": "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-essentials_build.zip",
+        "archive": "ffmpeg-7.1.1-essentials_build.zip",
+        "archive_sha256": "04861D3339C5EBE38B56C19A15CF2C0CC97F5DE4FA8910E4D47E5E6404E4A2D4",
+        "executable_sha256": "B90225987BDD042CCA09A1EFB5E34E9848F2D1DBF5FBCD388753A44145522997",
+        "development_only": true,
+        "included_in_release": false
+    },
+    "fixture_policy": {
+        "work_directory": ".work/music-v4",
+        "submitted_fixture": "tests/fixtures/music_visual_baseline_v4.npz",
+        "forbidden_metadata": [
+            "frame_time",
+            "frame_order",
+            "song_name",
+            "lane_sequence",
+            "action_sequence"
+        ]
+    }
+}

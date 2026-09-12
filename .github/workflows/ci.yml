@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap bundled runtime
+        shell: pwsh
+        run: ./tools/bootstrap.ps1
+      - name: Project check
+        shell: pwsh
+        run: ./runtime/python/python.exe -B tools/check_project.py --require-runtime
+      - name: Unit tests
+        shell: pwsh
+        run: ./runtime/python/python.exe -B -m unittest discover -s tests -p "test_*.py" -q
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap bundled runtime
+        shell: pwsh
+        run: ./tools/bootstrap.ps1
+      - name: Build package
+        shell: pwsh
+        run: ./tools/package.ps1
+      - name: Create release archive
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          Compress-Archive -Path "dist/MAES/*" -DestinationPath "MAES-$tag.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "MAES-$tag.zip").Hash
+          "$hash  MAES-$tag.zip" | Out-File -FilePath "MAES-$tag.zip.sha256" -Encoding ascii
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            MAES-*.zip
+            MAES-*.zip.sha256
+          generate_release_notes: true

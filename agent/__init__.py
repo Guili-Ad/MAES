@@ -1,0 +1,2 @@
+"""MAES custom MaaFramework agent."""
+
