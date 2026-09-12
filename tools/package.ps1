@@ -233,6 +233,10 @@ Copy-Item -LiteralPath (Join-Path $AppRoot "packaging\appsettings.json") -Destin
 $ConfigTarget = Join-Path $Target "config"
 New-Item -ItemType Directory -Path $ConfigTarget | Out-Null
 Copy-Item -LiteralPath (Join-Path $AppRoot "packaging\config.json") -Destination (Join-Path $ConfigTarget "config.json")
+$ShippedConfigPath = Join-Path $ConfigTarget "config.json"
+$ShippedConfig = Get-Content -LiteralPath $ShippedConfigPath -Raw | ConvertFrom-Json
+$ShippedConfig | Add-Member -NotePropertyName "UI.LiveView.EnableLiveView" -NotePropertyValue $true -Force
+[System.IO.File]::WriteAllText($ShippedConfigPath, ($ShippedConfig | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
 
 $TransientDirectories = @(
     Get-ChildItem -LiteralPath $Target -Recurse -Force -Directory -ErrorAction SilentlyContinue |
