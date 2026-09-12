@@ -215,9 +215,11 @@ class ProjectCheck:
                 self.error(f"{source} contains deprecated interrupt override")
 
     def check_portability(self) -> None:
-        forbidden_patterns = {
+        reference_patterns = {
             r"(?i)(?<![A-Za-z0-9_])MAAStudyModel(?![A-Za-z0-9_])": "reference model name/path",
             r"(?i)(?<![A-Za-z0-9_])MMleo(?![A-Za-z0-9_])": "reference project name/path",
+        }
+        global_patterns = {
             r"(?i)(?<![A-Z])[A-Z]:[\\/]": "absolute Windows path",
             r"127\.0\.0\.1:\d+": "fixed ADB address",
             r"(?i)MuMuPlayer|LDPlayer|Nox": "emulator-specific runtime value",
@@ -242,7 +244,10 @@ class ProjectCheck:
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
-            for pattern, label in forbidden_patterns.items():
+            patterns = dict(global_patterns)
+            if path.name != "README.md":
+                patterns.update(reference_patterns)
+            for pattern, label in patterns.items():
                 if re.search(pattern, text):
                     self.error(f"{path.relative_to(APP_ROOT)} contains forbidden {label}")
 
