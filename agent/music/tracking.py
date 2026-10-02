@@ -1272,6 +1272,7 @@ class MusicVisionEngine:
         """
         if not self.config.stationary_zone_enabled:
             return
+        import numpy as np
         # Identical screenshots are not independent stationary-glyph evidence.
         if isinstance(frame.image, np.ndarray):
             fingerprint = frame.image[::32, ::32, :3]
