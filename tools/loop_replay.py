@@ -95,13 +95,13 @@ def run_loop(stream, calibration, config, args):
     runtime.provider = Provider()
     runtime.input_mode = 'advanced'
     executor = MusicActionExecutor(context, 1280, 720, config, advanced=True, multi_touch=True,
-                                   clock=clock, sleeper=runtime._sleep_interruptibly)
+                                   clock=clock, sleeper=getattr(runtime, '_sleep_interruptibly', clock.sleep))
     engines, scheduled, pending_snapshot, samples, observations = [], [], [], [], []
     def new_engine(*positional, **keywords):
         engine = MusicVisionEngine(*positional, **keywords)
         original = engine.update
         def update(frame, candidates, visual):
-            observations.append({'segment': runtime.tap_trace.segment_id, 'sequence':frame.sequence,
+            observations.append({'segment': getattr(runtime.tap_trace, 'segment_id', 0), 'sequence':frame.sequence,
                                  'capture_finished':frame.capture_finished})
             begin = time.perf_counter()
             events = original(frame, candidates, visual)

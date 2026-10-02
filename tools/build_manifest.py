@@ -11,6 +11,22 @@ sys.path.insert(0, str(ROOT))
 from agent.music.build_identity import create_manifest, verify_manifest, seal_package
 
 
+def verify_archive(path):
+    with tempfile.TemporaryDirectory(prefix='maes-package-check-') as temporary:
+        # Windows TEMP may contain an 8.3 alias (ADMINI~1). Compare canonical
+        # paths on both sides; do not relax the archive traversal guard.
+        root = Path(temporary).resolve()
+        with zipfile.ZipFile(path) as archive:
+            for item in archive.infolist():
+                target = (root / item.filename).resolve()
+                if not target.is_relative_to(root):
+                    raise ValueError('Unsafe archive path')
+            archive.extractall(root)
+        manifest = json.loads((root / 'build-manifest.json').read_text(encoding='utf-8'))
+        verify_manifest(root, manifest)
+        return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=ROOT)
@@ -19,16 +35,7 @@ def main():
     parser.add_argument('--archive', type=Path)
     args = parser.parse_args()
     if args.archive:
-        with tempfile.TemporaryDirectory(prefix='maes-package-check-') as temporary:
-            root = Path(temporary)
-            with zipfile.ZipFile(args.archive) as archive:
-                for item in archive.infolist():
-                    target = (root / item.filename).resolve()
-                    if not target.is_relative_to(root):
-                        raise ValueError('Unsafe archive path')
-                archive.extractall(root)
-            manifest = json.loads((root / 'build-manifest.json').read_text(encoding='utf-8'))
-            verify_manifest(root, manifest)
+        manifest = verify_archive(args.archive)
     elif args.verify:
         manifest = json.loads((args.root / 'build-manifest.json').read_text(encoding='utf-8'))
         verify_manifest(args.root, manifest)

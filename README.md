@@ -52,7 +52,7 @@ powershell -ExecutionPolicy Bypass -File tools/bootstrap.ps1
 # 2. 项目检查（含离线运行时与原生库校验）
 runtime\python\python.exe -B tools\check_project.py --require-runtime
 
-# 3. 单元测试（当前250项；以运行输出为准）
+# 3. 单元测试（当前252项；以运行输出为准）
 runtime\python\python.exe -B tools\run_tests.py
 
 # 4. 构建独立候选包；目标已存在时拒绝覆盖

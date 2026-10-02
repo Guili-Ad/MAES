@@ -62,6 +62,29 @@ class BuildIdentityTests(unittest.TestCase):
                  patch.dict(os.environ, {'MAES_DATA_DIR':'', 'LOCALAPPDATA':str(root/'local-app')}):
                 self.assertEqual(data_root(), root/'local-app/MAES')
 
+    def test_archive_checks_resolved_temp_root_without_rejecting_valid_package(self):
+        import zipfile
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
+        from build_manifest import verify_archive
+        with tempfile.TemporaryDirectory(prefix='maes-archive-test-') as temporary:
+            root = Path(temporary)
+            manifest = create_manifest(root)
+            archive = root/'package.zip'
+            with zipfile.ZipFile(archive, 'w') as output:
+                output.writestr('build-manifest.json', json.dumps(manifest))
+            self.assertEqual(verify_archive(archive), manifest)
+
+    def test_archive_rejects_traversal_before_extracting_anything(self):
+        import zipfile
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
+        from build_manifest import verify_archive
+        with tempfile.TemporaryDirectory(prefix='maes-archive-test-') as temporary:
+            archive = Path(temporary)/'bad.zip'
+            with zipfile.ZipFile(archive, 'w') as output:
+                output.writestr('../outside.txt', 'not allowed')
+            with self.assertRaisesRegex(ValueError, 'Unsafe archive path'):
+                verify_archive(archive)
+
 
 class InputLifecycleTests(unittest.TestCase):
     def executor(self):
