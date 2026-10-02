@@ -145,6 +145,11 @@ def fuse_touch_backend(signature: str, reason: str) -> None:
 
 
 def write_result(result: MusicRunResult) -> None:
+    if not result.identity:
+        from uuid import uuid4
+        from .build_identity import current_identity
+        result.identity = {**current_identity(), 'run_id': 'exception-' + uuid4().hex,
+                           'config_hash': '', 'calibration_hash': ''}
     atomic_write_json(result_path(), result.to_dict())
 
 
@@ -164,6 +169,7 @@ def read_result() -> MusicRunResult:
         profile=str(raw.get("profile", "")),
         task_id=raw.get("task_id"),
         metrics_ms=dict(raw.get("metrics_ms", {})),
+        identity=dict(raw.get("identity", {})),
         schema_version=int(raw.get("schema_version", 2)),
         time=str(raw.get("time", "")),
     )

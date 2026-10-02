@@ -792,7 +792,8 @@ class MusicRunResult:
     profile: str = ""
     task_id: int | None = None
     metrics_ms: dict[str, dict[str, float | int]] = field(default_factory=dict)
-    schema_version: int = 2
+    schema_version: int = 3
+    identity: dict[str, Any] = field(default_factory=dict)
     time: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> dict[str, Any]:

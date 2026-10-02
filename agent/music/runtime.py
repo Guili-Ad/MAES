@@ -35,6 +35,7 @@ from .storage import (
 from .tap_policy import TapTimingPolicy
 from .tap_dispatch import due_tap_batches
 from .tap_trace import TapTrace, VERSION
+from .build_identity import digest
 from .tracking import MusicVisionEngine
 from .vision import MaaCandidateProvider, NumpyCandidateProvider, VisualMask, giant_live_title_present
 
@@ -194,7 +195,15 @@ class MusicRuntime:
             controller_signature=self.signature,
             profile=self.calibration.profile_key if self.calibration else "",
             task_id=task_id,
+            identity=self.result_identity(),
         )
+
+    def result_identity(self) -> dict:
+        calibration_hash = digest(asdict(self.calibration)) if self.calibration else ''
+        self.tap_trace.calibration_hash = calibration_hash
+        return {**self.tap_trace.identity, 'run_id': self.tap_trace.run_id,
+                'config_hash': self.tap_trace.config_hash, 'calibration_hash': calibration_hash,
+                'segment_id': self.tap_trace.segment_id, 'cleanup_failure': self.cleanup_failure}
 
     def _record_head_action(
         self,
@@ -1149,6 +1158,7 @@ def run_preflight_action(context: Any, config: MusicConfig, argv: Any) -> MusicR
     else:
         runtime.metrics.capture.append(capture_ms)
         result = runtime.preflight(frame, _task_id(argv))
+    result.identity = runtime.result_identity()
     write_result(result)
     return result
 
@@ -1168,5 +1178,6 @@ def run_play_action(context: Any, config: MusicConfig, argv: Any) -> MusicRunRes
             _task_id(argv),
         )
     result.metrics_ms = runtime.metrics.summaries(runtime.action_durations)
+    result.identity = runtime.result_identity()
     write_result(result)
     return result

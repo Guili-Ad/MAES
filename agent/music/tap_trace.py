@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-VERSION = 'v1.0.0-Stable'
+from .build_identity import VERSION, current_identity
 
 
 class TapTrace:
@@ -17,20 +17,24 @@ class TapTrace:
         self.run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid4().hex[:8]
         self.config = asdict(config)
         self.config_hash = hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest()[:16]
+        self.identity = current_identity()
+        self.calibration_hash = ''
+        self.segment_id = 0
         self.records = deque(maxlen=capacity)
         self.dropped = 0
 
     def add(self, kind: str, **fields):
         if len(self.records) == self.records.maxlen:
             self.dropped += 1
-        self.records.append({'kind': kind, **fields})
+        self.records.append({'kind': kind, 'segment_id': self.segment_id, **fields})
 
     def write(self) -> Path:
         # Branch-local output; never writes the shared user calibration store.
         root = Path(__file__).resolve().parents[2] / 'logs' / 'tap-traces'
         root.mkdir(parents=True, exist_ok=True)
         path = root / (self.run_id + '.jsonl')
-        header = {'schema': 1, 'version': VERSION, 'run_id': self.run_id,
+        header = {'schema': 2, **self.identity, 'run_id': self.run_id,
+                  'calibration_hash': self.calibration_hash,
                   'config_hash': self.config_hash, 'config': self.config,
                   'dropped_records': self.dropped, 'clock': 'host perf_counter; not game judgement time'}
         with path.open('x', encoding='utf-8') as stream:
