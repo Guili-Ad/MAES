@@ -1267,11 +1267,18 @@ class MusicVisionEngine:
 
         Judgement text and similar banners draw small chromatic glyphs over the
         note field.  They freeze centre-lane tracks exactly where they appear.
-        Several distinct tracks frozen inside one cell prove a HUD glyph site;
-        candidates there are then ignored for the rest of the song.
+        Regions are diagnostic only. Retire individually stationary tracks,
+        never real notes merely passing through the same screen position.
         """
         if not self.config.stationary_zone_enabled:
             return
+        # Identical screenshots are not independent stationary-glyph evidence.
+        if isinstance(frame.image, np.ndarray):
+            fingerprint = frame.image[::32, ::32, :3]
+            previous = getattr(self, '_stationary_fingerprint', None)
+            self._stationary_fingerprint = fingerprint.copy()
+            if previous is not None and np.array_equal(previous, fingerprint):
+                return
         freeze_seconds = self.config.stationary_zone_freeze_ms / 1000.0
         for track in list(self.tracks.values()):
             if track.state not in {TrackState.APPROACHING, TrackState.TAP_PENDING}:
@@ -1295,7 +1302,8 @@ class MusicVisionEngine:
                 continue
             cell = (int(center[0] // 32), int(center[1] // 32))
             site = self.frozen_sites.setdefault(cell, set())
-            site.add(track.track_id)
+            if len(site) < self.config.stationary_zone_min_tracks:
+                site.add(track.track_id)
             if (
                 len(site) >= self.config.stationary_zone_min_tracks
                 and len(self.text_zones) < self.config.stationary_zone_max_zones
@@ -1824,18 +1832,11 @@ class MusicVisionEngine:
                 exclusion_radius = max(42.0, max(special_candidate.box[2:]) * 0.75)
                 if math.dist(candidate.center, special_candidate.center) <= exclusion_radius:
                     continue
-            if self.text_zones and self._in_text_zone(candidate.center):
-                continue
             projection = assign_lane(candidate, self.calibration)
             if projection is not None:
                 by_lane[projection.lane].append((candidate, projection))
         recovered = recover_masked_taps(self.tracks, frame, self.calibration,
                                         lambda c: assign_lane(c, self.calibration))
-        if self.text_zones:
-            recovered = {
-                tid: item for tid, item in recovered.items()
-                if not self._in_text_zone(item[0].center)
-            }
         for lane, entries in by_lane.items():
             entries = unique_head_candidates(entries, self.tap_trace, frame)
             self._associate_lane(lane, entries, frame, visual, recovered)

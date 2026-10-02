@@ -17,6 +17,7 @@ from agent.music.models import (
     MusicConfig,
     MusicFrame,
     NoteTrack,
+    NoteGesture,
     TrackObservation,
     TrackState,
 )
@@ -90,14 +91,56 @@ class TextZoneTests(unittest.TestCase):
         self.assertFalse(engine._in_text_zone((844.0, 459.0)))
         self.assertTrue(any(record.get('kind') == 'text_zone' for record in engine.tap_trace.records))
 
-    def test_candidate_inside_zone_is_ignored(self):
+    def test_candidate_inside_zone_is_not_deleted_by_position(self):
         engine = self._engine()
         engine.text_zones.append((640.0, 459.0, 48.0))
         image = np.zeros((720, 1280, 3), dtype=np.uint8)
         visual = VisualMask.from_image(image, calibration())
         candidate = MusicCandidate(note_box((640, 459), 7), 200, 0.8, (640.0, 459.0))
         engine.update(MusicFrame(1, 0.0, 0.0, 0.0, image), [candidate], visual)
-        self.assertEqual(len(engine.tracks), 0)
+        self.assertEqual(len(engine.tracks), 1)
+
+    def test_moving_note_crosses_learned_zone_without_loss(self):
+        engine = self._engine()
+        engine.text_zones.append((640., 459., 48.))
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        visual = VisualMask.from_image(image, calibration())
+        for sequence in range(18):
+            note = candidate_at(calibration(), 3, .45+sequence*.03)
+            engine.update(MusicFrame(sequence, sequence*.03, sequence*.03, sequence*.03, image), [note], visual)
+        self.assertEqual(engine.next_track_id, 2)
+        self.assertTrue(any(t.action_executed for t in engine.tracks.values()))
+
+    def test_static_hud_and_repeated_frames_never_schedule_input(self):
+        engine = self._engine()
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        visual = VisualMask.from_image(image, calibration())
+        note = candidate_at(calibration(), 3, .65)
+        events = []
+        for sequence in range(40):
+            events.extend(engine.update(MusicFrame(sequence, sequence*.04, sequence*.04, sequence*.04, image), [note], visual))
+        self.assertFalse(events)
+
+    def test_star_and_flick_are_not_filtered_by_a_learned_region(self):
+        from dataclasses import replace
+        for variant in ('bonus_star', 'flick'):
+            engine = self._engine()
+            engine.text_zones.append((640., 459., 48.))
+            image = np.zeros((720, 1280, 3), dtype=np.uint8)
+            visual = VisualMask.from_image(image, calibration())
+            note = replace(candidate_at(calibration(), 3, .665), variant=variant,
+                           flick_direction=NoteGesture.FLICK_LEFT)
+            engine.update(MusicFrame(1, 0., 0., 0., image), [note], visual)
+            self.assertEqual(len(engine.tracks), 1)
+
+    def test_repeated_screenshot_does_not_create_stationary_region(self):
+        engine = self._engine()
+        tracks = [self._frozen_track(engine, tid, dx) for tid, dx in ((1,0),(2,2),(3,4))]
+        image = np.zeros((720,1280,3), dtype=np.uint8)
+        engine._stationary_fingerprint = image[::32,::32,:3].copy()
+        engine._update_text_zones(MusicFrame(10,1.,1.,1.,image))
+        self.assertFalse(engine.text_zones)
+        self.assertTrue(all(t.state == TrackState.APPROACHING for t in tracks))
 
 
 class ImpostorGuardTests(unittest.TestCase):

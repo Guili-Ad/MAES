@@ -188,7 +188,7 @@ class MusicConfig:
     # A stationary HUD glyph row (judgement text, banners) can freeze a moving
     # centre-lane track and absorb later real notes.  Freeze evidence from
     # several distinct tracks inside one small cell forms a suppression zone;
-    # candidates inside it are ignored for the rest of the song.
+    # regions are diagnostics only; never delete a candidate by its position.
     stationary_zone_enabled: bool = False
     stationary_zone_min_tracks: int = 3
     stationary_zone_radius_px: float = 48.0
