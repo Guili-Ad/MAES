@@ -21,8 +21,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / "runtime" / "python" / "python.exe"
-SYNTHETIC = ROOT / "temp" / "validation" / "tap-chord-v1" / "synthetic.jsonl"
-SYNTHETIC_ANNOTATIONS = ROOT / "temp" / "validation" / "tap-chord-v1" / "synthetic.annotations.json"
+SYNTHETIC = ROOT / "tests/fixtures/optimization/synthetic.jsonl"
+SYNTHETIC_ANNOTATIONS = ROOT / "tests/fixtures/optimization/synthetic.annotations.json"
 
 BEHAVIOR_KEYS = {
     "hold_contract": ["tests", "records", "errors"],

@@ -22,6 +22,10 @@ class MetricSeries:
     def __len__(self):
         return len(self.recent)
 
+    def extend(self, values):
+        for value in values:
+            self.append(value)
+
     def __getitem__(self, index):
         return list(self.recent)[index]
 

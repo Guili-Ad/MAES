@@ -158,3 +158,26 @@ class CalibrationSafetyTests(unittest.TestCase):
             cal.points[1] = value
             with self.assertRaises(ValueError):
                 _validate(cal)
+
+
+class ReplayToolTests(unittest.TestCase):
+    def test_candidate_preserves_flick_direction_and_color(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
+        from tap_replay import decode_candidate
+        from agent.music.models import NoteGesture
+        note = decode_candidate({'box':[1,2,30,30], 'center':[16,17], 'pixel_count':900,
+                                 'fill_ratio':1., 'variant':'flick', 'flick_direction':'FlickLeft',
+                                 'flick_color':'red'})
+        self.assertEqual(note.flick_direction, NoteGesture.FLICK_LEFT)
+        self.assertEqual(note.flick_color, 'red')
+
+    def test_ffmpeg_workspace_is_resolved_from_project_not_drive_root(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
+        from workspace_paths import workspace_root
+        self.assertTrue((workspace_root()/'test-materials').is_dir())
+
+    def test_preflight_metrics_accept_extend(self):
+        from agent.music.metrics import MetricSeries
+        values = MetricSeries()
+        values.extend([1.,2.,3.])
+        self.assertEqual(values[:], [1.,2.,3.])

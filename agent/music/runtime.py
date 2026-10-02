@@ -256,7 +256,7 @@ class MusicRuntime:
     def _acknowledge_taps(self, receipts, events, engine, metrics):
         by_id = {event.event_id: event for event in events}
         for receipt in receipts:
-            if receipt.segment_id is not None and (receipt.run_id != self.tap_trace.run_id
+            if receipt.run_id and receipt.segment_id is not None and (receipt.run_id != self.tap_trace.run_id
                                                    or receipt.segment_id != self.tap_trace.segment_id):
                 self.tap_trace.add('stale_receipt', event=receipt.event_id)
                 continue

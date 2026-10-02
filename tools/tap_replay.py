@@ -18,9 +18,11 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_paths import workspace_root, ffmpeg_binary
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parents[2]
+WORKSPACE = workspace_root()
 
 
 class ReplayClock:
@@ -48,6 +50,8 @@ class RecordingContext:
 
 def video_frames(args):
     import numpy as np
+    if not args.video.is_file():
+        raise FileNotFoundError(f'Video does not exist: {args.video}')
     flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
     probe = subprocess.run([str(args.ffprobe), '-v', 'error', '-select_streams', 'v:0',
                             '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'json', str(args.video)],
@@ -57,7 +61,7 @@ def video_frames(args):
     end = args.start + args.duration
     indices = [i for i, t in enumerate(times) if args.start <= t < end]
     if not indices:
-        return
+        raise ValueError('No video frames inside the selected interval')
     selected = [times[i] for i in indices]
     # ffprobe rounds the decimal PTS; selecting floating-point t in FFmpeg
     # can include a different boundary frame. Decode the same frame indices.
@@ -104,6 +108,14 @@ def candidate_frames(args):
             yield timestamp, blank, item['candidates']
 
 
+def decode_candidate(raw):
+    from agent.music.models import MusicCandidate, NoteGesture
+    return MusicCandidate(tuple(raw['box']), raw['pixel_count'], raw['fill_ratio'],
+                          tuple(raw['center']), raw.get('variant', ''),
+                          flick_direction=NoteGesture(raw.get('flick_direction', 'Unknown')),
+                          flick_color=raw.get('flick_color', ''))
+
+
 def annotate(heads, path):
     expected = json.loads(path.read_text(encoding='utf-8'))['heads']
     unused = set(range(len(heads)))
@@ -138,15 +150,16 @@ def main():
     parser.add_argument('--start', type=float, default=0.)
     parser.add_argument('--duration', type=float, default=15.)
     parser.add_argument('--action-ms', type=float, default=0.)
+    parser.add_argument('--loop', action='store_true', help='Run the production play loop with simulated stage costs')
+    parser.add_argument('--cost-profile', type=Path, help='Local JSON default/by_capture costs and failures for --loop')
     parser.add_argument('--trace-observations', action='store_true', help='Developer-only candidate/track history in the output report')
     parser.add_argument('--annotations', type=Path)
     parser.add_argument('--output', type=Path, required=True)
-    binary = WORKSPACE / '.work/ffmpeg-7.1.1-extract/ffmpeg-7.1.1-essentials_build/bin'
-    parser.add_argument('--ffmpeg', type=Path, default=binary / 'ffmpeg.exe')
-    parser.add_argument('--ffprobe', type=Path, default=binary / 'ffprobe.exe')
+    parser.add_argument('--ffmpeg', type=Path, default=ffmpeg_binary('ffmpeg.exe'))
+    parser.add_argument('--ffprobe', type=Path, default=ffmpeg_binary('ffprobe.exe'))
     args = parser.parse_args()
     if not args.output.resolve().is_relative_to(ROOT / 'temp'):
-        parser.error('Replay output must stay in Double/temp (never runtime resources or the baseline).')
+        parser.error('Replay output must stay in app/temp (never runtime resources or the baseline).')
     if args.duration <= 0 or args.action_ms < 0:
         parser.error('Duration must be positive; action cost cannot be negative.')
     if args.report:
@@ -181,11 +194,23 @@ def main():
     cal = MusicCalibrationData(**raw_cal)
     config = MusicConfig(**({'lane_count': 7, 'enable_holds': True} | raw_config))
     provider = NumpyCandidateProvider(cal, config.candidate_iou_threshold, config.candidate_min_size, config.split_stacked_notes)
+    if args.loop:
+        from loop_replay import run_loop
+        stream = video_frames(args) if args.video else candidate_frames(args)
+        report = run_loop(stream, cal, config, args)
+        if args.annotations:
+            report['annotation_result'] = annotate(report['heads'], args.annotations)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
+        print(json.dumps({'mode': 'production-loop', 'heads': len(report['heads']), 'frames': report['frames']}))
+        return 0
     clock = ReplayClock()
     context = RecordingContext(clock, args.action_ms)
     engine = MusicVisionEngine(cal, config)
     runtime = MusicRuntime(context, config, clock=clock, monotonic=clock, sleeper=clock.sleep)
     executor = MusicActionExecutor(context, 1280, 720, config, advanced=True, multi_touch=True, clock=clock, sleeper=clock.sleep)
+    if hasattr(executor, 'begin_segment'):
+        executor.begin_segment(runtime.tap_trace.run_id, 0)
     pending, samples, frame_count, scheduled = [], [], 0, []
     observation_trace = []
     metrics = RuntimeMetrics()
@@ -211,7 +236,7 @@ def main():
         frame = MusicFrame(sequence, timestamp, timestamp, timestamp, image)
         visual = VisualMask.from_image(image, cal)
         candidates = provider.detect(frame, visual) if raw_candidates is None else [
-            MusicCandidate(tuple(c['box']), c['pixel_count'], c['fill_ratio'], tuple(c['center']), c.get('variant', ''))
+            decode_candidate(c)
             for c in raw_candidates]
         started = time.perf_counter()
         new = engine.update(frame, candidates, visual)
