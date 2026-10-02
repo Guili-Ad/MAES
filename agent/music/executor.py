@@ -30,6 +30,8 @@ class TapInputReceipt:
     down_call_finished: float | None = None
     up_call_finished: float | None = None
     error: str = ''
+    run_id: str = ''
+    segment_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,10 +87,23 @@ class MusicActionExecutor:
         self.fuse_reason = ""
         self.action_durations: list[float] = []
         self.lanes: dict[int, LaneInputState] = {}
-        self._used_event_ids: set[str] = set()
+        self._used_event_ids: set[tuple[str, int, str]] = set()
+        self.run_id = ''
+        self.segment_id = 0
+        self.release_unconfirmed: set[int] = set()
         self._temporary_contacts: set[int] = set()
         self.tap_fallbacks: list[str] = []
         self._pending_inputs: list[PendingInput] = []
+
+    def begin_segment(self, run_id: str, segment_id: int) -> None:
+        if self.active_contacts or self._temporary_contacts or self._pending_inputs or self.release_unconfirmed:
+            raise MusicTouchError('Cannot resume with unconfirmed input cleanup')
+        if not self.healthy:
+            raise MusicTouchError('Cannot resume a fused input backend')
+        self.run_id, self.segment_id = run_id, segment_id
+
+    def _event_key(self, event_id: str) -> tuple[str, int, str]:
+        return self.run_id, self.segment_id, event_id
 
     @property
     def active_contacts(self) -> dict[int, int]:
@@ -238,11 +253,12 @@ class MusicActionExecutor:
             contacts: list[tuple[TapInputReceipt, int, int, int]] = []
             for (lane, x, y), event_id in batch:
                 contact = self._allocate_temporary_contact()
-                receipt = TapInputReceipt(event_id, lane, contact, down_call_started=self.clock())
+                receipt = TapInputReceipt(event_id, lane, contact, down_call_started=self.clock(),
+                                          run_id=self.run_id, segment_id=self.segment_id)
                 contacts.append((receipt, contact, x, y))
                 receipts.append(receipt)
                 if event_id:
-                    self._used_event_ids.add(event_id)
+                    self._used_event_ids.add(self._event_key(event_id))
             posted: list[tuple[TapInputReceipt, int, Any]] = []
             for receipt, contact, x, y in contacts:
                 try:
@@ -254,7 +270,7 @@ class MusicActionExecutor:
                     reason = f"async tap post lane {receipt.lane} failed: {error}"
                     self._mark_fused(reason)
                     receipt.error = reason
-                    self._temporary_contacts.discard(contact)
+                    self.release_unconfirmed.add(contact)
                     raise MusicTouchError(reason, receipts=receipts) from error
                 posted.append((receipt, contact, job_down))
             for receipt, contact, job_down in posted:
@@ -267,7 +283,7 @@ class MusicActionExecutor:
                     reason = f"async tap post lane {receipt.lane} failed: {error}"
                     self._mark_fused(reason)
                     receipt.error = reason
-                    self._temporary_contacts.discard(contact)
+                    self.release_unconfirmed.add(contact)
                     raise MusicTouchError(reason, receipts=receipts) from error
                 self._pending_inputs.append(
                     PendingInput("tap", receipt.lane, contact, receipt.event_id, job_down, job_up, receipt)
@@ -298,7 +314,12 @@ class MusicActionExecutor:
                 if receipt is not None:
                     receipt.error = "framework gesture job failed"
                 self._mark_fused(f"async {pending.kind} job failed on lane {pending.lane}")
-                self._finish_input(pending)
+                try:
+                    self._run(JActionType.TouchUp, JTouchUp(contact=pending.contact),
+                              'failed async input cleanup', self.config.max_click_touch_ms, force=True)
+                    self._finish_input(pending)
+                except Exception:
+                    self.release_unconfirmed.add(pending.contact)
                 self._pending_inputs.remove(pending)
                 if receipt is not None:
                     completed.append(receipt)
@@ -334,11 +355,12 @@ class MusicActionExecutor:
         fresh = []
         seen = set(self._used_event_ids)
         for request, event_id in zip(requests, ids):
-            if event_id and event_id in seen:
+            key = self._event_key(event_id)
+            if event_id and key in seen:
                 continue
             fresh.append((request, event_id))
             if event_id:
-                seen.add(event_id)
+                seen.add(key)
         if not fresh:
             return []
         self._bindings()
@@ -361,14 +383,15 @@ class MusicActionExecutor:
                 # Allocate all chord contacts and targets before the first down.
                 for (lane, x, y), event_id in batch:
                     contact = self._allocate_temporary_contact()
-                    receipt = TapInputReceipt(event_id, lane, contact)
+                    receipt = TapInputReceipt(event_id, lane, contact, run_id=self.run_id,
+                                              segment_id=self.segment_id)
                     contacts.append((receipt, JTouch(contact=contact, target=self._target(x, y), pressure=1)))
                     receipts.append(receipt)
                 for receipt, target in contacts:
                     receipt.down_call_started = self.clock()
                     # A failed/ambiguous down must not be retried automatically.
                     if receipt.event_id:
-                        self._used_event_ids.add(receipt.event_id)
+                        self._used_event_ids.add(self._event_key(receipt.event_id))
                     self._run(JActionType.TouchDown, target, f"tap down lane {receipt.lane}", self.config.max_click_touch_ms)
                     receipt.down_call_finished = self.clock()
                 for receipt, _ in reversed(contacts):
@@ -386,8 +409,10 @@ class MusicActionExecutor:
                             receipt.up_call_finished = self.clock()
                         except Exception:
                             # Keep the contact reserved for release_all to retry.
+                            self.release_unconfirmed.add(receipt.contact)
                             continue
                     self._temporary_contacts.discard(receipt.contact)
+                    self.release_unconfirmed.discard(receipt.contact)
                 raise MusicTouchError(str(error), receipts=receipts) from error
         return receipts
 
@@ -399,18 +424,18 @@ class MusicActionExecutor:
         track_id: int | None = None,
         tick: Callable[[], None] | None = None,
     ) -> None:
-        if event_id and event_id in self._used_event_ids:
+        if event_id and self._event_key(event_id) in self._used_event_ids:
             return
         self._bindings()
         if self.async_flicks:
             self._swipe_async(request, event_id)
             if event_id:
-                self._used_event_ids.add(event_id)
+                self._used_event_ids.add(self._event_key(event_id))
             return
         if request.already_down:
             self.hold_flick(request.lane, request.x, request.y, request.direction, track_id=track_id, tick=tick)
             if event_id:
-                self._used_event_ids.add(event_id)
+                self._used_event_ids.add(self._event_key(event_id))
             return
         contact = self._allocate_temporary_contact()
         end_x, end_y = self._flick_target(request.x, request.y, request.direction)
@@ -418,6 +443,8 @@ class MusicActionExecutor:
         step_sleep = self._flick_step_sleep(len(waypoints))
         aborted = False
         try:
+            if event_id:
+                self._used_event_ids.add(self._event_key(event_id))
             self._run(
                 JActionType.TouchDown,
                 JTouch(contact=contact, target=self._target(request.x, request.y), pressure=1),
@@ -447,7 +474,6 @@ class MusicActionExecutor:
             aborted = True
             raise
         finally:
-            self._temporary_contacts.discard(contact)
             if aborted:
                 try:
                     self._run(
@@ -457,10 +483,15 @@ class MusicActionExecutor:
                         self.config.max_click_touch_ms,
                         force=True,
                     )
+                    self._temporary_contacts.discard(contact)
+                    self.release_unconfirmed.discard(contact)
                 except Exception:
+                    self.release_unconfirmed.add(contact)
                     LOGGER.exception("Failed to clean up an aborted flick on lane %s", request.lane)
+            else:
+                self._temporary_contacts.discard(contact)
         if event_id:
-            self._used_event_ids.add(event_id)
+            self._used_event_ids.add(self._event_key(event_id))
 
     def _flick_pause(self, duration: float, tick: Callable[[], None] | None) -> None:
         """Pause between flick steps, first giving the caller a chance to
@@ -516,9 +547,10 @@ class MusicActionExecutor:
                     self.config.max_click_touch_ms,
                     force=True,
                 )
+                state.contact = None
             except Exception:
+                self.release_unconfirmed.add(contact)
                 LOGGER.exception("Failed to clean up a partially started contact on lane %s", lane)
-            state.contact = None
             raise
         state.hold_track_id = track_id
         state.contact_started = time.monotonic()
@@ -557,10 +589,14 @@ class MusicActionExecutor:
                 self.config.max_click_touch_ms,
                 force=force,
             )
-        finally:
+        except Exception:
+            self.release_unconfirmed.add(contact)
+            raise
+        else:
             state.contact = None
             state.hold_track_id = None
             state.contact_started = 0.0
+            self.release_unconfirmed.discard(contact)
 
     def touch_up(self, lane: int, *, track_id: int | None = None) -> None:
         state = self._lane_state(lane)
@@ -677,7 +713,7 @@ class MusicActionExecutor:
                 f"flick post lane {request.lane}",
             )
         except Exception as error:
-            self._temporary_contacts.discard(contact)
+            self.release_unconfirmed.add(contact)
             reason = f"flick post lane {request.lane} failed: {error}"
             self._mark_fused(reason)
             raise MusicTouchError(reason) from error
@@ -715,24 +751,29 @@ class MusicActionExecutor:
         LOGGER.warning("Released contacts that exceeded the maximum duration on lanes %s", expired)
 
     def release_all(self) -> None:
-        cleanup_failed = False
+        errors = {}
+        contacts = set(self.active_contacts.values()) | self._temporary_contacts | self.release_unconfirmed
+        for contact in sorted(contacts, reverse=True):
+            for attempt in range(2):
+                try:
+                    self._run(JActionType.TouchUp, JTouchUp(contact=contact), 'input cleanup',
+                              self.config.max_click_touch_ms, force=True)
+                    for state in self.lanes.values():
+                        if state.contact == contact:
+                            state.contact = state.hold_track_id = None
+                            state.contact_started = 0.0
+                    self._temporary_contacts.discard(contact)
+                    self.release_unconfirmed.discard(contact)
+                    break
+                except Exception as error:
+                    self.release_unconfirmed.add(contact)
+                    if attempt == 1:
+                        errors[contact] = str(error)
+        if errors:
+            reason = f'Touch cleanup unconfirmed: {errors}; original={self.fuse_reason}'
+            self._mark_fused(reason)
+            raise MusicTouchError(reason)
         self._pending_inputs.clear()
-        for contact in sorted(self._temporary_contacts, reverse=True):
-            try:
-                self._run(JActionType.TouchUp, JTouchUp(contact=contact), 'temporary tap cleanup',
-                          self.config.max_click_touch_ms, force=True)
-                self._temporary_contacts.discard(contact)
-            except Exception:
-                cleanup_failed = True
-        for lane in sorted(list(self.active_contacts), reverse=True):
-            try:
-                self._touch_up(lane, force=not self.healthy)
-            except Exception:
-                cleanup_failed = True
-                LOGGER.exception("Failed to clean up music contact on lane %s", lane)
-        if cleanup_failed and self.healthy:
-            self._mark_fused("Touch cleanup failed")
-            raise MusicTouchError("Touch cleanup failed")
 
     def close(self) -> None:
         self.release_all()

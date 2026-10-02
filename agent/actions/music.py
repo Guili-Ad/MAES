@@ -151,6 +151,7 @@ class MusicTouchProbe(CustomAction):
                 raise RuntimeError("MaaFramework direct action bindings are unavailable")
 
             basic: list[float] = []
+            active_contacts.add(0)
             basic.append(_run_probe_action(
                 context,
                 JActionType.TouchDown,
@@ -165,6 +166,8 @@ class MusicTouchProbe(CustomAction):
                 config.max_click_touch_ms,
                 "safe-area TouchUp probe",
             ))
+            active_contacts.discard(0)
+            active_contacts.add(0)
             basic.append(_run_probe_action(
                 context,
                 JActionType.TouchDown,
@@ -186,6 +189,7 @@ class MusicTouchProbe(CustomAction):
                 config.max_click_touch_ms,
                 "safe-area TouchUp probe",
             ))
+            active_contacts.discard(0)
             checkpoint = capture_image(context, timeout_ms=config.capture_timeout_ms)
             if checkpoint is None or not _pause_visible(context, checkpoint):
                 raise RuntimeError("Pause dialog disappeared during the basic touch probe")
@@ -195,9 +199,11 @@ class MusicTouchProbe(CustomAction):
             try:
                 for sample in range(5):
                     first_down_started = time.perf_counter()
+                    active_contacts.add(0)
                     advanced.append(_run_probe_action(context, JActionType.TouchDown, JTouch(contact=0, target=(left[0], left[1], 1, 1), pressure=1), config.max_click_touch_ms, "TouchDown contact 0"))
                     active_contacts.add(0)
                     second_down_started = time.perf_counter()
+                    active_contacts.add(1)
                     double_down_gaps.append((second_down_started - first_down_started) * 1000.0)
                     advanced.append(_run_probe_action(context, JActionType.TouchDown, JTouch(contact=1, target=(right[0], right[1], 1, 1), pressure=1), config.max_click_touch_ms, "TouchDown contact 1"))
                     active_contacts.add(1)
@@ -252,11 +258,15 @@ class MusicTouchProbe(CustomAction):
             if active_contacts and JActionType is not None and JTouchUp is not None:
                 cleanup_failed = False
                 for contact in sorted(active_contacts, reverse=True):
-                    try:
-                        _run_probe_action(context, JActionType.TouchUp, JTouchUp(contact=contact), 20.0, f"probe cleanup contact {contact}")
-                    except Exception:
-                        cleanup_failed = True
-                        LOGGER.exception("Touch probe cleanup failed")
+                    for attempt in range(2):
+                        try:
+                            _run_probe_action(context, JActionType.TouchUp, JTouchUp(contact=contact), 20.0, f"probe cleanup contact {contact}")
+                            active_contacts.discard(contact)
+                            break
+                        except Exception:
+                            if attempt == 1:
+                                cleanup_failed = True
+                                LOGGER.exception("Touch probe cleanup failed")
                 if cleanup_failed and signature:
                     state.update({"fused": True, "advanced": "failed", "fuse_reason": "Probe contact cleanup failed"})
                     save_touch_state(state)

@@ -1721,7 +1721,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(frame.image, "live")
         self.assertEqual(sequence, 4)
         self.assertEqual(executor.releases, 1)
-        self.assertFalse(any(node.startswith("MusicResult") for node, _image in context.called))
+        self.assertTrue(any(node.startswith("MusicResult") for node, _image in context.called))
 
     def test_terminal_state_has_exactly_two_normal_finish_signals(self) -> None:
         context = StrictTerminalContext(loading=True, live=False)

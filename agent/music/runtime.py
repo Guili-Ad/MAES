@@ -155,6 +155,10 @@ def _resolve_calibration(context: Any, config: MusicConfig, image: Any) -> Music
     raise ValueError(f"Unable to confirm a 7- or 9-lane screen; recognized {lane_count} targets")
 
 
+class MusicCancelled(RuntimeError):
+    pass
+
+
 class MusicRuntime:
     def __init__(
         self,
@@ -205,6 +209,17 @@ class MusicRuntime:
                 'config_hash': self.tap_trace.config_hash, 'calibration_hash': calibration_hash,
                 'segment_id': self.tap_trace.segment_id, 'cleanup_failure': self.cleanup_failure}
 
+    def _check_cancelled(self) -> None:
+        if is_stopping(self.context):
+            raise MusicCancelled('User cancelled music play')
+
+    def _sleep_interruptibly(self, duration: float) -> None:
+        while duration > 0.0:
+            self._check_cancelled()
+            step = min(0.01, duration)
+            self.sleeper(step)
+            duration -= step
+
     def _record_head_action(
         self,
         event: MusicActionEvent,
@@ -223,6 +238,10 @@ class MusicRuntime:
     def _acknowledge_taps(self, receipts, events, engine, metrics):
         by_id = {event.event_id: event for event in events}
         for receipt in receipts:
+            if receipt.segment_id is not None and (receipt.run_id != self.tap_trace.run_id
+                                                   or receipt.segment_id != self.tap_trace.segment_id):
+                self.tap_trace.add('stale_receipt', event=receipt.event_id)
+                continue
             event = by_id.get(receipt.event_id)
             if event is None:
                 continue
@@ -525,6 +544,7 @@ class MusicRuntime:
         LOGGER.info("Music pause detected; contacts released and tracking suspended until resume")
         capture_failures = 0
         live_confirmations = 0
+        terminal_confirmations = 0
         while True:
             if is_stopping(self.context):
                 return (
@@ -552,17 +572,27 @@ class MusicRuntime:
                     )
             else:
                 capture_failures = 0
-                if _recognize(self.context, "MusicPauseDialog", frame.image):
+                if giant_live_title_present(frame.image) or terminal_state(self.context, frame.image) == 'result':
+                    terminal_confirmations += 1
+                    if terminal_confirmations >= 2:
+                        return None, sequence, self.monotonic() - pause_started, MusicRunResult(
+                            status='succeeded', reason='Strict result transition detected while paused',
+                            task_id=task_id, identity=self.result_identity())
+                    live_confirmations = 0
+                elif _recognize(self.context, "MusicPauseDialog", frame.image):
+                    terminal_confirmations = 0
                     live_confirmations = 0
                 elif _live_screen(self.context, frame.image):
+                    terminal_confirmations = 0
                     live_confirmations += 1
                     if live_confirmations >= 2:
                         paused_seconds = self.monotonic() - pause_started
                         LOGGER.info("Music live screen returned after %.2f paused seconds; rebuilding note tracks", paused_seconds)
                         return frame, sequence, paused_seconds, None
                 else:
+                    terminal_confirmations = 0
                     live_confirmations = 0
-            self.sleeper(max(0.05, self.config.pause_check_interval_ms / 1000.0))
+            self._sleep_interruptibly(max(0.05, self.config.pause_check_interval_ms / 1000.0))
 
     def _record_hold_call(self, call, event, engine):
         started = self.clock()
@@ -615,11 +645,11 @@ class MusicRuntime:
             return
         earliest = min(event.deadline for event in near)
         if earliest > now:
-            delay = earliest - now
-            if delay > 0.008:
-                self.sleeper(delay - 0.006)
+            while earliest - self.clock() > 0.008:
+                self._check_cancelled()
+                self.sleeper(min(0.010, earliest - self.clock() - 0.006))
             while self.clock() < earliest:
-                pass
+                self._check_cancelled()
             now = self.clock()
         tap_batches = due_tap_batches(pending, now, engine)
         allowed_taps = {e.event_id for batch in tap_batches for e in batch}
@@ -973,6 +1003,8 @@ class MusicRuntime:
         pending: list[MusicActionEvent] = []
         try:
             executor = self._create_executor()
+            executor.begin_segment(self.tap_trace.run_id, 0)
+            self.tap_trace.calibration_hash = digest(asdict(self.calibration))
             self.action_durations = executor.action_durations
             self._in_flight_taps: dict[str, MusicActionEvent] = {}
             engine = MusicVisionEngine(self.calibration, self.config, tap_trace=self.tap_trace)
@@ -987,6 +1019,7 @@ class MusicRuntime:
             capture_failures = 0
             provider_failures = 0
             performance_warned = False
+            resumed_frame = None
             while self.monotonic() - started < self.config.max_duration_seconds:
                 loop_started = self.clock()
                 if is_stopping(self.context):
@@ -994,16 +1027,14 @@ class MusicRuntime:
                 # A controller screencap now costs about 25--35 ms while the
                 # independent preview is active.  Do not start it when a known
                 # tap/head/tail is already closer than that capture boundary.
-                self._service_imminent_before_capture(executor, pending, self.metrics, engine)
-                self._poll_async_inputs(executor, engine, self.metrics)
-                frame, capture_ms = _capture_frame(
-                    self.context,
-                    sequence,
-                    self.clock,
-                    self.config.capture_timeout_ms,
-                )
-                sequence += 1
-                self.metrics.capture.append(capture_ms)
+                if resumed_frame is None:
+                    self._service_imminent_before_capture(executor, pending, self.metrics, engine)
+                    self._poll_async_inputs(executor, engine, self.metrics)
+                    frame, capture_ms = _capture_frame(self.context, sequence, self.clock, self.config.capture_timeout_ms)
+                    sequence += 1
+                    self.metrics.capture.append(capture_ms)
+                else:
+                    frame, resumed_frame = resumed_frame, None
                 if frame is None:
                     capture_failures += 1
                     if capture_failures >= self.config.max_capture_failures:
@@ -1038,6 +1069,10 @@ class MusicRuntime:
                         # soon as the countdown disappears, so resume from a clean
                         # tracker while preserving every ordinary tap parameter.
                         pending.clear()
+                        self._in_flight_taps.clear()
+                        self.tap_trace.segment_id += 1
+                        executor.begin_segment(self.tap_trace.run_id, self.tap_trace.segment_id)
+                        resumed_frame = _resume_frame
                         self.tap_trace.add('pause_reset', time=self.clock())
                         engine = MusicVisionEngine(self.calibration, self.config, tap_trace=self.tap_trace)
                         started += paused_seconds
@@ -1122,8 +1157,10 @@ class MusicRuntime:
                 if self.config.sample_interval_ms:
                     remaining = self.config.sample_interval_ms / 1000.0 - (self.clock() - loop_started)
                     if remaining > 0:
-                        self.sleeper(remaining)
+                        self._sleep_interruptibly(remaining)
             return self._failure(MusicFailureCode.SONG_TIMEOUT, "Maximum song duration exceeded", task_id)
+        except MusicCancelled as error:
+            return self._failure(MusicFailureCode.CANCELLED, str(error), task_id)
         except MusicTouchError as error:
             return self._failure(MusicFailureCode.TOUCH_BACKEND_FUSED, str(error), task_id)
         except Exception as error:
