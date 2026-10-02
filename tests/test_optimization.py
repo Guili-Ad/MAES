@@ -181,3 +181,27 @@ class ReplayToolTests(unittest.TestCase):
         values = MetricSeries()
         values.extend([1.,2.,3.])
         self.assertEqual(values[:], [1.,2.,3.])
+
+
+class PixelAndDispatchTests(unittest.TestCase):
+    def test_component_output_order_pixels_and_boxes_match_reference(self):
+        import numpy as np
+        from legacy_components import connected_components as original
+        from agent.music.vision import connected_components
+        generator = np.random.default_rng(35)
+        masks = [np.zeros((0,0),bool), np.zeros((9,11),bool), np.ones((9,11),bool),
+                 np.eye(14,dtype=bool), np.indices((17,19)).sum(axis=0)%2 == 0]
+        masks += [generator.random((31,53)) < p for p in (.01,.1,.3,.6,.9) for _ in range(8)]
+        for mask in masks:
+            for threshold in (1,3,10):
+                self.assertEqual(connected_components(mask, threshold), original(mask, threshold))
+
+    def test_post_capture_dispatch_never_waits_for_future_input(self):
+        from agent.music.runtime import MusicRuntime, RuntimeMetrics
+        from test_tap_pipeline import tap_event
+        runtime = MusicRuntime(SimpleNamespace(), MusicConfig(lane_count=7), clock=lambda: 1.)
+        pending = [tap_event(1,3,1.05)]
+        with patch.object(runtime, 'sleeper') as sleep:
+            runtime._execute_due(SimpleNamespace(), pending, 1., RuntimeMetrics(), wait=False)
+        sleep.assert_not_called()
+        self.assertEqual(len(pending), 1)

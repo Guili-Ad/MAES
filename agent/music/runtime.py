@@ -640,18 +640,20 @@ class MusicRuntime:
         now: float,
         metrics: RuntimeMetrics,
         engine: MusicVisionEngine | None = None,
+        *,
+        wait: bool = True,
     ) -> None:
         # Candidate/hold-route refinement may have consumed tens of milliseconds
         # after the caller sampled ``now``.  Never precision-sleep from that stale
         # timestamp: doing so can turn an otherwise on-time isolated tap into the
         # single late action of a song.
         now = max(now, self.clock())
-        base_window = self.config.deadline_execution_window_ms / 1000.0
+        base_window = self.config.deadline_execution_window_ms / 1000.0 if wait else 0.0
         lookahead = base_window
         for event in pending:
             event_window = base_window
             track = engine.tracks.get(event.track_id) if engine is not None else None
-            if event.gesture in {
+            if wait and event.gesture in {
                 NoteGesture.HOLD_START,
                 NoteGesture.HOLD_CONTINUE,
                 NoteGesture.HOLD_END,
@@ -660,7 +662,7 @@ class MusicRuntime:
                 NoteGesture.SUSTAIN_RELEASE,
             }:
                 event_window = self.hold_policy.execution_window_ms(event, track) / 1000.0
-            elif event.gesture == NoteGesture.TAP:
+            elif wait and event.gesture == NoteGesture.TAP:
                 event_window = self.tap_policy.execution_window_ms(event, track, pending) / 1000.0
             if event.deadline <= now + event_window:
                 lookahead = max(lookahead, event_window)
@@ -1068,7 +1070,7 @@ class MusicRuntime:
                 executor.enforce_contact_limits()
                 # Service deadlines already predicted by prior frames before any
                 # relatively expensive UI recognition can block the action loop.
-                self._execute_due(executor, pending, now, self.metrics, engine)
+                self._execute_due(executor, pending, now, self.metrics, engine, wait=False)
                 now = self.clock()
                 if now >= schedule_started + self.config.terminal_initial_delay_ms / 1000.0 and giant_live_title_present(frame.image):
                     LOGGER.info("Music terminal detected by strict giant LIVE visual confirmation")
