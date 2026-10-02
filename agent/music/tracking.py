@@ -113,28 +113,8 @@ def regression_slope(observations: Iterable[TrackObservation], *, recency: bool 
     recent observations must dominate the estimate or the terminal speed is
     underestimated and taps land late.
     """
-    values = list(observations)
-    count = len(values)
-    if count < 2:
-        return 0.0
-    w_sum = 0.0
-    wx_sum = 0.0
-    wy_sum = 0.0
-    wxx_sum = 0.0
-    wxy_sum = 0.0
-    for index, observation in enumerate(values):
-        weight = float(index + 1) if recency else 1.0
-        x = observation.timestamp
-        y = observation.progress
-        w_sum += weight
-        wx_sum += weight * x
-        wy_sum += weight * y
-        wxx_sum += weight * x * x
-        wxy_sum += weight * x * y
-    denominator = w_sum * wxx_sum - wx_sum * wx_sum
-    if denominator <= 1e-9:
-        return 0.0
-    return (w_sum * wxy_sum - wx_sum * wy_sum) / denominator
+    from .motion import weighted_slope
+    return weighted_slope(observations, recency=recency)
 
 
 class MusicVisionEngine:
@@ -2011,7 +1991,7 @@ class MusicVisionEngine:
         maximum_age = self.config.max_schedule_horizon_ms / 1000.0 + 0.5
         refined: list[MusicActionEvent] = []
         for event in pending:
-            if event.source_capture_finished > 0.0 and now - event.source_capture_finished > maximum_age:
+            if event.source_capture_finished is not None and now - event.source_capture_finished > maximum_age:
                 track = self.tracks.get(event.track_id)
                 if track is not None and track.state in {TrackState.TAP_PENDING, TrackState.FLICK_PENDING}:
                     track.state = TrackState.RELEASED
@@ -2392,6 +2372,8 @@ class MusicVisionEngine:
                         coordinate=self._lane_point(lane),
                         tap_group_id=group_id,
                         tap_reference_hit_time=hit,
+                        source_capture_started=marker.observations[-1].capture_started,
+                        source_capture_finished=marker.observations[-1].capture_finished,
                     ))
                     track.hold_sustain_planned_ids.add(marker.marker_id)
                     scheduled.append((lane, hit))

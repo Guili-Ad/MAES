@@ -99,3 +99,41 @@ class InputLifecycleTests(unittest.TestCase):
             with self.assertRaises(MusicCancelled):
                 runtime._sleep_interruptibly(.1)
         self.assertEqual(sleeps, [.01, .01])
+
+
+class MotionAndMetricTests(unittest.TestCase):
+    def test_motion_fit_is_time_translation_invariant(self):
+        from agent.music.tracking import regression_slope
+        from agent.music.sustain import _recency_slope
+        for origin in (0., 13600., 86400., 604800., 2592000., 1e7):
+            values = [SimpleNamespace(timestamp=origin+i*.02, progress=.60+i*.01) for i in range(3)]
+            for function in (regression_slope, _recency_slope):
+                self.assertAlmostEqual(function(values), .5, places=6)
+
+    def test_fit_rejects_nonfinite_and_degenerate_samples(self):
+        from agent.music.tracking import regression_slope
+        for timestamps in ((1., 1.), (float('nan'), 1.), (1., float('inf'))):
+            values = [SimpleNamespace(timestamp=t, progress=.5+i*.01) for i, t in enumerate(timestamps)]
+            self.assertEqual(regression_slope(values), 0.)
+
+    def test_missing_capture_time_does_not_become_host_uptime_latency(self):
+        from agent.music.runtime import MusicRuntime, RuntimeMetrics
+        from test_tap_pipeline import tap_event
+        runtime = MusicRuntime(SimpleNamespace(), MusicConfig(lane_count=7))
+        metrics = RuntimeMetrics()
+        runtime._acknowledge_taps([TapInputReceipt('1', 3, 0, 13600., 13600.001, 13600.002)],
+                                  [tap_event(1, 3, 13599.)], None, metrics)
+        self.assertEqual(len(metrics.perception_to_action), 0)
+
+    def test_metrics_are_bounded_and_full_run_overflow_is_explicit(self):
+        from agent.music.metrics import MetricSeries
+        series = MetricSeries()
+        for _ in range(1000):
+            series.append(2.2)
+        series.append(6000.)
+        series.append(float('nan'))
+        self.assertEqual(len(series), 60)
+        self.assertEqual(series.summary()['count'], 1001)
+        self.assertEqual(series.summary()['p95_upper_ms'], 3)
+        self.assertEqual(series.summary()['overflow_count'], 1)
+        self.assertEqual(series.summary()['invalid_count'], 1)

@@ -29,6 +29,8 @@ class SustainObservation:
     pixel_count: int
     exits: int
     topology: str
+    capture_started: float | None = None
+    capture_finished: float | None = None
 
 
 @dataclass
@@ -97,24 +99,8 @@ class SustainMarker:
 
 
 def _recency_slope(observations) -> float:
-    values = list(observations)
-    count = len(values)
-    if count < 2:
-        return 0.0
-    w_sum = wx_sum = wy_sum = wxx_sum = wxy_sum = 0.0
-    for index, observation in enumerate(values):
-        weight = float(index + 1)
-        x = observation.timestamp
-        y = observation.progress
-        w_sum += weight
-        wx_sum += weight * x
-        wy_sum += weight * y
-        wxx_sum += weight * x * x
-        wxy_sum += weight * x * y
-    denominator = w_sum * wxx_sum - wx_sum * wx_sum
-    if denominator <= 1e-9:
-        return 0.0
-    return (w_sum * wxy_sum - wx_sum * wy_sum) / denominator
+    from .motion import weighted_slope
+    return weighted_slope(observations)
 
 
 class SustainMarkerTracker:
@@ -150,6 +136,8 @@ class SustainMarkerTracker:
                 pixel_count=detection.pixel_count,
                 exits=detection.ribbon_exit_count,
                 topology=detection.topology,
+                capture_started=frame.capture_started,
+                capture_finished=frame.capture_finished,
             ),
             owner=owner,
         )

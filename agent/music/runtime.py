@@ -36,18 +36,24 @@ from .tap_policy import TapTimingPolicy
 from .tap_dispatch import due_tap_batches
 from .tap_trace import TapTrace, VERSION
 from .build_identity import digest
+from .metrics import MetricSeries
 from .tracking import MusicVisionEngine
 from .vision import MaaCandidateProvider, NumpyCandidateProvider, VisualMask, giant_live_title_present
 
 
 @dataclass
 class RuntimeMetrics:
-    capture: list[float] = field(default_factory=list)
-    provider: list[float] = field(default_factory=list)
-    perception_to_action: list[float] = field(default_factory=list)
-    capture_to_action: list[float] = field(default_factory=list)
-    terminal: list[float] = field(default_factory=list)
-    loop: list[float] = field(default_factory=list)
+    capture: MetricSeries = field(default_factory=MetricSeries)
+    provider: MetricSeries = field(default_factory=MetricSeries)
+    perception_to_action: MetricSeries = field(default_factory=MetricSeries)
+    capture_to_action: MetricSeries = field(default_factory=MetricSeries)
+    terminal: MetricSeries = field(default_factory=MetricSeries)
+    loop: MetricSeries = field(default_factory=MetricSeries)
+    mask: MetricSeries = field(default_factory=MetricSeries)
+    tracking: MetricSeries = field(default_factory=MetricSeries)
+    ocr: MetricSeries = field(default_factory=MetricSeries)
+    dispatch_wait: MetricSeries = field(default_factory=MetricSeries)
+    missing_source_times: int = 0
     tracks_created: int = 0
     tracks_retained_peak: int = 0
     tracks_expired: int = 0
@@ -58,7 +64,7 @@ class RuntimeMetrics:
     unscheduled_head_losses: int = 0
 
     def summaries(self, action: list[float]) -> dict[str, dict[str, float | int]]:
-        return {
+        result = {
             "capture": metric_summary(self.capture[-60:]),
             "provider": metric_summary(self.provider[-60:]),
             "perception_to_action": metric_summary(self.perception_to_action[-60:]),
@@ -77,6 +83,16 @@ class RuntimeMetrics:
                 "unscheduled_head_losses": self.unscheduled_head_losses,
             },
         }
+        series = {name: getattr(self, name) for name in ('capture', 'provider', 'perception_to_action',
+                  'capture_to_action', 'terminal', 'loop', 'mask', 'tracking', 'ocr', 'dispatch_wait')}
+        if isinstance(action, MetricSeries):
+            series['action'] = action
+        for name in ('mask', 'ocr', 'dispatch_wait'):
+            result[name] = metric_summary(series[name][-60:])
+        result['tracking_time'] = metric_summary(self.tracking[-60:])
+        result['whole_run'] = {name: values.summary() for name, values in series.items()}
+        result['diagnostics'] = {'missing_source_times': self.missing_source_times, 'recent_window_capacity': 60}
+        return result
 
 
 def _task_id(argv: Any) -> int | None:
@@ -255,8 +271,14 @@ class MusicRuntime:
                                                else event.deadline + self.tap_policy.action_advance_ms(track) / 1000.)
             if receipt.down_call_finished is not None and receipt.down_call_started is not None:
                 self._record_head_action(event, receipt.down_call_started, engine)
-                metrics.perception_to_action.append(max(0., (receipt.down_call_started - event.source_capture_started) * 1000.))
-                metrics.capture_to_action.append(max(0., (receipt.down_call_started - event.source_capture_finished) * 1000.))
+                self._record_source_latency(event, receipt.down_call_started, metrics)
+
+    def _record_source_latency(self, event, started, metrics):
+        if event.source_capture_started is None or event.source_capture_finished is None:
+            metrics.missing_source_times += 1
+            return
+        metrics.perception_to_action.append((started - event.source_capture_started) * 1000.)
+        metrics.capture_to_action.append((started - event.source_capture_finished) * 1000.)
 
     def _flush_due_taps(
         self,
@@ -645,12 +667,14 @@ class MusicRuntime:
             return
         earliest = min(event.deadline for event in near)
         if earliest > now:
+            wait_started = self.clock()
             while earliest - self.clock() > 0.008:
                 self._check_cancelled()
                 self.sleeper(min(0.010, earliest - self.clock() - 0.006))
             while self.clock() < earliest:
                 self._check_cancelled()
             now = self.clock()
+            metrics.dispatch_wait.append((now - wait_started) * 1000.)
         tap_batches = due_tap_batches(pending, now, engine)
         allowed_taps = {e.event_id for batch in tap_batches for e in batch}
         due = [event for event in near if event.deadline <= now
@@ -905,10 +929,7 @@ class MusicRuntime:
             self._record_hold_call(lambda: executor.touch_move(event.lane, *event.coordinate, track_id=event.track_id), event, engine)
         elif event.gesture == NoteGesture.HOLD_END:
             self._record_hold_call(lambda: executor.touch_up(event.lane, track_id=event.track_id), event, engine)
-        if event.source_capture_started > 0.0:
-            metrics.perception_to_action.append(max(0.0, (action_started - event.source_capture_started) * 1000.0))
-        if event.source_capture_finished > 0.0:
-            metrics.capture_to_action.append(max(0.0, (action_started - event.source_capture_finished) * 1000.0))
+        self._record_source_latency(event, action_started, metrics)
 
     @staticmethod
     def pending_within(pending: list[MusicActionEvent], now: float, guard_ms: float) -> bool:
@@ -1060,7 +1081,10 @@ class MusicRuntime:
                     )
                 if now >= next_pause_check:
                     next_pause_check = now + self.config.pause_check_interval_ms / 1000.0
-                    if _recognize(self.context, "MusicPauseDialog", frame.image):
+                    ocr_started = self.clock()
+                    paused = _recognize(self.context, "MusicPauseDialog", frame.image)
+                    self.metrics.ocr.append((self.clock() - ocr_started) * 1000.)
+                    if paused:
                         _resume_frame, sequence, paused_seconds, resume_failure = self._wait_until_resumed(executor, sequence, task_id)
                         if resume_failure is not None:
                             return resume_failure
@@ -1084,7 +1108,9 @@ class MusicRuntime:
                         provider_failures = 0
                         continue
                 try:
+                    mask_started = self.clock()
                     visual = VisualMask.from_image(frame.image, self.calibration)
+                    self.metrics.mask.append((self.clock() - mask_started) * 1000.)
                     provider_started = self.clock()
                     candidates = self.provider.detect(frame, visual)
                     self.metrics.provider.append((self.clock() - provider_started) * 1000.0)
@@ -1094,7 +1120,9 @@ class MusicRuntime:
                     if provider_failures >= self.config.max_provider_failures:
                         return self._failure(MusicFailureCode.CANDIDATE_FAILURE, f"Candidate Provider failed three times: {error}", task_id)
                     continue
+                tracking_started = self.clock()
                 new_events = engine.update(frame, candidates, visual)
+                self.metrics.tracking.append((self.clock() - tracking_started) * 1000.)
                 self.metrics.tracks_created = max(self.metrics.tracks_created, engine.next_track_id - 1)
                 self.metrics.tracks_retained_peak = max(self.metrics.tracks_retained_peak, len(engine.tracks))
                 self.metrics.tracks_expired = engine.expired_track_count

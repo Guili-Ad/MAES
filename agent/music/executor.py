@@ -8,6 +8,7 @@ from agent.common import LOGGER
 
 from .models import FlickRequest, LaneInputState, MusicConfig, NoteGesture
 from .storage import fuse_touch_backend
+from .metrics import MetricSeries
 
 try:
     from maa.pipeline import JActionType, JClick, JSwipe, JTouch, JTouchUp
@@ -85,7 +86,7 @@ class MusicActionExecutor:
         self.clock = clock
         self.healthy = True
         self.fuse_reason = ""
-        self.action_durations: list[float] = []
+        self.action_durations = MetricSeries()
         self.lanes: dict[int, LaneInputState] = {}
         self._used_event_ids: set[tuple[str, int, str]] = set()
         self.run_id = ''

@@ -721,8 +721,8 @@ class MusicActionEvent:
     coordinate: tuple[int, int]
     direction: NoteGesture = NoteGesture.UNKNOWN
     contact_policy: str = "auto"
-    source_capture_started: float = 0.0
-    source_capture_finished: float = 0.0
+    source_capture_started: float | None = None
+    source_capture_finished: float | None = None
     tap_group_id: str | None = None
     tap_frozen: bool = False
     tap_reference_hit_time: float | None = None
