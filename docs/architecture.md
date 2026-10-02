@@ -17,6 +17,7 @@ MAES 由两大部分组成：
 
 - **校准**：`MusicCalibrate` 在演唱会进行页识别判定点（模板 `resource/base/image/music_lane_judge_point.png`），保存轨道折线、候选 ROI 与视觉基线。
 - **跟踪**：`agent/music/tracking.py` 维护轨道生命周期（Tap/长按/划动/变轨路线），`holds.py`/`hold_policy.py`/`head_identity.py` 负责长按语义。
+- **隔离边界**：`association.py`仅处理观测关联，`stationary.py`处理轨迹级静止证据，`hold_notes.py`规划长按小音符；引擎保留兼容编排。点按时序与长按时序仍使用各自策略，共享`motion.py`数值拟合与`components.py`像素原语，不跨模块修改对方截止时间。
 - **调度与执行**：`agent/music/runtime.py` 主循环；`executor.py` 通过 MaaFramework 直接动作（TouchDown/TouchMove/TouchUp/Swipe）执行；默认按 Maatouch 高级输入运行。
 - **诊断**：`tap_trace.py` 输出每轮 JSONL trace；`storage.py` 保存最近结果与触控状态。
 
@@ -41,4 +42,6 @@ MAES 由两大部分组成：
 
 ## 版本与日志标识
 
-- 引擎版本串位于 `agent/music/tap_trace.py` 的 `VERSION`（当前 `v1.0.0-Stable`），会写入 trace 头部便于复盘。
+- 构建身份由`build_identity.py`计算；包内`build-manifest.json`记录源码、Pipeline及实际依赖文件哈希。打包与解压核验全清单；启动只校验源码及Pipeline，避免重复扫描运行库。显示版本为`v1.0.1-opt-candidate`，不代替内容身份。
+- 运行、恢复段、事件三级命名空间隔离去重；只有确认释放所有触点才能开始新段。未确认释放的触点不得再分配。
+- 7轨入口保持`hold_notes_as_taps=true`和`hold_sustain_enabled=false`；旧持续动作留作兼容测试，不自动启用。

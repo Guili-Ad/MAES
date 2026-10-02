@@ -21,7 +21,8 @@
 
 ## 用户数据
 
-- 默认目录：`%LOCALAPPDATA%\MAES`
+- 独立优化候选包默认目录：包内`user-data/`；只复制必要校准及触控状态，不覆盖原用户目录。直接运行GUI也会隔离。
+- 原发行包及源码默认目录：`%LOCALAPPDATA%\MAES`
   - `calibration/music.json`：点位校准。
   - `music_touch.json`：触控探针状态（诊断用）。
   - `music_last_result.json`：最近一次打歌结果与性能指标。
@@ -33,5 +34,8 @@
 1. 游戏内成绩截图：Perfect/Great/Good/Bad/Miss、Max Combo、SUPPORT 次数；
 2. 整段录屏（若方便）；
 3. 运行目录下 `logs/`（含 `tap-traces`）与 `debug/on_error`（若有）；
-4. `%LOCALAPPDATA%\MAES\music_last_result.json`；
+4. 对应包的数据目录中的`music_last_result.json`，候选默认在包内`user-data/`；
 5. 模拟器名称与版本、输入模式、分辨率、以及是否使用校准后的同一设备签名。
+
+候选构建编号、运行编号和恢复段编号会写入诊断。Perfect下有Support小标时按Miss记录，不能只凭FC徽章认定验收通过。
+当前启用的是长按头部与内部小音符独立点按、尾端划动模式；兼容持续触控路径保留但未启用。

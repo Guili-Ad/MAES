@@ -244,7 +244,8 @@ class MusicActionExecutor:
         """
         controller = self._controller()
         duplicate_lane = len({request[0] for request, _ in fresh}) < len(fresh)
-        available = self.config.max_contacts - len(self.active_contacts) - len(self._temporary_contacts)
+        available = self.config.max_contacts - len(set(self.active_contacts.values())
+                    | self._temporary_contacts | self.release_unconfirmed)
         serial = len(fresh) > 1 and (duplicate_lane or not self.supports_multi_touch or len(fresh) > available)
         batches = [[item] for item in fresh] if serial else [fresh]
         if serial:
@@ -372,7 +373,8 @@ class MusicActionExecutor:
         # Defense in depth: never overlap contacts on one lane, even when a
         # caller bypasses the scheduler. Valid chords have distinct lanes.
         duplicate_lane = len({request[0] for request, _ in fresh}) < len(fresh)
-        available = self.config.max_contacts - len(self.active_contacts) - len(self._temporary_contacts)
+        available = self.config.max_contacts - len(set(self.active_contacts.values())
+                    | self._temporary_contacts | self.release_unconfirmed)
         serial = len(fresh) > 1 and (duplicate_lane or not self.supports_multi_touch or len(fresh) > available)
         batches = [[item] for item in fresh] if serial else [fresh]
         if serial:
@@ -731,7 +733,7 @@ class MusicActionExecutor:
         """
         if self.supports_multi_touch:
             return True
-        return not self._temporary_contacts and not self.active_contacts
+        return not self._temporary_contacts and not self.active_contacts and not self.release_unconfirmed
 
     def enforce_contact_limits(self, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now

@@ -93,6 +93,18 @@ class InputLifecycleTests(unittest.TestCase):
         self.assertEqual(executor._allocate_temporary_contact(), 1)
         self.assertEqual(executor._allocate_contact(3), 2)
 
+    def test_chord_capacity_counts_unconfirmed_contacts_and_falls_back_serially(self):
+        from dataclasses import replace
+        executor = self.executor()
+        executor.config = replace(executor.config, max_contacts=2)
+        executor.release_unconfirmed.add(0)
+        with patch.object(executor, '_run') as run:
+            executor.tap_many([(2,480,620),(4,800,620)], event_ids=['a','b'])
+        self.assertEqual([c.args[0].value for c in run.call_args_list],
+                         ['TouchDown','TouchUp','TouchDown','TouchUp'])
+        self.assertIn('contact-capacity', executor.tap_fallbacks)
+        self.assertEqual(executor.release_unconfirmed, {0})
+
     def test_failed_lane_release_keeps_contact_and_reports_when_fused(self):
         executor = self.executor()
         executor.healthy = False
@@ -298,3 +310,15 @@ class ProductionLoopReplayTests(unittest.TestCase):
             profile.write_text(json.dumps({'by_capture':{'0':{'capture_failure':True}}}), encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'Initial replay capture failed'):
                 self.replay(profile)
+
+    def test_first_resumed_capture_reaches_new_tracker_without_another_capture(self):
+        with tempfile.TemporaryDirectory(prefix='maes-cost-test-') as temporary:
+            profile = Path(temporary)/'cost.json'
+            profile.write_text(json.dumps({'by_capture':{'1':{'ui':'pause'},'2':{'ui':'pause'}}}), encoding='utf-8')
+            result = self.replay(profile)
+        resets = [row for row in result['trace'] if row['kind'] == 'pause_reset']
+        self.assertEqual(len(resets), 1)
+        resumed = [row for row in result['observations'] if row['segment'] == 1]
+        self.assertTrue(resumed)
+        self.assertLess(resumed[0]['capture_finished'], resets[0]['time'])
+        self.assertEqual(resumed[0]['sequence'], 3)

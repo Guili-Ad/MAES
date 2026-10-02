@@ -142,6 +142,18 @@ class TextZoneTests(unittest.TestCase):
         self.assertFalse(engine.text_zones)
         self.assertTrue(all(t.state == TrackState.APPROACHING for t in tracks))
 
+    def test_short_freeze_retains_real_moving_note_identity(self):
+        engine = self._engine()
+        image = np.zeros((720,1280,3), dtype=np.uint8)
+        visual = VisualMask.from_image(image, calibration())
+        progress = [.4,.43,.46,.49,.49,.49,.52,.55,.58,.61,.64,.67,.70,.73,.76]
+        for sequence, value in enumerate(progress):
+            note = candidate_at(calibration(), 3, value)
+            engine.update(MusicFrame(sequence, sequence*.03, sequence*.03, sequence*.03, image), [note], visual)
+        self.assertEqual(engine.next_track_id, 2)
+        self.assertFalse(engine.text_zones)
+        self.assertNotEqual(engine.tracks[1].state, TrackState.LOST)
+
 
 class ImpostorGuardTests(unittest.TestCase):
     def _match(self, guard: bool):

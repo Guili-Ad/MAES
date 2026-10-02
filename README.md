@@ -1,7 +1,7 @@
 # MAES
 
 基于 MaaFramework 5.12.2 与 ProjectInterface V2 ，依托Deepseek和Codex实现的《偶像梦幻祭2》打歌自动化项目。
-当前版本 **v1.0.0-Stable**，聚焦「临时打歌」与「打歌点位校准」。
+当前源码 **v1.0.1-opt-candidate**，为待实战验证的优化候选，不代表稳定FC版本。旧发行目录保持不变。
 
 ## 功能范围
 
@@ -31,6 +31,9 @@
 
 **日志与数据**：任务日志位于 `logs/`（含 `tap-traces`）；错误截图位于 `debug/on_error`；用户数据（校准、触控状态、最近结果）保存在本机 `%LOCALAPPDATA%\MAES`，可用环境变量 `MAES_DATA_DIR` 指定其他目录。
 
+优化候选包含 `candidate-package.marker`，默认使用包内 `user-data/` 隔离保存状态，构建时复制必要校准及触控探针状态，不覆盖旧版本数据。显式设置 `MAES_DATA_DIR` 时该设置优先。
+当前7轨入口将长按头部及白色条带上的小音符独立点按，不切换到旧持续按压模式；尾端划动仍使用既有语义。
+
 ## 已知限制
 
 - 仅支持 1280×720 的演唱会进行页；其他分辨率需要自行适配。
@@ -49,10 +52,10 @@ powershell -ExecutionPolicy Bypass -File tools/bootstrap.ps1
 # 2. 项目检查（含离线运行时与原生库校验）
 runtime\python\python.exe -B tools\check_project.py --require-runtime
 
-# 3. 单元测试（178 项）
-runtime\python\python.exe -B -m unittest discover -s tests -p "test_*.py" -q
+# 3. 单元测试（当前250项；以运行输出为准）
+runtime\python\python.exe -B tools\run_tests.py
 
-# 4. 构建发行包（输出 dist\MAES）
+# 4. 构建独立候选包；目标已存在时拒绝覆盖
 powershell -ExecutionPolicy Bypass -File tools/package.ps1
 ```
 
@@ -60,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File tools/package.ps1
 
 - `agent/`：Python 动作服务与打歌引擎（`agent/music/` 为视觉跟踪、输入执行与运行时）。
 - `resource/base/`：Pipeline、判定点模板与 OCR 模型；`resource/bside/` 为 B 服覆盖层（当前未启用）。
-- `tests/`：178 项单元与契约测试。
+- `tests/`：单元与契约测试；开发候选序列位于 fixtures，不进入运行资源。
 - `tools/`：bootstrap、项目检查、测试与打包脚本。
 - `provenance/`：资源来源与许可记录。
 - `docs/`：架构、使用与诊断说明。

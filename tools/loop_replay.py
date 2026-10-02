@@ -96,11 +96,13 @@ def run_loop(stream, calibration, config, args):
     runtime.input_mode = 'advanced'
     executor = MusicActionExecutor(context, 1280, 720, config, advanced=True, multi_touch=True,
                                    clock=clock, sleeper=runtime._sleep_interruptibly)
-    engines, scheduled, pending_snapshot, samples = [], [], [], []
+    engines, scheduled, pending_snapshot, samples, observations = [], [], [], [], []
     def new_engine(*positional, **keywords):
         engine = MusicVisionEngine(*positional, **keywords)
         original = engine.update
         def update(frame, candidates, visual):
+            observations.append({'segment': runtime.tap_trace.segment_id, 'sequence':frame.sequence,
+                                 'capture_finished':frame.capture_finished})
             begin = time.perf_counter()
             events = original(frame, candidates, visual)
             samples.append((time.perf_counter()-begin)*1000.)
@@ -140,4 +142,4 @@ def run_loop(stream, calibration, config, args):
             'metrics_ms': runtime.metrics.summaries(executor.action_durations),
             'stop': {'status': result.status, 'reason': result.reason, 'cleanup_failure': runtime.cleanup_failure},
             'game_bad_miss': 'unavailable: compressed video / known candidates, simulated input and OCR',
-            'trace': list(runtime.tap_trace.records), 'observations': []}
+            'trace': list(runtime.tap_trace.records), 'observations': observations}

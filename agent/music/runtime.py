@@ -1067,7 +1067,7 @@ class MusicRuntime:
                     continue
                 capture_failures = 0
                 now = self.clock()
-                executor.enforce_contact_limits()
+                executor.enforce_contact_limits(self.clock())
                 # Service deadlines already predicted by prior frames before any
                 # relatively expensive UI recognition can block the action loop.
                 self._execute_due(executor, pending, now, self.metrics, engine, wait=False)
