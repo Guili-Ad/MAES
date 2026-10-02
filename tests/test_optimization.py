@@ -137,3 +137,24 @@ class MotionAndMetricTests(unittest.TestCase):
         self.assertEqual(series.summary()['p95_upper_ms'], 3)
         self.assertEqual(series.summary()['overflow_count'], 1)
         self.assertEqual(series.summary()['invalid_count'], 1)
+
+
+class CalibrationSafetyTests(unittest.TestCase):
+    def test_confirmed_nine_lanes_never_loads_seven_lane_profile(self):
+        from agent.music.runtime import _resolve_calibration
+        context = SimpleNamespace(run_recognition=lambda *_: object())
+        boxes = [SimpleNamespace(box=[100+i*100, 600, 10, 10]) for i in range(9)]
+        with patch('agent.music.runtime.recognition_results', return_value=boxes), \
+             patch('agent.music.runtime.load_calibration') as load:
+            with self.assertRaises(ValueError):
+                _resolve_calibration(context, MusicConfig(lane_count=7), None)
+        load.assert_not_called()
+
+    def test_geometry_rejects_invalid_or_duplicate_targets(self):
+        from agent.music.calibration import _validate
+        from test_longtap_branch import calibration
+        for value in ([-1, 620], [float('nan'), 620], [160, 620]):
+            cal = calibration()
+            cal.points[1] = value
+            with self.assertRaises(ValueError):
+                _validate(cal)

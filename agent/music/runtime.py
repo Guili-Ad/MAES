@@ -156,6 +156,8 @@ def _resolve_calibration(context: Any, config: MusicConfig, image: Any) -> Music
     expected = config.lane_count if config.lane_count in (7, 9) else 0
     if expected and lane_count == expected:
         return load_calibration(expected, image)
+    if expected and lane_count in (7, 9):
+        raise ValueError(f"Configured for {expected} lanes but the current live screen has {lane_count}")
     if expected and lane_count >= 4:
         LOGGER.warning(
             "Lane target recognition found %s targets but configuration expects %s lanes; "
