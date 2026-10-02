@@ -27,7 +27,7 @@ def discontinuity(track, progress, timestamp):
     return None
 
 
-def coastable_tap(track, config, *, now=None, sequence=None):
+def coastable_tap(track, config, *, now=None, sequence=None, min_speed=None):
     """Ordinary taps with healthy forward motion may coast through occlusion.
 
     The judgement text tints and fragments centre-lane pixels; the track's own
@@ -48,7 +48,8 @@ def coastable_tap(track, config, *, now=None, sequence=None):
     last = observations[-1]
     if last.progress < config.coast_min_progress or last.progress >= 0.95:
         return False
-    if track.speed < config.coast_min_speed:
+    speed_gate = config.coast_min_speed if min_speed is None else min_speed
+    if track.speed < speed_gate:
         return False
     if last.progress - observations[-2].progress < 0.0:
         return False

@@ -20,6 +20,11 @@ class NoteGesture(str, Enum):
     HOLD_START = "HoldStart"
     HOLD_CONTINUE = "HoldContinue"
     HOLD_END = "HoldEnd"
+    # Sustained small-note chain: the hold head is tapped, then every ribbon
+    # checkpoint (and the terminal cap) receives its own held B window.
+    SUSTAIN_PRESS = "SustainPress"
+    SUSTAIN_MOVE = "SustainMove"
+    SUSTAIN_RELEASE = "SustainRelease"
     FLICK_LEFT = "FlickLeft"
     FLICK_RIGHT = "FlickRight"
     FLICK_UP = "FlickUp"
@@ -172,6 +177,33 @@ class MusicConfig:
     coast_min_speed: float = 0.25
     coast_min_progress: float = 0.45
     coast_max_age_ms: float = 1600.0
+    # The fixed threshold above is calibrated for the default fall speed.
+    # Slower note speeds shrink every track's progress rate, which used to
+    # disable coasting exactly when the judgement text needs it most.  When
+    # adaptive mode is on, the effective threshold is a fraction of the
+    # median speed of healthy tracked notes, clamped to [floor, coast_min_speed].
+    coast_adaptive_speed: bool = False
+    coast_speed_floor: float = 0.10
+    coast_speed_ratio: float = 0.40
+    # A stationary HUD glyph row (judgement text, banners) can freeze a moving
+    # centre-lane track and absorb later real notes.  Freeze evidence from
+    # several distinct tracks inside one small cell forms a suppression zone;
+    # candidates inside it are ignored for the rest of the song.
+    stationary_zone_enabled: bool = False
+    stationary_zone_min_tracks: int = 3
+    stationary_zone_radius_px: float = 48.0
+    stationary_zone_freeze_ms: float = 320.0
+    stationary_zone_max_zones: int = 8
+    # A candidate that cannot advance a healthy track is a stationary impostor
+    # (glyph/decor) and must not replace the track's moving identity.
+    stationary_impostor_guard: bool = False
+    # Linked pairs with wildly different arrivals must not share one deadline:
+    # otherwise one side of the chord fires tens of milliseconds early/late.
+    # Zero keeps the historical shared midpoint (legacy regression contract).
+    tap_chord_max_skew_ms: float = 0.0
+    # Two vertically overlapping notes merge into one tall component at slow
+    # fall speeds.  A conservative valley split recovers both taps.
+    split_stacked_notes: bool = False
 
     # The bonus-star head is identical for taps and holds, so one confirmed
     # ribbon frame must commit a bonus note to a hold (evidence never decays
@@ -294,6 +326,33 @@ class MusicConfig:
     # carrying a tap/head/tail across its deadline.
     pre_capture_deadline_guard_ms: float = 45.0
     hold_move_advance_ms: float = 280.0
+    # Sustained small-note chain: the hold head is tapped (ABA), then every
+    # ribbon marker (middle checkpoints and the terminal cap) receives its own
+    # conservative B press window on the marker's lane.  Adjacent windows closer
+    # than the merge gap share one continuous contact; the contact is lifted
+    # between distant windows to avoid swallowing ordinary notes.
+    hold_sustain_enabled: bool = True
+    hold_sustain_press_advance_ms: float = 120.0
+    hold_sustain_press_hold_ms: float = 150.0
+    hold_sustain_merge_gap_ms: float = 120.0
+    hold_sustain_release_delay_ms: float = 200.0
+    hold_sustain_move_advance_ms: float = 200.0
+    hold_sustain_marker_min_samples: int = 3
+    hold_sustain_marker_min_speed: float = 0.02
+    hold_sustain_marker_max_horizon_ms: float = 8000.0
+    # A bound ribbon-tip flick must agree with the hold's release estimate.
+    # A sprite that predicts an arrival far beyond it is a different note (or
+    # a static decoration) and is unbound so it can be swiped on its own.
+    hold_end_flick_bind_tolerance_ms: float = 400.0
+    # Tap-only hold handling: the hold head is still detected (it predicts the
+    # small-note chain), but the head, every ribbon small note and the terminal
+    # cap are dispatched as ordinary taps; a ribbon-tip flick stays a normal
+    # standalone swipe.  No sustained contact is ever created in this mode.
+    hold_notes_as_taps: bool = False
+    hold_note_tap_horizon_ms: float = 350.0
+    hold_note_tap_dedupe_ms: float = 80.0
+    hold_note_chord_window_ms: float = 30.0
+    hold_note_contact_max_ms: float = 1200.0
     enable_holds: bool = False
     # Four-direction flick support.  Direction is classified purely by the
     # sprite's colour family (blue=right, red=left, violet=up, pink=down).
@@ -465,6 +524,46 @@ class MusicConfig:
             raise ValueError("hold_ribbon_extension_ms is invalid")
         if not 0 <= config.hold_move_advance_ms <= config.hold_fallback_duration_ms:
             raise ValueError("hold_move_advance_ms is invalid")
+        if not 0.0 <= config.hold_sustain_press_advance_ms <= 400.0:
+            raise ValueError("hold_sustain_press_advance_ms is invalid")
+        if not 30.0 <= config.hold_sustain_press_hold_ms <= 800.0:
+            raise ValueError("hold_sustain_press_hold_ms is invalid")
+        if not 0.0 <= config.hold_sustain_merge_gap_ms <= 500.0:
+            raise ValueError("hold_sustain_merge_gap_ms is invalid")
+        if not 0.0 <= config.hold_sustain_release_delay_ms <= 600.0:
+            raise ValueError("hold_sustain_release_delay_ms is invalid")
+        if not 0.0 <= config.hold_sustain_move_advance_ms <= 500.0:
+            raise ValueError("hold_sustain_move_advance_ms is invalid")
+        if not 2 <= config.hold_sustain_marker_min_samples <= 8:
+            raise ValueError("hold_sustain_marker_min_samples is invalid")
+        if not 0.0 <= config.hold_sustain_marker_min_speed <= 1.0:
+            raise ValueError("hold_sustain_marker_min_speed is invalid")
+        if not 500.0 <= config.hold_sustain_marker_max_horizon_ms <= 15000.0:
+            raise ValueError("hold_sustain_marker_max_horizon_ms is invalid")
+        if not 0.0 <= config.hold_end_flick_bind_tolerance_ms <= 1500.0:
+            raise ValueError("hold_end_flick_bind_tolerance_ms is invalid")
+        if not 100.0 <= config.hold_note_tap_horizon_ms <= 1000.0:
+            raise ValueError("hold_note_tap_horizon_ms is invalid")
+        if not 0.0 <= config.hold_note_tap_dedupe_ms <= 200.0:
+            raise ValueError("hold_note_tap_dedupe_ms is invalid")
+        if not 0.0 <= config.hold_note_chord_window_ms <= 120.0:
+            raise ValueError("hold_note_chord_window_ms is invalid")
+        if not 200.0 <= config.hold_note_contact_max_ms <= 5000.0:
+            raise ValueError("hold_note_contact_max_ms is invalid")
+        if not 0.0 <= config.coast_speed_floor <= config.coast_min_speed:
+            raise ValueError("coast_speed_floor is invalid")
+        if not 0.05 <= config.coast_speed_ratio <= 1.0:
+            raise ValueError("coast_speed_ratio is invalid")
+        if not 2 <= config.stationary_zone_min_tracks <= 8:
+            raise ValueError("stationary_zone_min_tracks is invalid")
+        if not 16.0 <= config.stationary_zone_radius_px <= 160.0:
+            raise ValueError("stationary_zone_radius_px is invalid")
+        if not 100.0 <= config.stationary_zone_freeze_ms <= 1500.0:
+            raise ValueError("stationary_zone_freeze_ms is invalid")
+        if not 1 <= config.stationary_zone_max_zones <= 16:
+            raise ValueError("stationary_zone_max_zones is invalid")
+        if config.tap_chord_max_skew_ms != 0.0 and not 20.0 <= config.tap_chord_max_skew_ms <= 400.0:
+            raise ValueError("tap_chord_max_skew_ms is invalid")
         if not 0 <= config.hold_cap_acquire_delay_ms <= config.hold_fallback_duration_ms:
             raise ValueError("hold_cap_acquire_delay_ms is invalid")
         if not 0.7 <= config.hold_cap_lock_progress <= 1.0:
@@ -564,6 +663,14 @@ class NoteTrack:
     hold_fold_target_frames: int = 0
     hold_fold_route_confirmed: bool = False
     hold_fold_move_scheduled: bool = False
+    # Sustained small-note chain planner state: marker ids already folded into
+    # an emitted window, the active chain lane and its refinable release time.
+    hold_sustain_planned_ids: set[int] = field(default_factory=set)
+    hold_sustain_chain_active: bool = False
+    hold_sustain_chain_lane: int | None = None
+    hold_sustain_release_time: float | None = None
+    hold_sustain_release_event_id: str = ""
+    hold_sustain_final_emitted: bool = False
     hold_tail_loss_frames: int = 0
     bonus_star: bool = False
     # Born from a colour-classified flick sprite; carries its direction.

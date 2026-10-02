@@ -333,8 +333,8 @@ class MusicRuntime:
         if self.calibration is None:
             raise RuntimeError("Calibration is not loaded")
         if name == "maa":
-            return MaaCandidateProvider(self.context, self.calibration, self.config.candidate_iou_threshold, self.config.candidate_min_size)
-        return NumpyCandidateProvider(self.calibration, self.config.candidate_iou_threshold, self.config.candidate_min_size)
+            return MaaCandidateProvider(self.context, self.calibration, self.config.candidate_iou_threshold, self.config.candidate_min_size, self.config.split_stacked_notes)
+        return NumpyCandidateProvider(self.calibration, self.config.candidate_iou_threshold, self.config.candidate_min_size, self.config.split_stacked_notes)
 
     def provider_gate(self, first_frame: MusicFrame, task_id: int | None = None) -> MusicRunResult | None:
         if self.calibration is None:
@@ -588,7 +588,14 @@ class MusicRuntime:
         for event in pending:
             event_window = base_window
             track = engine.tracks.get(event.track_id) if engine is not None else None
-            if event.gesture in {NoteGesture.HOLD_START, NoteGesture.HOLD_CONTINUE, NoteGesture.HOLD_END}:
+            if event.gesture in {
+                NoteGesture.HOLD_START,
+                NoteGesture.HOLD_CONTINUE,
+                NoteGesture.HOLD_END,
+                NoteGesture.SUSTAIN_PRESS,
+                NoteGesture.SUSTAIN_MOVE,
+                NoteGesture.SUSTAIN_RELEASE,
+            }:
                 event_window = self.hold_policy.execution_window_ms(event, track) / 1000.0
             elif event.gesture == NoteGesture.TAP:
                 event_window = self.tap_policy.execution_window_ms(event, track, pending) / 1000.0
@@ -622,7 +629,19 @@ class MusicRuntime:
                     for event in late
                 ],
             )
-        taps = [event for event in due if event.gesture == NoteGesture.TAP or (event.gesture == NoteGesture.HOLD_START and not executor.supports_holds)]
+        taps = [
+            event
+            for event in due
+            if event.gesture == NoteGesture.TAP
+            or (
+                event.gesture == NoteGesture.HOLD_START
+                and (
+                    not executor.supports_holds
+                    or self.config.hold_sustain_enabled
+                    or self.config.hold_notes_as_taps
+                )
+            )
+        ]
         if taps:
             fallback_holds = [e for e in taps if e.gesture == NoteGesture.HOLD_START]
             batches = tap_batches + ([fallback_holds] if fallback_holds else [])
@@ -641,13 +660,20 @@ class MusicRuntime:
                         self._in_flight_taps[event.event_id] = event
                 else:
                     self._acknowledge_taps(receipts or [], batch, engine, metrics)
-            if engine is not None and not executor.supports_holds:
+            if engine is not None:
                 for event in taps:
                     if event.gesture != NoteGesture.HOLD_START:
                         continue
                     fallback_track = engine.tracks.get(event.track_id)
-                    if fallback_track is not None:
+                    if fallback_track is None:
+                        continue
+                    if not executor.supports_holds:
                         fallback_track.state = TrackState.RELEASED
+                    elif self.config.hold_sustain_enabled or self.config.hold_notes_as_taps:
+                        # The head is judged as a tap; the track stays live so
+                        # the sustained-chain / small-note planner can press or
+                        # tap the following notes.
+                        fallback_track.state = TrackState.HOLDING
         suppressed_tracks: set[int] = set()
         for event in due:
             if event in taps:
@@ -665,6 +691,46 @@ class MusicRuntime:
     ) -> None:
         """Owner-guarded dispatch of one due non-tap event (flicks included)."""
         if event.track_id in suppressed_tracks:
+            return
+        if event.gesture == NoteGesture.SUSTAIN_PRESS:
+            lane_owner = executor.hold_owner(event.lane)
+            if lane_owner == event.track_id:
+                return
+            if event.lane in executor.active_contacts:
+                LOGGER.warning(
+                    "Music sustain press skipped occupied lane=%s track=%s owner=%s owner_track=%s",
+                    event.lane,
+                    event.track_id,
+                    lane_owner,
+                    event.event_id,
+                )
+                return
+            self._record_hold_call(
+                lambda: executor.touch_down(event.lane, *event.coordinate, track_id=event.track_id),
+                event,
+                engine,
+            )
+            return
+        if event.gesture == NoteGesture.SUSTAIN_MOVE:
+            if executor.hold_owner(event.lane) != event.track_id:
+                return
+            self._record_hold_call(
+                lambda: executor.touch_move(event.lane, *event.coordinate, track_id=event.track_id),
+                event,
+                engine,
+            )
+            return
+        if event.gesture == NoteGesture.SUSTAIN_RELEASE:
+            self._record_hold_call(
+                lambda: executor.release_track(event.track_id),
+                event,
+                engine,
+            )
+            if event.contact_policy == "sustain_final" and engine is not None:
+                track = engine.tracks.get(event.track_id)
+                if track is not None:
+                    track.state = TrackState.RELEASED
+                    engine._retire_hold_end_flick(track)
             return
         owner = executor.hold_owner(event.lane)
         occupied = event.lane in executor.active_contacts
@@ -724,7 +790,12 @@ class MusicRuntime:
             or (event.gesture in FLICK_GESTURES and event.contact_policy == "held_flick")
         )
         conflict = event.gesture == NoteGesture.HOLD_START and occupied
-        stale_followup = persistent_followup and owner != event.track_id
+        held_flick_event = event.gesture in FLICK_GESTURES and event.contact_policy == "held_flick"
+        stale_followup = (
+            persistent_followup
+            and owner != event.track_id
+            and not (self.config.hold_sustain_enabled and held_flick_event)
+        )
         if conflict or stale_followup:
             reason = "occupied" if conflict else "owner-mismatch"
             LOGGER.warning(
@@ -752,17 +823,37 @@ class MusicRuntime:
                 event.gesture.value,
                 "held_flick" if event.contact_policy == "held_flick" else "standalone",
             )
+            held_flick = (
+                event.contact_policy == "held_flick"
+                and executor.hold_owner(event.lane) == event.track_id
+            )
+            if event.contact_policy == "held_flick" and not held_flick:
+                LOGGER.warning(
+                    "Music held flick had no owned contact; performing a standalone swipe lane=%s track=%s event=%s",
+                    event.lane,
+                    event.track_id,
+                    event.event_id,
+                )
             executor.swipe(
                 FlickRequest(
                     event.lane,
                     *event.coordinate,
                     event.gesture,
-                    already_down=event.contact_policy == "held_flick",
+                    already_down=held_flick,
                 ),
                 event_id=event.event_id,
-                track_id=event.track_id if event.contact_policy == "held_flick" else None,
+                track_id=event.track_id if held_flick else None,
                 tick=lambda: self._flush_due_taps(executor, pending, engine, metrics),
             )
+            if (
+                engine is not None
+                and self.config.hold_sustain_enabled
+                and event.event_id.startswith("sustain-flick-")
+            ):
+                track = engine.tracks.get(event.track_id)
+                if track is not None:
+                    track.state = TrackState.RELEASED
+                    engine._retire_hold_end_flick(track)
             self._record_head_action(event, action_started, engine)
         elif event.gesture == NoteGesture.HOLD_START:
             self._record_hold_call(lambda: executor.touch_down(event.lane, *event.coordinate, track_id=event.track_id), event, engine)

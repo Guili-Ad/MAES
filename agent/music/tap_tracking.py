@@ -122,6 +122,15 @@ def associate_taps(tracks, entries, frame, config, safe_candidate, trace, owned=
                     and projection.progress - previous.progress >= -0.03):
                 continue
             reason = discontinuity(track, projection.progress, frame.midpoint) if safe[index] else None
+            if reason is None and config.stationary_impostor_guard and track.speed > .10:
+                interval = frame.midpoint - previous.timestamp
+                if (interval > .05
+                        and projection.progress - previous.progress
+                        <= max(.004, track.speed * interval * .25)):
+                    # The candidate did not advance with a healthy moving
+                    # track: a stationary glyph/decor must not replace the
+                    # track's moving identity.
+                    reason = 'stationary-impostor'
             if reason:
                 if track.track_id not in rejected:
                     trace.add('tap_association_rejected', time=frame.midpoint, frame=frame.sequence,

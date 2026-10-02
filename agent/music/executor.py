@@ -574,6 +574,11 @@ class MusicActionExecutor:
             return
         self._touch_up(lane)
 
+    def release_track(self, track_id: int) -> None:
+        for lane, state in list(self.lanes.items()):
+            if state.contact is not None and state.hold_track_id == track_id:
+                self._touch_up(lane)
+
     def hold_flick(
         self,
         lane: int,
@@ -691,12 +696,17 @@ class MusicActionExecutor:
 
     def enforce_contact_limits(self, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
+        limit_ms = (
+            self.config.hold_note_contact_max_ms
+            if self.config.hold_notes_as_taps
+            else self.config.max_contact_ms
+        )
         expired = [
             lane
             for lane, state in self.lanes.items()
             if state.contact is not None
             and state.contact_started > 0
-            and (current - state.contact_started) * 1000.0 > self.config.max_contact_ms
+            and (current - state.contact_started) * 1000.0 > limit_ms
         ]
         if not expired:
             return

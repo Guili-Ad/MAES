@@ -180,7 +180,7 @@ def main():
             raw_cal = raw_cal['profiles']['7@1280x720']
     cal = MusicCalibrationData(**raw_cal)
     config = MusicConfig(**({'lane_count': 7, 'enable_holds': True} | raw_config))
-    provider = NumpyCandidateProvider(cal, config.candidate_iou_threshold, config.candidate_min_size)
+    provider = NumpyCandidateProvider(cal, config.candidate_iou_threshold, config.candidate_min_size, config.split_stacked_notes)
     clock = ReplayClock()
     context = RecordingContext(clock, args.action_ms)
     engine = MusicVisionEngine(cal, config)

@@ -159,6 +159,73 @@ def note_like_candidate(candidate: MusicCandidate, calibration: MusicCalibration
     return candidate.fill_ratio >= 0.45
 
 
+def split_stacked_notes(
+    candidates: Iterable[MusicCandidate],
+    visual: VisualMask,
+    calibration: MusicCalibrationData,
+    min_size: int = 0,
+) -> list[MusicCandidate]:
+    """Recover two vertically touching notes merged into one tall component.
+
+    Only ordinary candidates with a clearly bipartite mask profile are split:
+    both halves must independently pass the ordinary note filter and a deep
+    valley must separate two dense halves.  Flick/bonus/variant candidates are
+    never touched.
+    """
+    mask = getattr(visual, "mask", None)
+    if mask is None:
+        return list(candidates)
+    origin_x, origin_y = getattr(visual, "roi_origin", (0, 0))
+    result: list[MusicCandidate] = []
+    for candidate in candidates:
+        if candidate.variant:
+            result.append(candidate)
+            continue
+        x, y, width, height = candidate.box
+        if width < 8 or height < 1.65 * width or height > 2.45 * width:
+            result.append(candidate)
+            continue
+        local_x, local_y = x - origin_x, y - origin_y
+        if local_x < 0 or local_y < 0 or local_y + height > mask.shape[0] or local_x + width > mask.shape[1]:
+            result.append(candidate)
+            continue
+        crop = mask[local_y : local_y + height, local_x : local_x + width]
+        profile = crop.sum(axis=1)
+        if profile.shape[0] != height:
+            result.append(candidate)
+            continue
+        lower, upper = int(height * 0.35), int(height * 0.65)
+        top, band, bottom = profile[:lower], profile[lower:upper], profile[upper:]
+        if top.size == 0 or band.size == 0 or bottom.size == 0:
+            result.append(candidate)
+            continue
+        top_peak, bottom_peak = float(top.max()), float(bottom.max())
+        split = lower + int(band.argmin())
+        valley = float(profile[split])
+        if valley > 0.55 * min(top_peak, bottom_peak) or min(top_peak, bottom_peak) < 0.6 * width:
+            result.append(candidate)
+            continue
+        upper_box = (x, y, width, split)
+        lower_box = (x, y + split, width, height - split)
+        upper_half = MusicCandidate(
+            upper_box,
+            int(profile[:split].sum()),
+            float(crop[:split].mean()),
+            (upper_box[0] + width / 2.0, upper_box[1] + split / 2.0),
+        )
+        lower_half = MusicCandidate(
+            lower_box,
+            int(profile[split:].sum()),
+            float(crop[split:].mean()),
+            (lower_box[0] + width / 2.0, lower_box[1] + (height - split) / 2.0),
+        )
+        if note_like_candidate(upper_half, calibration, min_size) and note_like_candidate(lower_half, calibration, min_size):
+            result.extend((upper_half, lower_half))
+        else:
+            result.append(candidate)
+    return result
+
+
 def detect_bonus_star_notes(image: Any, calibration: MusicCalibrationData) -> list[MusicCandidate]:
     """Return green score-bonus note heads without relaxing ordinary filters.
 
@@ -600,11 +667,12 @@ def linked_tap_pair_present(image: Any, left: MusicCandidate, right: MusicCandid
 class MaaCandidateProvider:
     name = "maa"
 
-    def __init__(self, context: Any, calibration: MusicCalibrationData, iou_threshold: float = 0.55, min_size: int = 0) -> None:
+    def __init__(self, context: Any, calibration: MusicCalibrationData, iou_threshold: float = 0.55, min_size: int = 0, split_stacked: bool = False) -> None:
         self.context = context
         self.calibration = calibration
         self.iou_threshold = iou_threshold
         self.min_size = min_size
+        self.split_stacked = split_stacked
         self.failures = 0
         self._configured = False
 
@@ -671,16 +739,19 @@ class MaaCandidateProvider:
             for candidate in candidates
             if note_like_candidate(candidate, self.calibration, self.min_size)
         ]
+        if self.split_stacked:
+            candidates = split_stacked_notes(candidates, visual, self.calibration, self.min_size)
         return deduplicate_candidates(candidates, self.iou_threshold)
 
 
 class NumpyCandidateProvider:
     name = "numpy"
 
-    def __init__(self, calibration: MusicCalibrationData, iou_threshold: float = 0.55, min_size: int = 0) -> None:
+    def __init__(self, calibration: MusicCalibrationData, iou_threshold: float = 0.55, min_size: int = 0, split_stacked: bool = False) -> None:
         self.calibration = calibration
         self.iou_threshold = iou_threshold
         self.min_size = min_size
+        self.split_stacked = split_stacked
         self.failures = 0
 
     def detect(self, frame: MusicFrame, visual: VisualMask) -> list[MusicCandidate]:
@@ -704,4 +775,6 @@ class NumpyCandidateProvider:
             for candidate in candidates
             if note_like_candidate(candidate, self.calibration, self.min_size)
         ]
+        if self.split_stacked:
+            candidates = split_stacked_notes(candidates, visual, self.calibration, self.min_size)
         return deduplicate_candidates(candidates, self.iou_threshold)

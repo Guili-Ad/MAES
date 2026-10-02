@@ -75,6 +75,19 @@ class HoldTimingPolicy:
             return self.config.hold_start_execution_window_ms
         if event.gesture == NoteGesture.HOLD_CONTINUE:
             return self.config.hold_move_execution_window_ms
+        if event.gesture in {NoteGesture.SUSTAIN_PRESS, NoteGesture.SUSTAIN_MOVE}:
+            return self.config.hold_move_execution_window_ms
+        if event.gesture == NoteGesture.SUSTAIN_RELEASE:
+            precise_release = (
+                track is not None
+                and track.predicted_hit_time is not None
+                and (track.hold_release_locked or track.hold_sustain_release_time is not None)
+            )
+            return (
+                self.config.hold_release_execution_window_ms
+                if precise_release
+                else self.config.hold_fallback_release_execution_window_ms
+            )
         if event.gesture == NoteGesture.HOLD_END:
             precise_release = (
                 track is not None

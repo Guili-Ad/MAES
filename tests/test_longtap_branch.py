@@ -227,8 +227,8 @@ class LongTapBranchTests(unittest.TestCase):
         cal = calibration()
         visual = VisualMask(mask=np.ones((720, 1280), dtype=bool), roi_origin=(0, 0))
         engines = [
-            MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False)),
-            MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True)),
+            MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False)),
+            MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)),
         ]
         outputs: list[list[dict[str, object]]] = [[], []]
         for sequence, progress in enumerate([0.20, 0.30, 0.42, 0.56, 0.72]):
@@ -244,7 +244,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_white_arc_links_two_taps_and_forces_one_shared_deadline(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         events: list[MusicActionEvent] = []
         for sequence, left_progress in enumerate([0.20, 0.29, 0.39, 0.51, 0.65]):
@@ -278,7 +278,7 @@ class LongTapBranchTests(unittest.TestCase):
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
 
         def run(*, lane: int, active_hold: bool) -> list[MusicActionEvent]:
-            engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+            engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
             if active_hold:
                 owner = NoteTrack(track_id=90, lane=0, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
                 owner.action_executed = True
@@ -304,7 +304,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(len(rescued), 1)
         self.assertAlmostEqual(rescued[0].deadline, 0.221153846, places=6)
 
-        linked_engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        linked_engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         linked_events: list[MusicActionEvent] = []
         for sequence, progress in enumerate([0.55, 0.68, 0.81]):
             left = candidate_at(cal, 2, progress, 46)
@@ -324,7 +324,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_three_sample_deadline_rescue_applies_to_confirmed_hold_head(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         events: list[MusicActionEvent] = []
         for sequence, progress in enumerate([0.55, 0.68, 0.81]):
@@ -346,7 +346,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_far_three_sample_head_waits_for_reliable_fourth_observation(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         events: list[MusicActionEvent] = []
         # Each inter-frame displacement remains within the production
@@ -373,7 +373,7 @@ class LongTapBranchTests(unittest.TestCase):
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
 
         def run(lane: int) -> list[MusicActionEvent]:
-            engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+            engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
             events: list[MusicActionEvent] = []
             for sequence, progress in enumerate([0.16, 0.30, 0.44]):
                 timestamp = sequence * 0.07
@@ -387,7 +387,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_dense_cross_lane_cluster_delays_only_unlinked_ordinary_taps(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         for track_id, lane, progress, hit_time in (
             (1, 2, 0.70, 1.20),
             (2, 3, 0.60, 1.42),
@@ -414,7 +414,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_dense_timing_does_not_fabricate_fixed_visual_hit_gaps(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         for track_id, progress, hit_time in ((1, 0.80, 1.00), (2, 0.70, 0.98), (3, 0.60, 1.01)):
             track = NoteTrack(track_id=track_id, lane=2, speed=0.5 + track_id, predicted_hit_time=hit_time)
             note = candidate_at(cal, 2, progress)
@@ -430,7 +430,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_two_note_same_or_adjacent_lane_burst_uses_tap_only_dense_timing(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         for track_id, lane, hit_time in ((1, 2, 1.00), (2, 3, 1.27), (3, 5, 2.00)):
             track = NoteTrack(track_id=track_id, lane=lane, predicted_hit_time=hit_time)
             note = candidate_at(cal, lane, 0.70)
@@ -449,7 +449,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_exactly_two_same_lane_taps_reach_the_pair_policy(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         for track_id, progress, hit_time in ((1, 0.72, 1.00), (2, 0.54, 1.55)):
             track = NoteTrack(track_id=track_id, lane=2, predicted_hit_time=hit_time)
             note = candidate_at(cal, 2, progress)
@@ -465,7 +465,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_equal_first_seen_cadence_does_not_rewrite_visual_hit_times(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         for track_id, first_seen, progress, raw_hit in (
             (1, 0.0, 0.82, 2.00),
             (2, 0.5, 0.62, 2.80),
@@ -496,7 +496,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_terminal_target_does_not_drift_across_intermediate_lane(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=7, lane=4, gesture=NoteGesture.HOLD_START)
         track.predicted_hit_time = 0.0
         engine.tracks[track.track_id] = track
@@ -523,7 +523,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(track.hold_target_lane, 2)
 
     def test_folded_hold_confirms_target_only_ribbon_temporally(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=7, lane=1, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         track.hold_target_lane = 4
 
@@ -540,7 +540,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_folded_hold_moves_to_target_then_keeps_straight_segment(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(
             track_id=7,
             lane=1,
@@ -568,7 +568,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_white_arc_links_two_holds_and_shares_reliable_release(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         events: list[MusicActionEvent] = []
         for sequence, progress in enumerate([0.20, 0.29, 0.39, 0.51, 0.65]):
@@ -632,7 +632,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_visible_held_head_can_link_to_later_bonus_hold_detection(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         first_events: list[MusicActionEvent] = []
         for sequence, progress in enumerate([0.20, 0.29, 0.39, 0.51, 0.65]):
@@ -666,7 +666,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_arrived_active_hold_cannot_consume_a_later_same_lane_tap(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         owner = NoteTrack(
             track_id=20,
@@ -692,7 +692,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(engine.isolated_same_lane_head_count, 1)
 
     def test_tap_and_hold_start_rescue_settings_are_independent(self) -> None:
-        config = MusicConfig(
+        config = MusicConfig(hold_sustain_enabled=False, 
             lane_count=7,
             tap_action_advance_ms=91.0,
             hold_start_action_advance_ms=127.0,
@@ -724,7 +724,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_bonus_star_tap_uses_one_ordinary_lane_event(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         progress_samples = [0.22, 0.27, 0.32, 0.36, 0.44, 0.52, 0.60, 0.70]
@@ -746,7 +746,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_center_lane_bonus_star_does_not_enter_rainbow_singleton(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         for sequence, progress in enumerate([0.25, 0.35, 0.46, 0.58, 0.72]):
@@ -766,7 +766,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_bonus_star_with_upstream_ribbon_reuses_hold_start(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         progress_samples = [0.22, 0.27, 0.32, 0.36, 0.44, 0.52, 0.60, 0.70]
@@ -817,7 +817,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_bonus_star_white_core_is_not_reused_as_a_hold_tail(self) -> None:
         cal = calibration()
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         image = bonus_star_frame(cal, 4, 0.62)
         tails = detect_hold_tails(image, cal, config)
         star_center = candidate_at(cal, 4, 0.62).center
@@ -825,7 +825,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_hold_marker_topology_separates_terminal_from_mid_hold_checkpoint(self) -> None:
         cal = calibration()
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         terminal = detect_hold_tails(tail_frame(cal, 3, 0.45), cal, config)
         checkpoint = detect_hold_tails(sustain_checkpoint_frame(cal, 3, 0.45), cal, config)
         self.assertEqual(len(terminal), 1)
@@ -835,7 +835,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_mid_hold_checkpoint_refreshes_watchdog_but_never_starts_release_fit(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=95, lane=3, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         track.predicted_hit_time = 0.0
         track.hold_release_time = 1.8
@@ -855,7 +855,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_checkpoint_identity_survives_one_sided_judgement_line_occlusion(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=97, lane=3, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         track.predicted_hit_time = 0.0
         track.hold_release_time = 1.8
@@ -879,7 +879,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_moving_same_lane_tail_schedules_persistent_hold_and_predicted_release(self) -> None:
         cal = calibration()
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         engine = MusicVisionEngine(cal, config)
         visual = VisualMask(mask=np.ones((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
@@ -910,7 +910,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_confirmed_orange_head_without_visible_tail_uses_bounded_fallback_hold(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.ones((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         for sequence, head_progress in enumerate([0.30, 0.40, 0.55, 0.70, 0.88]):
@@ -929,7 +929,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_transient_head_ribbon_disappearance_cannot_release_standard_hold_early(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.ones((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         for sequence, head_progress in enumerate([0.20, 0.30, 0.40, 0.55, 0.72]):
@@ -960,7 +960,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_unverified_ribbon_cannot_keep_a_hold_alive_past_the_safe_limit(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.ones((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         for sequence, head_progress in enumerate([0.20, 0.30, 0.40, 0.55, 0.72]):
@@ -992,7 +992,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_stable_slow_tail_motion_unlocks_extended_release_prediction(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=90, lane=3)
         track.state = TrackState.HOLDING
         track.predicted_hit_time = 0.1
@@ -1010,7 +1010,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_sub_twenty_two_second_slow_fit_cannot_unlock_ultra_long_mode(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=92, lane=3)
         track.state = TrackState.HOLDING
         track.predicted_hit_time = 0.1
@@ -1029,7 +1029,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_static_mature_cap_and_ribbon_loss_infers_short_release(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=93, lane=3, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         track.predicted_hit_time = 0.0
         track.hold_release_time = engine.config.hold_fallback_duration_ms / 1000.0
@@ -1051,7 +1051,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_disappearing_mid_hold_checkpoint_cannot_infer_release(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=96, lane=3, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         track.predicted_hit_time = 0.0
         track.hold_release_time = 1.8
@@ -1071,7 +1071,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_early_tail_lane_wobble_cannot_schedule_a_route(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=94, lane=5, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         track.predicted_hit_time = 0.0
         track.hold_release_time = 1.8
@@ -1086,7 +1086,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_linked_hold_caps_are_jointly_assigned_without_crossing_sides(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         left = NoteTrack(track_id=30, lane=1, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         right = NoteTrack(track_id=31, lane=5, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         left.predicted_hit_time = right.predicted_hit_time = 0.0
@@ -1110,7 +1110,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_solitary_hold_prefers_continuous_cap_over_closer_lane_impostor(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=32, lane=2, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         track.predicted_hit_time = 0.0
         track.hold_release_time = 1.8
@@ -1126,7 +1126,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_verified_very_long_hold_reacquires_a_distant_final_cap(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=91, lane=3)
         track.state = TrackState.HOLDING
         track.gesture = NoteGesture.HOLD_START
@@ -1146,7 +1146,7 @@ class LongTapBranchTests(unittest.TestCase):
 
 
     def test_contact_watchdog_does_not_cut_off_a_twenty_second_hold(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=True)
         executor.lanes[3] = LaneInputState(
             lane=3,
@@ -1160,7 +1160,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_single_direction_tail_schedules_move_without_changing_owner_contact(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.ones((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         samples = [0.20, 0.30, 0.40, 0.55, 0.72]
@@ -1195,7 +1195,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_center_color_note_uses_isolated_center_tap_track(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         for sequence, center_y in enumerate([180, 204, 228, 258, 290, 324]):
@@ -1229,7 +1229,7 @@ class LongTapBranchTests(unittest.TestCase):
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), roi_origin=(0, 0))
 
         def deadline(interval: float) -> float:
-            engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+            engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
             pending = []
             for sequence, center_y in enumerate([180, 220, 265, 315, 365]):
                 timestamp = sequence * interval
@@ -1242,7 +1242,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_route_steps_keep_observed_deadlines_during_refinement(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=7, lane=3)
         track.hold_release_time = 5.0
         track.hold_target_lane = 4
@@ -1259,7 +1259,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_split_same_lane_hold_does_not_schedule_a_second_contact(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.ones((720, 1280), dtype=bool), roi_origin=(0, 0))
         events = []
         for sequence, progress in enumerate([0.20, 0.30, 0.42, 0.56, 0.72]):
@@ -1276,7 +1276,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_stale_same_lane_hold_is_suppressed_when_contact_intervals_overlap(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         current = NoteTrack(track_id=20, lane=2)
         current.state = TrackState.HOLDING
         current.action_executed = True
@@ -1297,7 +1297,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_overage_approaching_track_cannot_schedule_after_stage_flash(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         stale = NoteTrack(track_id=1, lane=2, first_seen_time=1.0)
         stale.speed = 0.5
         stale.predicted_hit_time = 10.1
@@ -1314,7 +1314,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_lost_linked_pair_cannot_resurface_seconds_late(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         tracks: list[NoteTrack] = []
         for track_id, lane, predicted in ((245, 2, 8.0), (249, 4, 32.0)):
             track = NoteTrack(track_id=track_id, lane=lane, state=TrackState.LOST)
@@ -1337,7 +1337,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_current_note_replaces_an_overage_static_track(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         stale = NoteTrack(track_id=1, lane=2, first_seen_time=1.0)
         old_note = candidate_at(cal, 2, 0.70)
         stale.observations.append(TrackObservation(9, 9.9, old_note.center, 0.70, old_note))
@@ -1358,7 +1358,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_old_terminal_tracks_are_pruned_from_per_frame_work(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=False))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=False))
         stale = NoteTrack(track_id=1, lane=2, state=TrackState.LOST)
         note = candidate_at(cal, 2, 0.70)
         stale.observations.append(TrackObservation(0, 0.0, note.center, 0.70, note))
@@ -1371,7 +1371,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_distinct_later_same_lane_hold_is_scheduled_for_runtime_handoff(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         owner = NoteTrack(track_id=20, lane=2, state=TrackState.HOLDING)
         owner.action_executed = True
         owner.predicted_hit_time = 8.0
@@ -1390,7 +1390,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(later.state, TrackState.HOLD_PENDING)
 
     def test_runtime_discards_duplicate_touch_down_without_fusing_or_releasing_owner(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         runtime = MusicRuntime(SimpleNamespace(), config, clock=lambda: 1.0, sleeper=lambda _seconds: None)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=True)
         executor.lanes[2] = LaneInputState(lane=2, contact=0, hold_track_id=20, contact_started=0.5)
@@ -1414,7 +1414,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertTrue(executor.healthy)
 
     def test_runtime_atomically_hands_a_lane_to_a_distinct_later_hold(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         runtime = MusicRuntime(SimpleNamespace(), config, clock=lambda: 1.0, sleeper=lambda _seconds: None)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=True)
         executor.lanes[2] = LaneInputState(lane=2, contact=0, hold_track_id=20, contact_started=0.5)
@@ -1448,7 +1448,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(pending, [])
 
     def test_hold_start_uses_precision_window_without_changing_its_deadline(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         runtime = MusicRuntime(SimpleNamespace(), config, clock=lambda: 1.04, sleeper=lambda _seconds: None)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=True)
         engine = MusicVisionEngine(calibration(), config)
@@ -1464,7 +1464,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_queued_hold_cannot_track_or_release_tail_before_touchdown_ack(self) -> None:
         cal = calibration()
-        engine = MusicVisionEngine(cal, MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         visual = VisualMask(mask=np.ones((720, 1280), dtype=bool), roi_origin=(0, 0))
         starts: list[MusicActionEvent] = []
         for sequence, progress in enumerate([0.30, 0.42, 0.56, 0.72]):
@@ -1487,7 +1487,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertFalse(any(event.gesture in {NoteGesture.HOLD_CONTINUE, NoteGesture.HOLD_END} for event in followups))
 
     def test_hold_move_uses_precision_window(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         runtime = MusicRuntime(SimpleNamespace(), config, clock=lambda: 1.11, sleeper=lambda _seconds: None)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=True)
         executor.lanes[5] = LaneInputState(lane=5, contact=0, hold_track_id=7, contact_started=0.5)
@@ -1502,7 +1502,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(pending, [])
 
     def test_compatibility_hold_fallback_does_not_leave_phantom_active_contact(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         runtime = MusicRuntime(SimpleNamespace(), config, clock=lambda: 1.0, sleeper=lambda _seconds: None)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=False)
         engine = MusicVisionEngine(calibration(), config)
@@ -1517,7 +1517,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(pending, [])
 
     def test_terminal_ocr_requires_prior_activity_and_full_quiet_window(self) -> None:
-        runtime = MusicRuntime(SimpleNamespace(), MusicConfig(lane_count=7, enable_holds=True))
+        runtime = MusicRuntime(SimpleNamespace(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         base = dict(
             now=20.0,
             schedule_started=0.0,
@@ -1534,7 +1534,7 @@ class LongTapBranchTests(unittest.TestCase):
         ))
 
     def test_pending_hold_counts_as_chart_activity_before_touchdown(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         engine = MusicVisionEngine(calibration(), config)
         engine.tracks[7] = NoteTrack(track_id=7, lane=5, state=TrackState.HOLD_PENDING)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=True)
@@ -1569,7 +1569,7 @@ class LongTapBranchTests(unittest.TestCase):
             self.assertIsNone(capture_image(context, timeout_ms=1000, poll_interval_ms=1))
 
     def test_special_and_dense_taps_use_isolated_precision_windows(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         engine = MusicVisionEngine(calibration(), config)
         bonus = NoteTrack(track_id=40, lane=2, bonus_star=True)
         dense_a = NoteTrack(track_id=41, lane=4)
@@ -1593,7 +1593,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual([event.event_id for event in dense_pending], ["dense-b"])
 
     def test_isolated_ordinary_tap_uses_precision_window_without_moving_deadline(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         runtime = MusicRuntime(SimpleNamespace(), config, clock=lambda: 1.08, sleeper=lambda _seconds: None)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=False)
         pending = [MusicActionEvent("ordinary", 50, 3, NoteGesture.TAP, 1.08, (640, 620))]
@@ -1603,7 +1603,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(pending, [])
 
     def test_stale_dispatch_timestamp_does_not_add_a_late_precision_sleep(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         sleeps: list[float] = []
         runtime = MusicRuntime(
             SimpleNamespace(),
@@ -1622,7 +1622,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(pending, [])
 
     def test_cap_locked_and_fallback_releases_use_bounded_precision_windows(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         engine = MusicVisionEngine(calibration(), config)
 
         long_track = NoteTrack(track_id=8, lane=3)
@@ -1691,7 +1691,7 @@ class LongTapBranchTests(unittest.TestCase):
         self.assertEqual(fallback_pending, [])
 
     def test_imminent_event_is_serviced_before_starting_another_capture(self) -> None:
-        config = MusicConfig(lane_count=7, enable_holds=True)
+        config = MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True)
         runtime = MusicRuntime(SimpleNamespace(), config, clock=lambda: 1.0)
         executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, config, advanced=True)
         engine = MusicVisionEngine(calibration(), config)
@@ -1710,7 +1710,7 @@ class LongTapBranchTests(unittest.TestCase):
 
     def test_mid_song_pause_waits_for_two_live_frames_and_releases_contacts(self) -> None:
         context = PauseSequenceContext()
-        runtime = MusicRuntime(context, MusicConfig(lane_count=7), sleeper=lambda _seconds: None)
+        runtime = MusicRuntime(context, MusicConfig(hold_sustain_enabled=False, lane_count=7), sleeper=lambda _seconds: None)
         executor = ReleaseProbe()
         labels = ["paused", "transition", "live", "live"]
         frames = [MusicFrame(index, 0.0, 0.0, 0.0, label) for index, label in enumerate(labels)]
@@ -1754,6 +1754,8 @@ class LongTapBranchTests(unittest.TestCase):
         play = nodes["MusicPlayRun7"]["action"]["param"]["custom_action_param"]
         preflight = nodes["MusicPlayPreflight7"]["action"]["param"]["custom_action_param"]
         self.assertIs(play["enable_holds"], True)
+        self.assertIs(play["hold_notes_as_taps"], True)
+        self.assertIs(play["hold_sustain_enabled"], False)
         self.assertNotIn("enable_holds", preflight)
         self.assertEqual(nodes["MusicPlayRun7"]["timeout"], 600000)
         # MusicPlay already performs strict loading/LIVE confirmation.  A
