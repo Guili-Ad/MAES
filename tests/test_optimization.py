@@ -3,6 +3,8 @@ import os
 os.environ.setdefault('MAES_AGENT_TEST_MODE', '1')
 import unittest
 import sys
+import json
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,6 +24,43 @@ class BuildIdentityTests(unittest.TestCase):
         first['files']['interface.json'] = 'bad'
         with self.assertRaises(ValueError):
             verify_manifest(root, first)
+
+    def test_packaged_dependency_bytes_are_verified_separately_from_startup(self):
+        from agent.music.build_identity import seal_package
+        with tempfile.TemporaryDirectory(prefix='maes-manifest-test-') as temporary:
+            root = Path(temporary)
+            (root/'runtime').mkdir()
+            dependency = root/'runtime/python.exe'
+            dependency.write_bytes(b'test dependency')
+            manifest = seal_package(root, create_manifest(root))
+            verify_manifest(root, manifest)
+            dependency.write_bytes(b'changed')
+            with self.assertRaises(ValueError):
+                verify_manifest(root, manifest)
+            # Startup checks its code, not the whole runtime on every invocation.
+            verify_manifest(root, manifest, dependencies=False)
+
+    def test_candidate_data_is_isolated_and_explicit_override_wins(self):
+        from agent.common import data_root
+        with tempfile.TemporaryDirectory(prefix='maes-isolation-test-') as temporary:
+            root = Path(temporary)/'package'
+            root.mkdir()
+            (root/'candidate-package.marker').touch()
+            original = Path(temporary)/'original'
+            with patch('agent.common.project_root', return_value=root), \
+                 patch.dict(os.environ, {'MAES_DATA_DIR':'', 'LOCALAPPDATA':str(original)}):
+                self.assertEqual(data_root(), root/'user-data')
+                self.assertFalse(original.exists())
+                with patch.dict(os.environ, {'MAES_DATA_DIR':str(Path(temporary)/'override')}):
+                    self.assertEqual(data_root(), Path(temporary)/'override')
+
+    def test_source_data_default_remains_compatible(self):
+        from agent.common import data_root
+        with tempfile.TemporaryDirectory(prefix='maes-isolation-test-') as temporary:
+            root = Path(temporary)
+            with patch('agent.common.project_root', return_value=root), \
+                 patch.dict(os.environ, {'MAES_DATA_DIR':'', 'LOCALAPPDATA':str(root/'local-app')}):
+                self.assertEqual(data_root(), root/'local-app/MAES')
 
 
 class InputLifecycleTests(unittest.TestCase):
@@ -47,6 +86,12 @@ class InputLifecycleTests(unittest.TestCase):
         executor.lanes[3] = LaneInputState(3, contact=0, hold_track_id=1)
         with self.assertRaises(MusicTouchError):
             executor.begin_segment('run', 1)
+
+    def test_unconfirmed_contact_is_never_allocated_even_without_lane_owner(self):
+        executor = self.executor()
+        executor.release_unconfirmed.add(0)
+        self.assertEqual(executor._allocate_temporary_contact(), 1)
+        self.assertEqual(executor._allocate_contact(3), 2)
 
     def test_failed_lane_release_keeps_contact_and_reports_when_fused(self):
         executor = self.executor()
@@ -205,3 +250,51 @@ class PixelAndDispatchTests(unittest.TestCase):
             runtime._execute_due(SimpleNamespace(), pending, 1., RuntimeMetrics(), wait=False)
         sleep.assert_not_called()
         self.assertEqual(len(pending), 1)
+
+
+class ProductionLoopReplayTests(unittest.TestCase):
+    def replay(self, cost_profile=None):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
+        from tap_replay import candidate_frames
+        from loop_replay import run_loop
+        from agent.music.models import MusicCalibrationData
+        root = Path(__file__).resolve().parents[1]
+        fixture = root/'tests/fixtures/optimization/synthetic.jsonl'
+        header = json.loads(fixture.read_text(encoding='utf-8').splitlines()[0])
+        args = SimpleNamespace(candidates=fixture, video=None, branch_root=root,
+                               cost_profile=cost_profile, action_ms=0.)
+        return run_loop(candidate_frames(args), MusicCalibrationData(**header['calibration']),
+                        MusicConfig(**header['config']), args)
+
+    def test_real_loop_delays_and_failures_do_not_duplicate_or_leave_contacts(self):
+        root = Path(__file__).resolve().parents[1]
+        result = self.replay(root/'tests/fixtures/optimization/delays.json')
+        self.assertGreater(len(result['heads']), 0)
+        identifiers = [head['track'] for head in result['heads']]
+        self.assertEqual(len(identifiers), len(set(identifiers)))
+        active = set()
+        for action in result['actions']:
+            if action['action'] == 'TouchDown':
+                self.assertNotIn(action['contact'], active)
+                active.add(action['contact'])
+            elif action['action'] == 'TouchUp':
+                active.discard(action['contact'])
+        self.assertFalse(active)
+        self.assertEqual(result['stop']['status'], 'cancelled')
+        self.assertEqual(result['stop']['cleanup_failure'], '')
+
+    def test_failed_input_is_not_resent_and_records_original_error(self):
+        with tempfile.TemporaryDirectory(prefix='maes-cost-test-') as temporary:
+            profile = Path(temporary)/'cost.json'
+            profile.write_text(json.dumps({'action_failures':[0]}), encoding='utf-8')
+            result = self.replay(profile)
+        self.assertEqual(result['stop']['status'], 'failed')
+        self.assertIn('success=false', result['stop']['reason'])
+        self.assertEqual(sum(a['action'] == 'TouchDown' for a in result['actions']), 1)
+
+    def test_initial_capture_failure_fails_explicitly(self):
+        with tempfile.TemporaryDirectory(prefix='maes-cost-test-') as temporary:
+            profile = Path(temporary)/'cost.json'
+            profile.write_text(json.dumps({'by_capture':{'0':{'capture_failure':True}}}), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'Initial replay capture failed'):
+                self.replay(profile)

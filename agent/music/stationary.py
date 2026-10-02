@@ -1,8 +1,8 @@
 """Behavior-preserving stationary boundary; orchestration remains in the engine."""
 from __future__ import annotations
 
-# Imported on first use, after tracking finished defining its shared types.
-from .tracking import MusicFrame, TrackState, ordinary_tap
+from .models import MusicFrame, TrackState
+from .tap_identity import ordinary_tap
 
 
 def update_stationary_evidence(engine, frame: MusicFrame) -> None:

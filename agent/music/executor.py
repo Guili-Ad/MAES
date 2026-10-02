@@ -131,7 +131,8 @@ class MusicActionExecutor:
         state = self._lane_state(lane)
         if state.contact is not None:
             raise MusicTouchError(f"Lane {lane} already owns contact {state.contact}")
-        used = {item.contact for item in self.lanes.values() if item.contact is not None} | self._temporary_contacts
+        used = ({item.contact for item in self.lanes.values() if item.contact is not None}
+                | self._temporary_contacts | self.release_unconfirmed)
         for contact in range(self.config.max_contacts):
             if contact not in used:
                 state.contact = contact
@@ -139,7 +140,8 @@ class MusicActionExecutor:
         raise MusicTouchError("No free touch contacts")
 
     def _allocate_temporary_contact(self) -> int:
-        used = {item.contact for item in self.lanes.values() if item.contact is not None} | self._temporary_contacts
+        used = ({item.contact for item in self.lanes.values() if item.contact is not None}
+                | self._temporary_contacts | self.release_unconfirmed)
         for contact in range(self.config.max_contacts):
             if contact not in used:
                 self._temporary_contacts.add(contact)

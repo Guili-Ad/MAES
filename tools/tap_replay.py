@@ -6,7 +6,8 @@ Candidate-only frames use black images; use video replay for ribbon/arc pixels.
 Annotations: {heads: [{id, lane, gesture, earliest, latest}]} (seconds).
 Video results use NumPy (also used in the Test2 live logs), but compressed
 video timing/pixels and mock input are not a full live validation. Annotations and
-per-song timestamps belong only under temp/validation, never runtime resources.
+per-song timestamps belong in tests/fixtures or a local validation directory,
+never runtime resources. Reports are written under temp only.
 """
 from __future__ import annotations
 

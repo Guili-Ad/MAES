@@ -1,8 +1,8 @@
 """Behavior-preserving hold_notes boundary; orchestration remains in the engine."""
 from __future__ import annotations
 
-# Imported on first use, after tracking finished defining its shared types.
-from .tracking import MusicActionEvent, NoteGesture, SustainMarker, TrackState
+from .models import MusicActionEvent, NoteGesture, TrackState
+from .sustain import SustainMarker
 
 
 def plan_hold_note_taps(engine, now: float) -> list[MusicActionEvent]:

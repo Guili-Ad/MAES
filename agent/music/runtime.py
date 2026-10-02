@@ -529,7 +529,7 @@ class MusicRuntime:
             controller_signature=self.signature,
             advanced=advanced,
             multi_touch=multi_touch,
-            sleeper=self.sleeper,
+            sleeper=self._sleep_interruptibly,
             clock=self.clock,
         )
 

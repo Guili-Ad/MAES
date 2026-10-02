@@ -1,8 +1,15 @@
 """Behavior-preserving association boundary; orchestration remains in the engine."""
 from __future__ import annotations
 
-# Imported on first use, after tracking finished defining its shared types.
-from .tracking import FLICK_GESTURES, LOGGER, LaneProjection, MusicCandidate, MusicFrame, NoteGesture, TrackObservation, TrackState, VisualMask, associate_taps, bonus_hold_ribbon_present, hold_head_color_ratio, math
+import math
+from typing import TYPE_CHECKING
+from agent.common import LOGGER
+from .models import FLICK_GESTURES, MusicCandidate, MusicFrame, NoteGesture, TrackObservation, TrackState
+from .tap_tracking import associate_taps
+from .vision import VisualMask
+from .holds import bonus_hold_ribbon_present, hold_head_color_ratio
+if TYPE_CHECKING:
+    from .tracking import LaneProjection
 
 
 def associate_lane(

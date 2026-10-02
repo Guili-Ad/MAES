@@ -95,7 +95,7 @@ def run_loop(stream, calibration, config, args):
     runtime.provider = Provider()
     runtime.input_mode = 'advanced'
     executor = MusicActionExecutor(context, 1280, 720, config, advanced=True, multi_touch=True,
-                                   clock=clock, sleeper=clock.sleep)
+                                   clock=clock, sleeper=runtime._sleep_interruptibly)
     engines, scheduled, pending_snapshot, samples = [], [], [], []
     def new_engine(*positional, **keywords):
         engine = MusicVisionEngine(*positional, **keywords)
@@ -117,6 +117,8 @@ def run_loop(stream, calibration, config, args):
         pending_snapshot[:] = pending
         return result
     first = context.capture(context, 0, clock)[0]
+    if first is None:
+        raise ValueError('Initial replay capture failed; production startup has no valid frame')
     runtime._execute_due = execute
     with patch.object(runtime, 'startup_gate', return_value=None), \
          patch.object(runtime, 'activate_play_provider', return_value=None), \
