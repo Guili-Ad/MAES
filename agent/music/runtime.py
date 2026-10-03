@@ -37,6 +37,7 @@ from .tap_dispatch import due_tap_batches
 from .tap_trace import TapTrace, VERSION
 from .build_identity import digest
 from .metrics import MetricSeries
+from .pause_gate import pause_overlay_possible
 from .tracking import MusicVisionEngine
 from .vision import MaaCandidateProvider, NumpyCandidateProvider, VisualMask, giant_live_title_present
 
@@ -62,6 +63,7 @@ class RuntimeMetrics:
     events_scheduled: int = 0
     isolated_same_lane_heads: int = 0
     unscheduled_head_losses: int = 0
+    pause_ocr_skipped: int = 0
 
     def summaries(self, action: list[float]) -> dict[str, dict[str, float | int]]:
         result = {
@@ -91,7 +93,8 @@ class RuntimeMetrics:
             result[name] = metric_summary(series[name][-60:])
         result['tracking_time'] = metric_summary(self.tracking[-60:])
         result['whole_run'] = {name: values.summary() for name, values in series.items()}
-        result['diagnostics'] = {'missing_source_times': self.missing_source_times, 'recent_window_capacity': 60}
+        result['diagnostics'] = {'missing_source_times': self.missing_source_times, 'recent_window_capacity': 60,
+                                 'pause_ocr_skipped': self.pause_ocr_skipped}
         return result
 
 
@@ -263,9 +266,15 @@ class MusicRuntime:
             event = by_id.get(receipt.event_id)
             if event is None:
                 continue
-            self.tap_trace.add('input', event=event.event_id, group=event.tap_group_id,
-                               deadline=event.deadline, receipt=asdict(receipt))
             track = engine.tracks.get(event.track_id) if engine else None
+            latest = track.observations[-1] if track is not None and track.observations else None
+            self.tap_trace.add('input', event=event.event_id, group=event.tap_group_id,
+                               deadline=event.deadline, receipt=asdict(receipt),
+                               raw_hit=track.predicted_hit_time if track else None,
+                               latest_visual_time=latest.timestamp if latest else None,
+                               latest_box=latest.candidate.box if latest else None,
+                               source_capture_started=event.source_capture_started,
+                               source_capture_finished=event.source_capture_finished)
             if track is not None and event.gesture == NoteGesture.TAP and receipt.down_call_started is not None:
                 track.tap_input_started = receipt.down_call_started
                 track.tap_input_completed = receipt.up_call_finished
@@ -642,6 +651,7 @@ class MusicRuntime:
         engine: MusicVisionEngine | None = None,
         *,
         wait: bool = True,
+        tap_wait_ms: float | None = None,
     ) -> None:
         # Candidate/hold-route refinement may have consumed tens of milliseconds
         # after the caller sampled ``now``.  Never precision-sleep from that stale
@@ -664,6 +674,12 @@ class MusicRuntime:
                 event_window = self.hold_policy.execution_window_ms(event, track) / 1000.0
             elif wait and event.gesture == NoteGesture.TAP:
                 event_window = self.tap_policy.execution_window_ms(event, track, pending) / 1000.0
+                if tap_wait_ms is not None:
+                    # Outside the existing capture guard, acquire another
+                    # frame rather than implicitly freezing an ordinary tap
+                    # for the entire 90 ms execution window. This is only a
+                    # wait budget: deadlines/advances/group freezes do not move.
+                    event_window = min(event_window, max(0., tap_wait_ms) / 1000.)
             if event.deadline <= now + event_window:
                 lookahead = max(lookahead, event_window)
         near = [event for event in pending if event.deadline <= now + lookahead]
@@ -940,6 +956,15 @@ class MusicRuntime:
         limit = now + guard_ms / 1000.0
         return any(event.deadline <= limit for event in pending)
 
+    def pause_dialog_present(self, image: Any) -> bool:
+        if not pause_overlay_possible(image):
+            self.metrics.pause_ocr_skipped += 1
+            return False
+        started = self.clock()
+        result = _recognize(self.context, "MusicPauseDialog", image)
+        self.metrics.ocr.append((self.clock() - started) * 1000.)
+        return result
+
     def _service_imminent_before_capture(
         self,
         executor: MusicActionExecutor,
@@ -1085,9 +1110,7 @@ class MusicRuntime:
                     )
                 if now >= next_pause_check:
                     next_pause_check = now + self.config.pause_check_interval_ms / 1000.0
-                    ocr_started = self.clock()
-                    paused = _recognize(self.context, "MusicPauseDialog", frame.image)
-                    self.metrics.ocr.append((self.clock() - ocr_started) * 1000.)
+                    paused = self.pause_dialog_present(frame.image)
                     if paused:
                         _resume_frame, sequence, paused_seconds, resume_failure = self._wait_until_resumed(executor, sequence, task_id)
                         if resume_failure is not None:
@@ -1144,7 +1167,8 @@ class MusicRuntime:
                 dispatch_now = self.clock()
                 pending.extend(engine.release_events(dispatch_now))
                 pending = engine.refine_pending(pending, dispatch_now)
-                self._execute_due(executor, pending, dispatch_now, self.metrics, engine)
+                self._execute_due(executor, pending, dispatch_now, self.metrics, engine,
+                                  tap_wait_ms=self.config.pre_capture_deadline_guard_ms)
                 terminal_now = self.clock()
                 chart_active = self.chart_activity_present(engine, executor, pending, frame.sequence)
                 if chart_active:
@@ -1207,6 +1231,9 @@ class MusicRuntime:
                     LOGGER.exception("Music contact cleanup failed")
                 self.tap_trace.add('input_fallbacks', reasons=executor.tap_fallbacks)
             try:
+                self.tap_trace.summary = {'metrics_ms': self.metrics.summaries(self.action_durations),
+                                          'cleanup_failure': self.cleanup_failure,
+                                          'provider': getattr(self.provider, 'name', '')}
                 path = self.tap_trace.write()
                 LOGGER.info('Music tap diagnostics run_id=%s path=%s dropped=%s', self.tap_trace.run_id, path, self.tap_trace.dropped)
             except Exception:

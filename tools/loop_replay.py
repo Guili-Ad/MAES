@@ -16,7 +16,7 @@ def run_loop(stream, calibration, config, args):
     from agent.music.models import MusicFrame
     from agent.music.executor import MusicActionExecutor
     from agent.music.tracking import MusicVisionEngine
-    from agent.music.vision import NumpyCandidateProvider
+    from agent.music.vision import NumpyCandidateProvider, VisualMask
     from agent.music.storage import metric_summary
     from tap_replay import decode_candidate
 
@@ -114,6 +114,10 @@ def run_loop(stream, calibration, config, args):
         engines.append(engine)
         return engine
     original_execute = runtime._execute_due
+    original_mask = VisualMask.from_image
+    def mask(image, calibration):
+        clock.sleep(context.costs.get('mask_ms', 0.) / 1000.)
+        return original_mask(image, calibration)
     def execute(executor, pending, *positional, **keywords):
         result = original_execute(executor, pending, *positional, **keywords)
         pending_snapshot[:] = pending
@@ -126,6 +130,7 @@ def run_loop(stream, calibration, config, args):
          patch.object(runtime, 'activate_play_provider', return_value=None), \
          patch.object(runtime, '_create_executor', return_value=executor), \
          patch.object(runtime.tap_trace, 'write', return_value='mock/no-disk'), \
+         patch.object(VisualMask, 'from_image', side_effect=mask), \
          patch.object(runtime_module, '_capture_frame', side_effect=context.capture), \
          patch.object(runtime_module, 'MusicVisionEngine', side_effect=new_engine):
         result = runtime.play(first)

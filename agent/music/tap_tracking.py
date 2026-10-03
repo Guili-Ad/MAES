@@ -5,7 +5,7 @@ from functools import lru_cache
 import math
 from .models import FLICK_GESTURES, NoteGesture, TrackState
 from .head_identity import identity_continuity_allowed
-from .tap_identity import discontinuity
+from .tap_identity import discontinuity, ordinary_tap
 
 
 def confirmed_tap_motion(track):
@@ -15,6 +15,20 @@ def confirmed_tap_motion(track):
     recent = list(track.observations)[-3:]
     return all(b.progress - a.progress > .002 and 0 < b.frame_sequence - a.frame_sequence <= 3
                for a, b in zip(recent, recent[1:]))
+
+
+def repeated_head_pixels(track, candidate, frame):
+    """Short exact contour repeat is absent motion evidence, not a new head.
+
+    Requires an already healthy ordinary trajectory. Static HUD tracks and
+    all hold/bonus/flick identities retain the existing association path.
+    No spatial exclusion or minimum interval between different notes is used.
+    """
+    if frame.image is None or not ordinary_tap(track) or not confirmed_tap_motion(track):
+        return False
+    last = track.observations[-1]
+    return (0 < frame.midpoint-last.timestamp <= .12
+            and candidate.box == last.candidate.box and candidate.center == last.center)
 
 
 def physical_order(tracks):
@@ -113,10 +127,23 @@ def associate_taps(tracks, entries, frame, config, safe_candidate, trace, owned=
             # colour-classified sprite can never hijack an ordinary tap track.
             if (candidate.variant == 'flick') != track.flick:
                 continue
+            if (candidate.variant == 'flick' and track.flick_direction in FLICK_GESTURES
+                    and candidate.flick_direction in FLICK_GESTURES
+                    and candidate.flick_direction != track.flick_direction):
+                # Colour encodes direction and is stable throughout this
+                # sprite's flight. In particular a red left-flick cannot
+                # inherit the nearby stationary blue right-flick decoration.
+                continue
+            if safe[index] and repeated_head_pixels(track, candidate, frame):
+                costs[index, track.track_id] = 0.
+                by_candidate.setdefault(index, set()).add(track.track_id)
+                by_track.setdefault(track.track_id, set()).add(index)
+                continue
             if not identity_continuity_allowed(track, candidate, projection, frame):
                 continue
             previous = track.observations[-1]
-            expected = previous.progress + max(0., track.speed) * max(0., frame.midpoint - previous.timestamp)
+            association_time = max(previous.timestamp, track.tap_contour_seen_time or previous.timestamp)
+            expected = previous.progress + max(0., track.speed) * max(0., frame.midpoint - association_time)
             residual = projection.progress - expected
             if not (-0.04 <= residual <= max(0.04, config.association_progress_delta)
                     and projection.progress - previous.progress >= -0.03):

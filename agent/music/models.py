@@ -699,6 +699,9 @@ class NoteTrack:
     # legacy scheduled flag used by hold/flick code.
     tap_input_started: float | None = None
     tap_input_completed: float | None = None
+    # Exact short-lived contour repeats own their pixels but are not extra
+    # velocity samples. Tap-only; hold timing never reads this timestamp.
+    tap_contour_seen_time: float | None = None
     tap_executed_hit_time: float | None = None
 
 

@@ -45,6 +45,15 @@ def coastable_tap(track, config, *, now=None, sequence=None, min_speed=None):
     observations = list(track.observations)
     if len(observations) < 2:
         return False
+    # A real perspective head does not collapse from an 86 px circle into
+    # an 18 px score particle. Two-sample coasting must obey the same contour
+    # continuity as mature associations; otherwise that particle emits a
+    # second, already-late press after the original note.
+    for before, after in zip(observations, observations[1:]):
+        old_area = before.candidate.box[2] * before.candidate.box[3]
+        new_area = after.candidate.box[2] * after.candidate.box[3]
+        if old_area > 0 and new_area < old_area * .4:
+            return False
     last = observations[-1]
     if last.progress < config.coast_min_progress or last.progress >= 0.95:
         return False

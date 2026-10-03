@@ -1761,6 +1761,12 @@ class MusicVisionEngine:
                                    event=event_id, track=track.track_id, lane=track.lane,
                                    raw_hit=track.predicted_hit_time, deadline=events[-1].deadline,
                                    observations=[(o.timestamp, o.progress) for o in track.observations][-6:])
+            else:
+                self.tap_trace.add('head_scheduled', frame=frame.sequence, time=frame.midpoint,
+                                   event=event_id, track=track.track_id, lane=track.lane,
+                                   gesture=track.gesture.value, raw_hit=track.predicted_hit_time,
+                                   deadline=events[-1].deadline,
+                                   observations=[(o.timestamp,o.progress) for o in track.observations][-6:])
         if self.config.enable_holds:
             self._update_active_hold_tails(frame)
             self._synchronize_linked_hold_releases(frame)
@@ -1772,6 +1778,7 @@ class MusicVisionEngine:
         maximum_age = self.config.max_schedule_horizon_ms / 1000.0 + 0.5
         refined: list[MusicActionEvent] = []
         for event in pending:
+            original_event = event
             if event.source_capture_finished is not None and now - event.source_capture_finished > maximum_age:
                 track = self.tracks.get(event.track_id)
                 if track is not None and track.state in {TrackState.TAP_PENDING, TrackState.FLICK_PENDING}:
@@ -1861,6 +1868,13 @@ class MusicVisionEngine:
                         ):
                             hit_time = (hit_time + partner.predicted_hit_time) / 2.0
                     event = replace(event, deadline=hit_time - advance)
+            if event.gesture != NoteGesture.TAP and event.deadline != original_event.deadline:
+                latest = track.observations[-1] if track is not None and track.observations else None
+                self.tap_trace.add('head_refine', time=now, event=event.event_id,
+                                   gesture=event.gesture.value, before=original_event.deadline,
+                                   deadline=event.deadline, raw_hit=track.predicted_hit_time if track else None,
+                                   latest_visual_time=latest.timestamp if latest else None,
+                                   latest_box=latest.candidate.box if latest else None)
             refined.append(event)
         return self.tap_chords.refine(refined, self.tracks, now, self.last_frame_sequence)
 

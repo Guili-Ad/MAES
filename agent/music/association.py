@@ -5,7 +5,7 @@ import math
 from typing import TYPE_CHECKING
 from agent.common import LOGGER
 from .models import FLICK_GESTURES, MusicCandidate, MusicFrame, NoteGesture, TrackObservation, TrackState
-from .tap_tracking import associate_taps
+from .tap_tracking import associate_taps, repeated_head_pixels
 from .vision import VisualMask
 from .holds import bonus_hold_ribbon_present, hold_head_color_ratio
 if TYPE_CHECKING:
@@ -98,6 +98,15 @@ def associate_lane(
         if index in matches:
             track = matches[index]
             unmatched_tracks.discard(track.track_id)
+            if safe_tap_candidate(candidate, projection) and repeated_head_pixels(track, candidate, frame):
+                # Do not feed an unchanged contour into the velocity fit or
+                # manufacture a late duplicate. New/different contours still
+                # follow the original one-to-one matching/classification.
+                track.missed_frames = 0
+                track.tap_contour_seen_time = frame.midpoint
+                engine.tap_trace.add('tap_contour_repeat', time=frame.midpoint, frame=frame.sequence,
+                                     track=track.track_id, box=candidate.box)
+                continue
         else:
             track = engine._new_track(lane, frame.midpoint)
             if active_holds_outside_head_window:
@@ -117,6 +126,7 @@ def associate_lane(
             candidate=candidate,
         )
         track.observations.append(observation)
+        track.tap_contour_seen_time = None
         if track.first_seen_time is None:
             track.first_seen_time = frame.midpoint
         if candidate.variant == "bonus_star":
