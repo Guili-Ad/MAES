@@ -729,6 +729,12 @@ class MusicActionEvent:
     tap_group_id: str | None = None
     tap_frozen: bool = False
     tap_reference_hit_time: float | None = None
+    # Small-note ownership is independent of ordinary tap tracks. Historical
+    # negative track_id values remain for log compatibility only.
+    origin: str = "track"
+    owner_id: int | None = None
+    marker_id: int | None = None
+    marker_terminal: bool = False
 
 
 @dataclass(frozen=True)
