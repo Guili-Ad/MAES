@@ -54,6 +54,7 @@ class RuntimeMetrics:
     tracking: MetricSeries = field(default_factory=MetricSeries)
     ocr: MetricSeries = field(default_factory=MetricSeries)
     dispatch_wait: MetricSeries = field(default_factory=MetricSeries)
+    identity_refresh: MetricSeries = field(default_factory=MetricSeries)
     missing_source_times: int = 0
     tracks_created: int = 0
     tracks_retained_peak: int = 0
@@ -86,7 +87,7 @@ class RuntimeMetrics:
             },
         }
         series = {name: getattr(self, name) for name in ('capture', 'provider', 'perception_to_action',
-                  'capture_to_action', 'terminal', 'loop', 'mask', 'tracking', 'ocr', 'dispatch_wait')}
+                  'capture_to_action', 'terminal', 'loop', 'mask', 'tracking', 'ocr', 'dispatch_wait', 'identity_refresh')}
         if isinstance(action, MetricSeries):
             series['action'] = action
         for name in ('mask', 'ocr', 'dispatch_wait'):
@@ -1269,7 +1270,9 @@ class MusicRuntime:
                     # A newly acquired image must qualify physical rings before
                     # frozen deadlines execute. Refresh once; engine.update
                     # reuses the same frame watermark rather than warming twice.
+                    identity_started = self.clock()
                     engine.tap_hold_chain.refresh(frame)
+                    self.metrics.identity_refresh.append((self.clock()-identity_started)*1000.)
                 # Service deadlines already predicted by prior frames before any
                 # relatively expensive UI recognition can block the action loop.
                 self._execute_due(executor, pending, now, self.metrics, engine, wait=False)

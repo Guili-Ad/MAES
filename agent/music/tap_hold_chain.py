@@ -204,7 +204,8 @@ class GoldMarkerTracker(SustainMarkerTracker):
             self.chain.trace.add('gold_observation', time=frame.midpoint, frame=frame.sequence,
                 marker=mid, owner=state.owner, evidence=evidence.value,
                 center=d.center, lane=d.lane, progress=d.progress, topology=d.topology,
-                ring=d.ring_coverage)
+                ring=d.ring_coverage, physical_ring=d.physical_ring, owner_lanes=d.owner_lanes,
+                owner_scores=d.owner_scores)
         self.prune(frame.midpoint)
         alive = set(self.markers)
         self.descriptors = {k:v for k,v in self.descriptors.items() if k in alive}
@@ -349,20 +350,25 @@ class TapHoldChain:
         self.bind_flicks(frame)
 
     def eligible(self, marker, now):
+        return self.eligibility_reason(marker, now) is None
+
+    def eligibility_reason(self, marker, now):
         anchor = self.anchors.get(marker.owner)
         track = self.engine.tracks.get(marker.owner)
         if anchor is None or anchor.state == AnchorState.CLOSED or track is None:
-            return False
+            return 'owner-unconfirmed-or-closed'
         if not self.current_connection(anchor):
-            return False
+            return 'superseded-head-connection'
         if track.state != TrackState.HOLDING or not marker.stable(self.engine.config, now, self.engine.calibration.trigger_progress):
-            return False
+            return 'owner-state-or-motion-unqualified'
         if now-marker.last_seen_time > self.coast_budget:
-            return False
+            return 'gold-observation-age-exceeded'
         if self.last_frame_sequence-marker.last_seen_frame > 2:
-            return False
+            return 'gold-observation-frame-budget-exceeded'
         rejected = self.tracker.rejected.get(marker.marker_id)
-        return rejected is None or rejected[0] < marker.last_seen_frame
+        if rejected is not None and rejected[0] >= marker.last_seen_frame:
+            return 'contradictory-owner-evidence'
+        return None
 
     def linked(self, left_id, right_id):
         if left_id == right_id:

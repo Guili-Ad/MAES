@@ -199,8 +199,15 @@ class HoldNoteEventRegistry:
             if not self._valid(engine, state, now):
                 if state.started is None and not state.cancelled:
                     state.cancelled = True
+                    chain = engine.tap_hold_chain
+                    observed = engine.sustain_tracker.markers.get(event.marker_id)
                     engine.tap_trace.add('hold_note_cancelled', time=now,
-                                         event=event.event_id, reason='invalid-owner-or-marker')
+                        event=event.event_id, reason='invalid-owner-or-marker',
+                        qualification=(chain.eligibility_reason(observed, now) if chain and observed
+                                       else 'missing-marker-or-legacy-owner'),
+                        visual_age=(now-observed.last_seen_time if observed else None),
+                        visual_frame=(observed.last_seen_frame if observed else None),
+                        frame_budget=2 if chain else None, coast_budget=chain.coast_budget if chain else None)
                 continue
             marker = engine.sustain_tracker.markers[event.marker_id]
             if engine.tap_hold_chain is not None and marker.owner != state.event.owner_id:
@@ -295,7 +302,7 @@ class HoldNoteEventRegistry:
             self.states[event.event_id].event = updated
             result.append(updated)
         for eid in [eid for eid, state in self.states.items()
-                    if state.event.owner_id not in engine.tracks]:
+                    if engine.tap_hold_chain is None and state.event.owner_id not in engine.tracks]:
             del self.states[eid]
         return result
 

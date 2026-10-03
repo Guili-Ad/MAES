@@ -7,7 +7,7 @@ def connected_components(mask, min_pixels):
     edges=np.diff(np.pad(boolean.astype(np.int8),((0,0),(1,1))),axis=1)
     rows,starts=np.nonzero(edges==1)
     _,ends=np.nonzero(edges==-1)
-    parent=[];runs=[];previous=[];current=[];last_row=-2
+    parent=[];runs=[];previous=[];current=[];last_row=-2;overlap_start=0
 
     def find(label):
         while parent[label]!=label:
@@ -18,12 +18,20 @@ def connected_components(mask, min_pixels):
     for row,start,end in zip(rows.tolist(),starts.tolist(),ends.tolist()):
         if row!=last_row:
             previous=current if row==last_row+1 else []
-            current=[];last_row=row
+            current=[];last_row=row;overlap_start=0
         label=len(parent);parent.append(label)
-        for a,b,prior in previous:
-            if b<start or a>end:continue
+        # Each row's runs are ordered and disjoint. Retire runs left of the
+        # current start once, then visit only the potentially overlapping
+        # prefix. End is exclusive, but equal endpoints remain 8-connected:
+        # b == start / a == end represents diagonal neighbouring pixels.
+        while overlap_start<len(previous) and previous[overlap_start][1]<start:
+            overlap_start+=1
+        overlap=overlap_start
+        while overlap<len(previous) and previous[overlap][0]<=end:
+            prior=previous[overlap][2]
             left,right=find(label),find(prior)
             if left!=right:parent[right]=left
+            overlap+=1
         runs.append((row,start,end,label));current.append((start,end,label))
     aggregates={}
     for row,start,end,label in runs:

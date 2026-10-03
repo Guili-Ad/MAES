@@ -11,6 +11,9 @@ from agent.music.tracking import MusicVisionEngine
 from agent.music.hold_note_events import refine_hold_note_events, acknowledge_hold_note_event, hold_note_registry
 from agent.music.holds import HoldTailDetection
 from agent.music.tap_hold_chain import AnchorState
+from agent.music.runtime import MusicRuntime
+from agent.music.runtime import RuntimeMetrics
+from agent.music.executor import MusicActionExecutor
 
 
 def gold(progress, lane=2, *, topology='checkpoint', owner_lanes=None, ring=.90,
@@ -245,6 +248,63 @@ class TapHoldFoundationTests(unittest.TestCase):
             down_call_started=1.9, down_call_finished=1.901, up_call_finished=None, error='up-failed'))
         engine.sustain_tracker.observe(7, gold(.98), make_frame(2., 7), owner=owner.track_id)
         self.assertEqual(engine.release_events(2.), [])
+
+    def test_completed_physical_event_tombstone_survives_owner_pruning(self):
+        engine, owner = tap_engine()
+        add_marker(engine, 7, owner.track_id, 2, hit=2., now=1.8)
+        event = engine.release_events(1.8)[0]
+        marker_event(engine, event)
+        registry = hold_note_registry(engine)
+        completed = registry.states[event.event_id]
+        del engine.tracks[owner.track_id]
+        registry.refine(engine, [], 2.)
+        self.assertIs(registry.states[event.event_id], completed)
+        # A corrected owner is metadata, not a new physical event or permission
+        # to resend a circle whose Down has already been attempted.
+        new = NoteTrack(6, 2, gesture=NoteGesture.HOLD_START, state=TrackState.HOLD_PENDING)
+        engine.tracks[6] = new
+        register_head(engine, new, now=2.)
+        engine.sustain_tracker.observe(7, gold(.97), make_frame(2.01, 7), owner=6)
+        self.assertEqual(engine.release_events(2.01), [])
+        self.assertIs(registry.states[event.event_id], completed)
+
+    def test_dormant_virtual_anchor_does_not_permanently_block_end_ocr(self):
+        engine, owner = tap_engine()
+        executor = SimpleNamespace(active_contacts={})
+        self.assertTrue(MusicRuntime.chart_activity_present(engine, executor, [], 10))
+        engine.tap_hold_chain.anchors[owner.track_id].state = AnchorState.QUIESCENT
+        self.assertFalse(MusicRuntime.chart_activity_present(engine, executor, [], 10))
+        pending = [MusicActionEvent('real-pending', 8, 3, NoteGesture.TAP, 1., (640,620))]
+        self.assertTrue(MusicRuntime.chart_activity_present(engine, executor, pending, 10))
+        executor.active_contacts = {0: 3}
+        self.assertTrue(MusicRuntime.chart_activity_present(engine, executor, [], 10))
+
+    def test_unregistered_compatibility_holding_label_does_not_block_end_ocr(self):
+        engine, owner = tap_engine()
+        engine.tap_hold_chain.anchors.clear()
+        self.assertFalse(MusicRuntime.chart_activity_present(
+            engine, SimpleNamespace(active_contacts={}), [], 10))
+
+    def test_precision_wait_rechecks_visual_qualification_before_actual_down(self):
+        from test_round2_runtime import Clock
+        engine, owner = tap_engine()
+        add_marker(engine, 7, owner.track_id, 2, hit=1.975, now=1.82)
+        chain = engine.tap_hold_chain
+        chain.periods.extend([.010]*8)
+        event = engine.release_events(1.82)[0]
+        self.assertAlmostEqual(event.deadline, 1.85)
+        clock = Clock()
+        clock.now = 1.82
+        runtime = MusicRuntime(SimpleNamespace(), engine.config, clock=clock, sleeper=clock.sleep)
+        executor = MusicActionExecutor(SimpleNamespace(), 1280, 720, engine.config,
+            advanced=True, multi_touch=True, clock=clock, sleeper=clock.sleep)
+        pending = [event]
+        with patch.object(executor, '_run') as run:
+            runtime._execute_due(executor, pending, clock.now, RuntimeMetrics(), engine)
+        run.assert_not_called()
+        self.assertFalse(pending)
+        self.assertGreaterEqual(clock.now, event.deadline)
+        self.assertTrue(hold_note_registry(engine).states[event.event_id].cancelled)
 
     def test_old_quiet_same_lane_anchor_cannot_claim_new_head_gold(self):
         engine, old = tap_engine()
