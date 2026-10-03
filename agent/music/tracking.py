@@ -1541,6 +1541,9 @@ class MusicVisionEngine:
             return False
         observations = list(track.observations)
         last = observations[-1] if observations else None
+        from .tap_identity import tap_structure_ready
+        if not tap_structure_ready(track, frame):
+            return False
         coast_ready = last is not None and self._coast_eligible(track, frame)
         # A prediction is useful for a short visual dropout, but never after a
         # track has been absent for the full lost-frame window.  This is the
@@ -1788,9 +1791,18 @@ class MusicVisionEngine:
 
     def refine_pending(self, pending: list[MusicActionEvent], now: float) -> list[MusicActionEvent]:
         """Refresh every not-yet-due deadline from the latest per-track predictions."""
+        from .hold_note_events import refine_hold_note_events
+        from .pending_eligibility import valid_pending
+        pending = refine_hold_note_events(self, pending, now)
         maximum_age = self.config.max_schedule_horizon_ms / 1000.0 + 0.5
         refined: list[MusicActionEvent] = []
         for event in pending:
+            if event.origin == 'hold_note':
+                refined.append(event)
+                continue
+            if not valid_pending(event, self.tracks, self.config, now, self.tap_trace,
+                                 sequence=self.last_frame_sequence, min_speed=self.coast_speed_threshold):
+                continue
             original_event = event
             if event.source_capture_finished is not None and now - event.source_capture_finished > maximum_age:
                 track = self.tracks.get(event.track_id)
@@ -1889,7 +1901,13 @@ class MusicVisionEngine:
                                    latest_visual_time=latest.timestamp if latest else None,
                                    latest_box=latest.candidate.box if latest else None)
             refined.append(event)
-        return self.tap_chords.refine(refined, self.tracks, now, self.last_frame_sequence)
+        # Gold rings have their own owner, shared deadlines and freeze state;
+        # the ordinary TAP manager must never reinterpret their negative ids.
+        ordinary = self.tap_chords.refine([e for e in refined if e.origin != 'hold_note'],
+                                         self.tracks, now, self.last_frame_sequence)
+        by_id = {e.event_id: e for e in ordinary}
+        return [e if e.origin == 'hold_note' else by_id[e.event_id] for e in refined
+                if e.origin == 'hold_note' or e.event_id in by_id]
 
     def _lane_point(self, lane: int) -> tuple[int, int]:
         point = self.calibration.points[lane]
@@ -2125,6 +2143,9 @@ class MusicVisionEngine:
         return plan_hold_note_taps(self, now)
 
     def _finalize_hold_note_anchor(self, track: NoteTrack, now: float) -> None:
+        from .hold_note_events import hold_note_registry
+        if hold_note_registry(self).has_pending(track.track_id):
+            return
         if track.hold_sustain_final_emitted:
             return
         deadline = track.hold_release_time

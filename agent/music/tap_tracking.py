@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 from functools import lru_cache
-import math
 from .models import FLICK_GESTURES, NoteGesture, TrackState
-from .head_identity import identity_continuity_allowed
+from .head_identity import identity_continuity_allowed, duplicate_head_evidence
 from .tap_identity import discontinuity, ordinary_tap
 
 
@@ -63,11 +62,6 @@ def retire_converged_shadows(tracks, frame, trace):
                and t.observations[-1].progress >= .78
                and not any(g in FLICK_GESTURES for g in t.direction_evidence)]
 
-    def collapsed(track):
-        obs = list(track.observations)
-        return any(b.progress >= .35 and b.candidate.box[2] * b.candidate.box[3]
-                   < .35 * a.candidate.box[2] * a.candidate.box[3] for a, b in zip(obs, obs[1:]))
-
     by_lane: dict[int, list] = {}
     for track in current:
         by_lane.setdefault(track.lane, []).append(track)
@@ -77,26 +71,16 @@ def retire_converged_shadows(tracks, frame, trace):
             for right in lane_tracks[index + 1:]:
                 if left.state == TrackState.LOST or right.state == TrackState.LOST:
                     continue
-                a, b = left.observations[-1], right.observations[-1]
-                if abs(a.progress - b.progress) > .025:
-                    continue
-                ax, ay, aw, ah = a.candidate.box
-                bx, by, bw, bh = b.candidate.box
-                overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
-                if overlap < .9 * min(aw * ah, bw * bh) or math.dist(a.center, b.center) > .2 * min(aw, ah, bw, bh):
-                    continue
                 for shadow, real in ((left, right), (right, left)):
-                    # A scheduled or physically started input may never be
-                    # cancelled as a "shadow": its event is already in (or has
-                    # left) the dispatch queue and cancelling the track would
-                    # silently drop a real note.
-                    if shadow.tap_input_started is not None or shadow.action_event_id:
-                        continue
-                    if collapsed(shadow) and not collapsed(real) and confirmed_tap_motion(real):
+                    # Queueing is not input acknowledgement. A contained,
+                    # corrupted shadow may be revoked until TouchDown starts;
+                    # every dispatch entry consults the same qualification.
+                    reason = duplicate_head_evidence(shadow, real, frame)
+                    if reason is not None and confirmed_tap_motion(real):
                         shadow.state = TrackState.LOST
                         trace.add('duplicate_shadow', frame=frame.sequence, time=frame.midpoint,
                                   cancelled=shadow.track_id, kept=real.track_id, lane=real.lane,
-                                  reason='contained-contour-with-prior-size-collapse')
+                                  reason=reason)
                         break
 
 

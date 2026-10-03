@@ -262,6 +262,7 @@ class MusicRuntime:
         )
 
     def _acknowledge_taps(self, receipts, events, engine, metrics):
+        from .hold_note_events import acknowledge_hold_note_event
         by_id = {event.event_id: event for event in events}
         for receipt in receipts:
             if receipt.run_id and receipt.segment_id is not None and (receipt.run_id != self.tap_trace.run_id
@@ -273,13 +274,23 @@ class MusicRuntime:
                 continue
             track = engine.tracks.get(event.track_id) if engine else None
             latest = track.observations[-1] if track is not None and track.observations else None
+            marker = None
+            if engine is not None and event.origin == 'hold_note':
+                marker_id = engine.sustain_tracker.resolve_id(event.marker_id)
+                marker = engine.sustain_tracker.markers.get(marker_id)
+            marker_latest = marker.observations[-1] if marker is not None and marker.observations else None
             self.tap_trace.add('input', event=event.event_id, group=event.tap_group_id,
                                deadline=event.deadline, receipt=asdict(receipt),
-                               raw_hit=track.predicted_hit_time if track else None,
-                               latest_visual_time=latest.timestamp if latest else None,
+                               origin=event.origin, owner=event.owner_id, marker=event.marker_id,
+                               raw_hit=(marker.predicted_hit(engine.calibration.trigger_progress) if marker
+                                        else track.predicted_hit_time if track else None),
+                               latest_visual_time=(marker_latest.timestamp if marker_latest else
+                                                   latest.timestamp if latest else None),
+                               latest_center=marker_latest.center if marker_latest else None,
                                latest_box=latest.candidate.box if latest else None,
                                source_capture_started=event.source_capture_started,
                                source_capture_finished=event.source_capture_finished)
+            acknowledge_hold_note_event(engine, event, receipt)
             if track is not None and event.gesture == NoteGesture.TAP and receipt.down_call_started is not None:
                 track.tap_input_started = receipt.down_call_started
                 track.tap_input_completed = receipt.up_call_finished
@@ -295,6 +306,16 @@ class MusicRuntime:
             return
         metrics.perception_to_action.append((started - event.source_capture_started) * 1000.)
         metrics.capture_to_action.append((started - event.source_capture_finished) * 1000.)
+
+    def _qualify_pending(self, pending, engine, now):
+        if engine is None:
+            return
+        from .hold_note_events import refine_hold_note_events
+        from .pending_eligibility import valid_pending
+        pending[:] = [event for event in refine_hold_note_events(engine, pending, now)
+                      if valid_pending(event, engine.tracks, self.config, now, self.tap_trace,
+                                       sequence=engine.last_frame_sequence,
+                                       min_speed=engine.coast_speed_threshold)]
 
     def _flush_due_taps(
         self,
@@ -313,6 +334,7 @@ class MusicRuntime:
         in ``pending`` so gestures never nest.
         """
         now = self.clock()
+        self._qualify_pending(pending, engine, now)
         tap_batches = due_tap_batches(pending, now, engine)
         fallback_holds = [
             event
@@ -335,7 +357,7 @@ class MusicRuntime:
                     "Music tap deadlines were missed during a flick: %s",
                     [(event.track_id, round((now - event.deadline) * 1000.0, 1)) for event in late],
                 )
-            for batch in [*tap_batches, ([fallback_holds] if fallback_holds else [])]:
+            for batch in tap_batches + ([fallback_holds] if fallback_holds else []):
                 if not batch:
                     continue
                 try:
@@ -559,6 +581,17 @@ class MusicRuntime:
         receipts = executor.poll_inputs()
         if not receipts:
             return
+        current_receipts = []
+        for receipt in receipts:
+            if receipt.run_id and receipt.segment_id is not None and (
+                    receipt.run_id != self.tap_trace.run_id
+                    or receipt.segment_id != self.tap_trace.segment_id):
+                self.tap_trace.add('stale_receipt', event=receipt.event_id, source='async-poll')
+                continue
+            current_receipts.append(receipt)
+        # Event IDs are stable within a segment, not globally unique. Reject
+        # an old receipt BEFORE looking up/removing the current segment's ID.
+        receipts = current_receipts
         events = []
         for receipt in receipts:
             event = self._in_flight_taps.pop(receipt.event_id, None)
@@ -663,6 +696,7 @@ class MusicRuntime:
         # timestamp: doing so can turn an otherwise on-time isolated tap into the
         # single late action of a song.
         now = max(now, self.clock())
+        self._qualify_pending(pending, engine, now)
         # A hold's larger eligibility window must not lend its blind wait to
         # a mixed tap queue. Consider the earliest deadline of ALL pending
         # events; filtering taps then sleeping to a later hold would still
