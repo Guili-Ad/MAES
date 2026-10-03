@@ -1,7 +1,7 @@
 # MAES
 
 基于 MaaFramework 5.12.2 与 ProjectInterface V2 ，依托Deepseek和Codex实现的《偶像梦幻祭2》打歌自动化项目。
-当前源码 **v1.0.1-opt-candidate**，为待实战验证的优化候选，不代表稳定FC版本。旧发行目录保持不变。
+当前源码 **v1.0.3-marker-candidate**，为待实战验证的长按小音符修复候选，不代表稳定FC版本。独立包为`MAES_MarkerFix_Candidate`，旧发行目录保持不变，复核与下一轮说明见`docs/marker-fix-review.md`。
 
 ## 功能范围
 
@@ -52,11 +52,11 @@ powershell -ExecutionPolicy Bypass -File tools/bootstrap.ps1
 # 2. 项目检查（含离线运行时与原生库校验）
 runtime\python\python.exe -B tools\check_project.py --require-runtime
 
-# 3. 单元测试（当前252项；以运行输出为准）
+# 3. 单元测试（当前338项；以运行输出为准）
 runtime\python\python.exe -B tools\run_tests.py
 
 # 4. 构建独立候选包；目标已存在时拒绝覆盖
-powershell -ExecutionPolicy Bypass -File tools/package.ps1
+powershell -ExecutionPolicy Bypass -File tools/package.ps1 -OutputName MAES_MarkerFix_Candidate
 ```
 
 目录说明：
