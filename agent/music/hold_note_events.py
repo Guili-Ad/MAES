@@ -121,13 +121,15 @@ class HoldNoteEventRegistry:
                         if prediction is None:
                             continue
                         hit, lane = prediction
-                        if hit < now - .05 or hit - now > horizon:
-                            continue
+                        # This is an already queued physical identity, not a
+                        # new birth. Current chain qualification is authoritative;
+                        # preserve a genuine past deadline instead of suppressing
+                        # a healthy late event or hiding its delay with a clamp.
                         latest = marker.observations[-1]
                         previous_deadline = prior.event.deadline
                         prior.cancelled = False
                         prior.event = replace(prior.event, owner_id=owner.track_id,
-                            deadline=max(now, hit - advance), lane=lane,
+                            deadline=hit - advance, lane=lane,
                             coordinate=engine._lane_point(lane), tap_reference_hit_time=hit,
                             source_capture_started=latest.capture_started,
                             source_capture_finished=latest.capture_finished,
@@ -138,7 +140,8 @@ class HoldNoteEventRegistry:
                             event=prior.event.event_id, owner=owner.track_id,
                             marker=marker.marker_id, before=previous_deadline,
                             deadline=prior.event.deadline, hit=hit,
-                            source_capture_finished=latest.capture_finished)
+                            source_capture_finished=latest.capture_finished,
+                            correction_late_ms=max(0., (now-prior.event.deadline)*1000.))
                     continue
                 if chain is None and marker.marker_id in owner.hold_sustain_planned_ids:
                     continue

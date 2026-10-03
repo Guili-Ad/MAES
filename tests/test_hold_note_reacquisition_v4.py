@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from test_hold_note_taps import tap_engine
 from test_tap_hold_chain_v4 import gold
 from agent.music.models import MusicFrame
-from agent.music.hold_note_events import hold_note_registry
+from agent.music.hold_note_events import HoldNoteEventRegistry, hold_note_registry
 
 
 class HoldNoteReacquisitionTests(unittest.TestCase):
@@ -82,15 +82,51 @@ class HoldNoteReacquisitionTests(unittest.TestCase):
         self.assertGreater(recovered.deadline, original.deadline)
         self.assertEqual(recovered.source_capture_finished, frame.capture_finished)
 
-    def test_revoked_reappearance_outside_normal_horizon_stays_cancelled(self):
+    def test_already_queued_reappearance_keeps_future_prediction_outside_birth_horizon(self):
         engine, registry, original = self.make_old_event()
         state = self.revoke_old_event(engine, registry, original)
         frame, marker = self.positive_reappearance(engine, .92)
         self.assertGreater(marker.predicted_hit(engine.calibration.trigger_progress) - frame.midpoint,
                            engine.config.hold_note_tap_horizon_ms / 1000.)
-        self.assertEqual(registry.plan(engine, frame.midpoint), [])
-        self.assertTrue(state.cancelled)
+        expected_hit = marker.predicted_hit(engine.calibration.trigger_progress)
+        # Initial planning still uses its existing horizon. This marker was
+        # already legitimately queued before its observation was revoked.
+        self.assertEqual(HoldNoteEventRegistry().plan(engine, frame.midpoint), [])
+        recovered = registry.plan(engine, frame.midpoint)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].event_id, original.event_id)
+        self.assertAlmostEqual(recovered[0].deadline,
+                               expected_hit - engine.config.tap_action_advance_ms / 1000.)
+        self.assertGreater(recovered[0].deadline, frame.midpoint + .02)
+        self.assertFalse(recovered[0].tap_frozen)
+        self.assertFalse(state.cancelled)
         self.assertIsNone(state.started)
+
+    def test_healthy_reacquired_queued_event_preserves_true_past_deadline(self):
+        engine, registry, original = self.make_old_event()
+        state = self.revoke_old_event(engine, registry, original)
+        frame, marker = self.positive_reappearance(engine, .99)
+        now = 2.25
+        hit = marker.predicted_hit(engine.calibration.trigger_progress)
+        self.assertGreater(now - hit, .05)
+        self.assertTrue(engine.tap_hold_chain.eligible(marker, now))
+        expected_deadline = hit - engine.config.tap_action_advance_ms / 1000.
+        recovered = registry.plan(engine, now)
+        self.assertEqual(len(recovered), 1)
+        event = recovered[0]
+        self.assertEqual(event.event_id, original.event_id)
+        self.assertAlmostEqual(event.tap_reference_hit_time, hit)
+        self.assertAlmostEqual(event.deadline, expected_deadline)
+        self.assertLess(event.deadline, now)
+        self.assertTrue(event.tap_frozen)
+        self.assertEqual(event.source_capture_finished, frame.capture_finished)
+        self.assertIs(registry.states[event.event_id], state)
+        self.assertFalse(state.cancelled)
+        self.assertIsNone(state.started)
+        # The requalification diagnostics preserve the true overdue amount;
+        # dispatch may execute now, but may not present that as an on-time hit.
+        row = [r for r in engine.tap_trace.records if r['kind'] == 'hold_note_reacquired'][-1]
+        self.assertAlmostEqual(row['correction_late_ms'], (now - expected_deadline) * 1000.)
 
     def test_started_partial_or_successful_input_tombstone_never_revives(self):
         for completed, error in ((None, 'forced-up-failure'), (1.967, '')):
