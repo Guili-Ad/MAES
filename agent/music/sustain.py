@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from .holds import HoldTailDetection
 from .models import MusicConfig, MusicFrame
+from .hold_marker_identity import MarkerAssociationRequest, MarkerSnapshot, associate_marker_batch
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,57 @@ class SustainMarkerTracker:
         self.trigger_progress = trigger_progress
         self.markers: dict[int, SustainMarker] = {}
         self.next_marker_id = 1
+        self.marker_aliases: dict[int, int] = {}
+
+    def resolve_id(self, marker_id: int) -> int:
+        """Raw channel ids continue to name the healed physical marker."""
+        while marker_id in self.marker_aliases:
+            marker_id = self.marker_aliases[marker_id]
+        return marker_id
+
+    def associate_frame(
+        self, requests: list[MarkerAssociationRequest], frame: MusicFrame,
+        *, eligible_owners: set[int] | None = None,
+    ) -> dict[int, int]:
+        snapshots = [
+            MarkerSnapshot(state.marker_id, state.owner, state.last_seen_time,
+                           state.last_seen_frame, state.observations[-1].progress,
+                           state.observations[-1].lane, state.observations[-1].center,
+                           len(state.observations))
+            for state in self.markers.values()
+            if state.observations and (state.owner is None or eligible_owners is None
+                                       or state.owner in eligible_owners)
+        ]
+        normalized = [MarkerAssociationRequest(item.index, self.resolve_id(item.marker_id),
+                                                item.detection, item.owner) for item in requests]
+        matches = associate_marker_batch(normalized, snapshots, frame.midpoint, frame.sequence)
+        recovered = set(matches)
+        used = set(matches.values())
+        for item in normalized:
+            if item.index in matches:
+                continue
+            marker_id = item.marker_id
+            # An unmatched raw id may already refer to an old/ineligible ring,
+            # or a duplicated raw contour. It cannot overwrite that trajectory.
+            if marker_id in used or marker_id in self.markers:
+                marker_id = self.allocate_id()
+                while marker_id in used or marker_id in self.markers:
+                    marker_id = self.allocate_id()
+            matches[item.index] = marker_id
+            used.add(marker_id)
+        for original in requests:
+            if original.index not in recovered:
+                continue
+            marker_id = matches[original.index]
+            prior_id = self.resolve_id(original.marker_id)
+            if marker_id != prior_id and prior_id not in used:
+                # Alias only a genuinely replaced id. A second physical ring
+                # sharing a raw id gets its own id without redirecting the first.
+                self.marker_aliases[prior_id] = marker_id
+                self.markers.pop(prior_id, None)
+            if original.marker_id != marker_id and original.marker_id not in used:
+                self.marker_aliases[original.marker_id] = marker_id
+        return matches
 
     def allocate_id(self) -> int:
         marker_id = self.next_marker_id
@@ -121,10 +173,14 @@ class SustainMarkerTracker:
         frame: MusicFrame,
         owner: int | None = None,
     ) -> SustainMarker:
+        marker_id = self.resolve_id(marker_id)
         state = self.markers.get(marker_id)
         if state is None:
             state = SustainMarker(marker_id)
             self.markers[marker_id] = state
+        # One frame contributes at most one observation per physical marker.
+        if state.observations and state.last_seen_frame == frame.sequence:
+            return state
         state.observe(
             SustainObservation(
                 timestamp=frame.midpoint,
@@ -147,6 +203,8 @@ class SustainMarkerTracker:
         stale = [marker_id for marker_id, state in self.markers.items() if not state.fresh(now, linger)]
         for marker_id in stale:
             self.markers.pop(marker_id, None)
+        self.marker_aliases = {raw: canonical for raw, canonical in self.marker_aliases.items()
+                               if self.resolve_id(canonical) in self.markers}
 
     def targets(self, owner: int, config: MusicConfig, now: float) -> list[SustainMarker]:
         result = [
@@ -178,6 +236,8 @@ class SustainMarkerTracker:
             if owner is not None and state.owner is not None and state.owner != owner:
                 continue
             if not state.observations:
+                continue
+            if state.last_seen_frame == frame.sequence:
                 continue
             if frame.midpoint - state.last_seen_time > max_age:
                 continue

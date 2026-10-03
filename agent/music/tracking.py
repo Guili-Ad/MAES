@@ -31,6 +31,7 @@ from .tap_policy import TapTimingPolicy
 from .head_identity import unique_head_candidates
 from .hold_topology import ribbon_at_judgement
 from .sustain import SustainMarker, SustainMarkerTracker
+from .hold_marker_identity import HoldMarkerMotion, MarkerAssociationRequest
 from .tap_tracking import associate_taps, retire_converged_shadows
 from .tap_chords import TapChordManager, valid_tap_pair, coherent_tap_predictions
 from .tap_identity import ordinary_tap, retire_bonus_fragments, late_birth_ready, coastable_tap
@@ -712,8 +713,8 @@ class MusicVisionEngine:
     def _moving_hold_tails(
         self,
         tails: list[HoldTailDetection],
-    ) -> tuple[dict[int, tuple[float, float, int]], list[int], list[bool], list[int]]:
-        moving: dict[int, tuple[float, float, int]] = {}
+    ) -> tuple[dict[int, HoldMarkerMotion], list[int], list[bool], list[int]]:
+        moving: dict[int, HoldMarkerMotion] = {}
         current_streaks = [0] * len(tails)
         current_checkpoint_flags = [False] * len(tails)
         current_ids = [0] * len(tails)
@@ -733,7 +734,7 @@ class MusicVisionEngine:
                 best = min(matches, key=lambda item: (item[0], -item[2]))
                 previous_index = best[3]
                 used_previous.add(previous_index)
-                moving[index] = best[:3]
+                moving[index] = HoldMarkerMotion(best[0], best[1], best[2])
                 current_streaks[index] = best[2]
                 if previous_index < len(self.previous_hold_tail_ids) and self.previous_hold_tail_ids[previous_index]:
                     current_ids[index] = self.previous_hold_tail_ids[previous_index]
@@ -776,20 +777,22 @@ class MusicVisionEngine:
         self,
         frame: MusicFrame,
         tails: list[HoldTailDetection],
-        moving: dict[int, tuple[float, float, int]],
+        moving: dict[int, HoldMarkerMotion],
         current_ids: list[int],
         active: list[NoteTrack],
         belongs,
     ) -> None:
         minimum_frames = max(2, self.config.hold_tail_min_frames)
         route_lanes = {track.track_id: self._sustain_route_lanes(track) for track in active}
-        for index, (streak, _delta_y, _delta_progress) in moving.items():
-            if streak < minimum_frames:
+        requests: list[MarkerAssociationRequest] = []
+        for index, evidence in moving.items():
+            if evidence.consecutive_frames < minimum_frames:
                 continue
             tail = tails[index]
             marker_id = current_ids[index]
             if not marker_id:
                 continue
+            prior_state = self.sustain_tracker.markers.get(self.sustain_tracker.resolve_id(marker_id))
             best_track: NoteTrack | None = None
             best_score: tuple[float, float] | None = None
             for track in active:
@@ -801,16 +804,25 @@ class MusicVisionEngine:
                 gap = min(abs(tail.lane - lane) for lane in lanes) if lanes else 99
                 if gap > 1:
                     continue
+                if (prior_state is not None and prior_state.owner == track.track_id
+                        and prior_state.fresh(frame.midpoint, .6)):
+                    # Established ribbon ownership outranks an equal-distance
+                    # neighbouring hold. It still requires a live HOLDING owner
+                    # and current ribbon/lane evidence, never a stale owner id.
+                    best_track = track
+                    break
                 score = (float(gap), float(tail.distance))
                 if best_score is None or score < best_score:
                     best_score = score
                     best_track = track
             owner = best_track.track_id if best_track is not None else None
-            state = self.sustain_tracker.markers.get(marker_id)
-            if state is None or len(state.observations) < 2:
-                healed = self.sustain_tracker.match(tail, frame, owner)
-                if healed is not None:
-                    marker_id = healed.marker_id
+            requests.append(MarkerAssociationRequest(index, marker_id, tail, owner))
+        assignments = self.sustain_tracker.associate_frame(
+            requests, frame, eligible_owners={track.track_id for track in active})
+        for request in requests:
+            marker_id = assignments[request.index]
+            current_ids[request.index] = marker_id
+            tail, owner = request.detection, request.owner
             state = self.sustain_tracker.observe(marker_id, tail, frame, owner=owner)
             if not state.stable_logged and state.stable(self.config, frame.midpoint, self.calibration.trigger_progress):
                 state.stable_logged = True
@@ -874,7 +886,7 @@ class MusicVisionEngine:
             for index, tail in enumerate(tails)
             if current_checkpoint_flags[index]
             and index in moving
-            and moving[index][2] >= self.config.hold_tail_min_frames
+            and moving[index].consecutive_frames >= self.config.hold_tail_min_frames
         ]
         checkpoint_used: set[int] = set()
         for track in sorted(active, key=lambda item: item.predicted_hit_time or 0.0):
@@ -1002,7 +1014,7 @@ class MusicVisionEngine:
                 if (
                     index in used
                     or index not in moving
-                    or moving[index][2] < self.config.hold_tail_min_frames
+                    or moving[index].consecutive_frames < self.config.hold_tail_min_frames
                     or current_checkpoint_flags[index]
                     or not usable_cap(tail)
                     or not belongs(track, tail)
@@ -1012,7 +1024,7 @@ class MusicVisionEngine:
                 ):
                     continue
                 lane_gap = abs(tail.lane - target_lane)
-                choices.append((lane_gap * 0.30 + (1.0 - tail.progress) - moving[index][1] / 500.0, index, tail))
+                choices.append((lane_gap * 0.30 + (1.0 - tail.progress) - moving[index].delta_y_px / 500.0, index, tail))
             if not choices:
                 continue
             _score, index, tail = min(choices)
@@ -1070,7 +1082,7 @@ class MusicVisionEngine:
                 for index, tail in enumerate(tails)
                 if index not in used
                 and index in moving
-                and moving[index][2] >= self.config.hold_tail_min_frames
+                and moving[index].consecutive_frames >= self.config.hold_tail_min_frames
                 and not current_checkpoint_flags[index]
                 and usable_cap(tail)
                 and tail.progress >= self.config.hold_tail_min_gap_progress
@@ -1087,7 +1099,7 @@ class MusicVisionEngine:
                 tail = tails[tail_index]
                 hit_time = item.predicted_hit_time or frame.midpoint
                 expected_progress = min(0.75, max(0.0, (frame.midpoint - hit_time) / 1.4))
-                _motion_distance, motion_y, _motion_streak = moving[tail_index]
+                motion_y = moving[tail_index].delta_y_px
                 return (
                     abs(tail.progress - expected_progress)
                     + tail.distance / 250.0
@@ -1149,7 +1161,7 @@ class MusicVisionEngine:
                 if (
                     index in used
                     or index not in moving
-                    or moving[index][2] < 2
+                    or moving[index].consecutive_frames < 2
                     or current_checkpoint_flags[index]
                     or not usable_cap(tail)
                     or not belongs(track, tail)
@@ -1159,7 +1171,8 @@ class MusicVisionEngine:
                     or tail.progress > 0.88
                 ):
                     continue
-                motion_distance, motion_y, _motion_streak = moving[index]
+                motion_distance = moving[index].distance_px
+                motion_y = moving[index].delta_y_px
                 # Simultaneous symmetric holds expose two visually identical
                 # caps.  Prefer the cap whose provisional lane remains closest
                 # to this head; continuity takes over after the first match and
