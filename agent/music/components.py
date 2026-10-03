@@ -7,7 +7,7 @@ def connected_components(mask, min_pixels):
     edges=np.diff(np.pad(boolean.astype(np.int8),((0,0),(1,1))),axis=1)
     rows,starts=np.nonzero(edges==1)
     _,ends=np.nonzero(edges==-1)
-    parent=[];runs=[];previous=[];current=[];last_row=-2;overlap_start=0
+    parent=[];aggregates=[];previous=[];current=[];last_row=-2;overlap_start=0
 
     def find(label):
         while parent[label]!=label:
@@ -19,7 +19,7 @@ def connected_components(mask, min_pixels):
         if row!=last_row:
             previous=current if row==last_row+1 else []
             current=[];last_row=row;overlap_start=0
-        label=len(parent);parent.append(label)
+        label=None
         # Each row's runs are ordered and disjoint. Retire runs left of the
         # current start once, then visit only the potentially overlapping
         # prefix. End is exclusive, but equal endpoints remain 8-connected:
@@ -28,18 +28,40 @@ def connected_components(mask, min_pixels):
             overlap_start+=1
         overlap=overlap_start
         while overlap<len(previous) and previous[overlap][0]<=end:
-            prior=previous[overlap][2]
-            left,right=find(label),find(prior)
-            if left!=right:parent[right]=left
+            prior=find(previous[overlap][2])
+            if label is None:
+                label=prior
+            elif label!=prior:
+                # Keep the larger physical component's root. Connected runs
+                # do not create fresh labels, so a long ribbon cannot replace
+                # its root every row or require a second pass over every run.
+                if aggregates[label][4]<aggregates[prior][4]:
+                    label,prior=prior,label
+                parent[prior]=label
+                item,other=aggregates[label],aggregates[prior]
+                if other[0]<item[0]:item[0]=other[0]
+                if other[1]<item[1]:item[1]=other[1]
+                if other[2]>item[2]:item[2]=other[2]
+                if other[3]>item[3]:item[3]=other[3]
+                item[4]+=other[4]
+                if other[5]<item[5]:item[5]=other[5]
             overlap+=1
-        runs.append((row,start,end,label));current.append((start,end,label))
-    aggregates={}
-    for row,start,end,label in runs:
-        root=find(label)
-        if root not in aggregates:
-            aggregates[root]=[start,row,end,row+1,end-start]
+        if label is None:
+            label=len(parent);parent.append(label)
+            # The final field is the first row-major component encounter, not
+            # its current root or bbox left edge. Late merges retain that order.
+            aggregates.append([start,row,end,row+1,end-start,label])
         else:
-            item=aggregates[root]
-            item[0]=min(item[0],start);item[1]=min(item[1],row)
-            item[2]=max(item[2],end);item[3]=max(item[3],row+1);item[4]+=end-start
-    return [((x,y,right-x,bottom-y),count) for x,y,right,bottom,count in aggregates.values() if count>=min_pixels]
+            item=aggregates[label]
+            if start<item[0]:item[0]=start
+            if end>item[2]:item[2]=end
+            item[3]=row+1
+            item[4]+=end-start
+        current.append((start,end,label))
+    # Filtering is intentionally after all unions: even a one-pixel diagonal
+    # bridge can join two accepted components. Weighted roots may reorder IDs,
+    # so retain the original first-pixel output order explicitly.
+    accepted=[item for label,item in enumerate(aggregates)
+              if parent[label]==label and item[4]>=min_pixels]
+    accepted.sort(key=lambda item:item[5])
+    return [((x,y,right-x,bottom-y),count) for x,y,right,bottom,count,_ in accepted]

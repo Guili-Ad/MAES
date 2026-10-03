@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 
 from .models import MusicCalibrationData, MusicCandidate, MusicConfig
 from .vision import build_color_mask, connected_components
@@ -380,6 +381,14 @@ def detect_hold_tails(
         score = pixel_count / max(width * height, 1)
         if score < max(0.25, config.hold_tail_min_score) or pixel_count < max(60, config.hold_tail_min_pixels):
             continue
+        marker_box = (x0 + local_x, y0 + local_y, width, height)
+        physical_ring = None
+        if physical_only and config.hold_notes_as_taps:
+            # Pure shape evidence does not depend on projection or the halo.
+            # Reject the same nonphysical contours before either costly pass.
+            physical_ring = gold_ring_shape(array, marker_box)
+            if not physical_ring:
+                continue
         center = (x0 + local_x + width / 2.0, y0 + local_y + height / 2.0)
         projections = [
             (*_project_to_line(center, line), lane)
@@ -412,14 +421,6 @@ def detect_hold_tails(
             )
             if float(lime.mean()) > 0.05:
                 continue
-        marker_box = (x0 + local_x, y0 + local_y, width, height)
-        physical_ring = None
-        if physical_only and config.hold_notes_as_taps:
-            # This is the existing shape verdict, before the expensive ribbon
-            # ownership calculation. It does not change any mask or threshold.
-            physical_ring = gold_ring_shape(array, marker_box)
-            if not physical_ring:
-                continue
         topology, owners, _, owner_scores = marker_evidence(array, center, longer / 2.0, target_lane, calibration)
         # Directional/local-contrast evidence replaces the old 24-sector scan.
         # Keep the compatibility field, but do not pay for both classifiers.
@@ -446,6 +447,20 @@ def detect_hold_tails(
     return sorted(detections, key=lambda item: (item.progress, item.center[1], item.center[0]))
 
 
+@lru_cache(maxsize=128)
+def _gold_shape_geometry(w, h):
+    """Immutable pixel-independent geometry; retain the original arithmetic."""
+    rows, cols = np.indices((h, w))
+    nx, ny = (cols-(w-1)/2.)/(w/2.), (rows-(h-1)/2.)/(h/2.)
+    radial = nx*nx+ny*ny
+    rim = (radial >= .55**2) & (radial <= 1.05**2)
+    bins = ((np.arctan2(ny, nx)+math.pi)*12/(2*math.pi)).astype(int).clip(0, 11)
+    counts = np.bincount(bins[rim], minlength=12)
+    for array in (rim, bins, counts):
+        array.flags.writeable = False
+    return rim, bins, counts
+
+
 def gold_ring_shape(image, box):
     """Positive circular gold rim evidence, not just white HUD coverage."""
     x, y, w, h = box
@@ -454,16 +469,26 @@ def gold_ring_shape(image, box):
     crop = np.asarray(image)[y:y+h, x:x+w, :3].astype(np.int16)
     if crop.shape[:2] != (h, w):
         return False
-    rows, cols = np.indices((h, w))
-    nx, ny = (cols-(w-1)/2.)/(w/2.), (rows-(h-1)/2.)/(h/2.)
-    radial = nx*nx+ny*ny
-    rim = (radial >= .55**2) & (radial <= 1.05**2)
+    rim, bins, counts = _gold_shape_geometry(w, h)
     b, g, r = crop[:,:,0], crop[:,:,1], crop[:,:,2]
     gold = (r >= 170) & (g >= 110) & (r-b >= 35) & (g-b >= 15)
-    bins = ((np.arctan2(ny, nx)+math.pi)*12/(2*math.pi)).astype(int).clip(0, 11)
-    counts = np.bincount(bins[rim], minlength=12)
     filled = np.bincount(bins[rim & gold], minlength=12)
     return bool(np.count_nonzero(filled >= np.maximum(1, counts*.15)) >= 8)
+
+
+@lru_cache(maxsize=128)
+def _gold_coverage_geometry(w, h):
+    """Coverage and shape have different rims/bins; never combine formulas."""
+    yy, xx = np.ogrid[:h, :w]
+    dx, dy = (xx-(w-1)/2.)/max(1., w/2.), (yy-(h-1)/2.)/max(1., h/2.)
+    radial = dx*dx+dy*dy
+    angle = (np.arctan2(dy, dx)+2*math.pi) % (2*math.pi)
+    rim = (radial >= .45**2) & (radial <= 1.05**2)
+    sectors = np.minimum(11, (angle[rim]*6/math.pi).astype(np.intp))
+    totals = np.bincount(sectors, minlength=12)
+    for array in (rim, sectors, totals):
+        array.flags.writeable = False
+    return rim, sectors, totals
 
 
 def gold_ring_coverage(image, box):
@@ -472,14 +497,8 @@ def gold_ring_coverage(image, box):
     patch = image[y:y+h, x:x+w, :3]
     if patch.size == 0 or min(w, h) < 8:
         return None
-    yy, xx = np.ogrid[:h, :w]
-    dx, dy = (xx-(w-1)/2.)/max(1., w/2.), (yy-(h-1)/2.)/max(1., h/2.)
-    radial = dx*dx+dy*dy
-    angle = (np.arctan2(dy, dx)+2*math.pi) % (2*math.pi)
-    rim = (radial >= .45**2) & (radial <= 1.05**2)
+    rim, sectors, totals = _gold_coverage_geometry(w, h)
     b, g, r = (patch[..., i].astype(np.int16) for i in range(3))
     pale = (r >= 145) & (g >= 110) & (r >= b-20) & (r-g <= 100)
-    sectors = np.minimum(11, (angle[rim]*6/math.pi).astype(np.intp))
-    totals = np.bincount(sectors, minlength=12)
     counts = np.bincount(sectors, weights=pale[rim], minlength=12)
     return float(((totals > 0) & (counts >= totals*.25)).mean())

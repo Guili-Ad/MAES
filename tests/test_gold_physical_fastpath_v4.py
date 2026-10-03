@@ -59,6 +59,19 @@ class GoldPhysicalFastpathTests(unittest.TestCase):
             holds.detect_hold_tails(self.image, self.cal, self.config, physical_only=True)
         self.assertEqual(shape.call_count, len(default))
 
+    def test_false_shapes_skip_projection_and_halo_before_owner_work(self):
+        image = self.image.copy()
+        image[370:431, 610:671] = 0
+        default = holds.detect_hold_tails(image, self.cal, self.config)
+        self.assertTrue(default)
+        self.assertTrue(all(d.physical_ring is False for d in default))
+        with patch.object(holds, '_project_to_line',
+                          side_effect=AssertionError('nonphysical projection')), \
+             patch.object(holds, 'build_color_mask',
+                          side_effect=AssertionError('nonphysical halo')):
+            self.assertEqual(holds.detect_hold_tails(
+                image, self.cal, self.config, physical_only=True), [])
+
     def test_legacy_mode_ignores_optional_gate_and_keeps_all_outputs(self):
         legacy = MusicConfig(hold_notes_as_taps=False, lane_count=7, enable_holds=True)
         expected = holds.detect_hold_tails(self.image, self.cal, legacy)
