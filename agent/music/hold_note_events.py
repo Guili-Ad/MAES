@@ -113,10 +113,32 @@ class HoldNoteEventRegistry:
                 if prior is not None:
                     # Revoked, unstarted physical events can legally reacquire.
                     if prior.cancelled and prior.started is None and chain is not None:
+                        # Cancellation ended the old scheduling qualification.
+                        # Refit from positive current observations BEFORE the
+                        # ordinary freeze check; its expired deadline must not
+                        # instantly freeze a legally reacquired physical ID.
+                        prediction = _finite_prediction(engine, marker)
+                        if prediction is None:
+                            continue
+                        hit, lane = prediction
+                        if hit < now - .05 or hit - now > horizon:
+                            continue
+                        latest = marker.observations[-1]
+                        previous_deadline = prior.event.deadline
                         prior.cancelled = False
                         prior.event = replace(prior.event, owner_id=owner.track_id,
-                                              tap_frozen=False, tap_group_id=None)
+                            deadline=max(now, hit - advance), lane=lane,
+                            coordinate=engine._lane_point(lane), tap_reference_hit_time=hit,
+                            source_capture_started=latest.capture_started,
+                            source_capture_finished=latest.capture_finished,
+                            marker_terminal=chain.terminal(marker),
+                            tap_frozen=False, tap_group_id=None)
                         events.append(prior.event)
+                        engine.tap_trace.add('hold_note_reacquired', time=now,
+                            event=prior.event.event_id, owner=owner.track_id,
+                            marker=marker.marker_id, before=previous_deadline,
+                            deadline=prior.event.deadline, hit=hit,
+                            source_capture_finished=latest.capture_finished)
                     continue
                 if chain is None and marker.marker_id in owner.hold_sustain_planned_ids:
                     continue
