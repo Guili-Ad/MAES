@@ -211,6 +211,58 @@ class GoldMarkerTracker(SustainMarkerTracker):
         self.descriptors = {k:v for k,v in self.descriptors.items() if k in alive}
         self.rejected = {k:v for k,v in self.rejected.items() if k in alive}
 
+    def recover_missing(self, detections, frame):
+        """A current local ring can restore motion, never ownership or tail votes."""
+        from .gold_recovery import recover_gold_markers
+        registry = getattr(self.chain.engine, 'hold_note_event_registry', None)
+        excluded = {state.event.marker_id for state in registry.states.values()
+                    if state.started is not None} if registry is not None else set()
+        healthy = {}
+        for mid, marker in self.markers.items():
+            if mid in excluded or marker.last_seen_frame == frame.sequence:
+                continue
+            anchor = self.chain.anchors.get(marker.owner)
+            track = self.chain.engine.tracks.get(marker.owner)
+            rejected = self.rejected.get(mid)
+            # Reacquiring *new positive pixels* is not permission to execute
+            # an expired prediction. The execution age check happens after
+            # the observation; a jittered second frame need not fit exactly
+            # inside the median-based coast allowance to prove reappearance.
+            if (anchor is None or anchor.state == AnchorState.CLOSED or track is None
+                    or not self.chain.current_connection(anchor)
+                    or track.state != TrackState.HOLDING
+                    or not 0 < frame.midpoint-marker.last_seen_time <= .6
+                    or not 0 < frame.sequence-marker.last_seen_frame <= 2
+                    or (rejected is not None and rejected[0] >= marker.last_seen_frame)
+                    or not marker.stable(self.chain.engine.config, frame.midpoint,
+                                         self.chain.engine.calibration.trigger_progress)):
+                continue
+            healthy[mid] = marker
+        if not healthy:
+            return
+        diagnostics = {}
+        recovered = recover_gold_markers(frame, self.chain.engine.calibration,
+            self.chain.engine.config, healthy, self.descriptors, detections,
+            excluded_ids=excluded, diagnostics=diagnostics)
+        for mid, detection in recovered.items():
+            marker = healthy.get(mid)
+            if marker is None or detection.physical_ring is not True:
+                continue
+            # No local fit may create terminal evidence, choose a new owner, or
+            # consume a second velocity sample for the same captured image.
+            if (detection.topology != 'unknown' or detection.ribbon_exit_count
+                    or detection.owner_lanes != () or marker.last_seen_frame == frame.sequence):
+                continue
+            last = marker.observations[-1]
+            if detection.center == last.center and abs(detection.progress-last.progress) <= 1e-6:
+                continue
+            super().observe(mid, detection, frame, None)
+            self.descriptors[mid] = detection
+            self.chain.trace.add('gold_recovered', time=frame.midpoint,
+                frame=frame.sequence, marker=mid, owner=marker.owner,
+                center=detection.center, lane=detection.lane, progress=detection.progress,
+                observation=diagnostics.get(mid), reason='current-local-physical-ring')
+
 
 class TapHoldChain:
     def __init__(self, engine):
@@ -347,6 +399,7 @@ class TapHoldChain:
             from .holds import detect_hold_tails
             detections = detect_hold_tails(frame.image, self.engine.calibration, self.engine.config)
         self.tracker.associate_detections(detections, frame)
+        self.tracker.recover_missing(detections, frame)
         self.bind_flicks(frame)
 
     def eligible(self, marker, now):

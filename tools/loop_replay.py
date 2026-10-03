@@ -5,6 +5,7 @@ simulated capture return time. Costs are synthetic, not measured game timing.
 """
 import json
 import time
+from contextlib import ExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +20,10 @@ def run_loop(stream, calibration, config, args):
     from agent.music.vision import NumpyCandidateProvider, VisualMask
     from agent.music.storage import metric_summary
     from tap_replay import decode_candidate
+    try:
+        from agent.music.tap_hold_chain import TapHoldChain
+    except ImportError:  # Frozen baseline does not have the new tap-mode chain.
+        TapHoldChain = None
 
     profile = json.loads(args.cost_profile.read_text(encoding='utf-8')) if args.cost_profile else {}
     class Clock:
@@ -42,6 +47,7 @@ def run_loop(stream, calibration, config, args):
         decoded = 0
         latest = None
         costs = {}
+        capture_pts = {}
         def capture(self, _context, sequence, _clock, timeout_ms=1200):
             nonlocal following
             begin = clock()
@@ -62,6 +68,7 @@ def run_loop(stream, calibration, config, args):
                 self.tasker.stopping = True
                 return None, (finish-begin)*1000.
             image = self.latest[1]
+            self.capture_pts[sequence] = self.latest[0]
             return MusicFrame(sequence, begin, finish, (begin+finish)/2., image), (finish-begin)*1000.
         def run_recognition(self, node, image):
             clock.sleep(self.costs.get('ocr_ms', 0.) / 1000.)
@@ -97,15 +104,46 @@ def run_loop(stream, calibration, config, args):
     executor = MusicActionExecutor(context, 1280, 720, config, advanced=True, multi_touch=True,
                                    clock=clock, sleeper=getattr(runtime, '_sleep_interruptibly', clock.sleep))
     engines, scheduled, pending_snapshot, samples, observations = [], [], [], [], []
+    cpu_frames, update_depth = {}, [0]
+    def cpu_frame(frame):
+        segment = getattr(runtime.tap_trace, 'segment_id', 0)
+        key = (segment, frame.sequence)
+        return cpu_frames.setdefault(key, {
+            'segment': segment, 'sequence': frame.sequence,
+            'source_pts': context.capture_pts.get(frame.sequence),
+            'capture_started': frame.capture_started, 'capture_finished': frame.capture_finished,
+            'midpoint': frame.midpoint, 'engine_update_cpu_ms': 0.,
+            'identity_prepass_cpu_ms': 0., 'gold_refresh_inline_cpu_ms': 0.,
+            'gold_refresh_prepass_calls': 0, 'gold_refresh_inline_calls': 0})
+    def refresh(chain, frame, *positional, **keywords):
+        # The pre-dispatch qualification lives outside engine.update. Count it
+        # separately; nested refresh is already in update's elapsed CPU time.
+        nested = update_depth[0] > 0
+        begin = time.perf_counter()
+        try:
+            return original_refresh(chain, frame, *positional, **keywords)
+        finally:
+            elapsed = (time.perf_counter()-begin)*1000.
+            row = cpu_frame(frame)
+            row['gold_refresh_inline_cpu_ms' if nested else 'identity_prepass_cpu_ms'] += elapsed
+            row['gold_refresh_inline_calls' if nested else 'gold_refresh_prepass_calls'] += 1
+    original_refresh = TapHoldChain.refresh if TapHoldChain is not None else None
     def new_engine(*positional, **keywords):
         engine = MusicVisionEngine(*positional, **keywords)
         original = engine.update
         def update(frame, candidates, visual):
             observations.append({'segment': getattr(runtime.tap_trace, 'segment_id', 0), 'sequence':frame.sequence,
-                                 'capture_finished':frame.capture_finished})
+                                 'capture_finished':frame.capture_finished,
+                                 'source_pts':context.capture_pts.get(frame.sequence)})
             begin = time.perf_counter()
-            events = original(frame, candidates, visual)
-            samples.append((time.perf_counter()-begin)*1000.)
+            update_depth[0] += 1
+            try:
+                events = original(frame, candidates, visual)
+            finally:
+                update_depth[0] -= 1
+                elapsed = (time.perf_counter()-begin)*1000.
+                samples.append(elapsed)
+                cpu_frame(frame)['engine_update_cpu_ms'] += elapsed
             clock.sleep(context.costs.get('tracking_ms', 0.) / 1000.)
             scheduled.extend({'track': e.track_id, 'gesture': e.gesture.value, 'lane': e.lane,
                               'deadline': e.deadline} for e in events)
@@ -126,24 +164,34 @@ def run_loop(stream, calibration, config, args):
     if first is None:
         raise ValueError('Initial replay capture failed; production startup has no valid frame')
     runtime._execute_due = execute
-    with patch.object(runtime, 'startup_gate', return_value=None), \
+    with ExitStack() as stack, \
+         patch.object(runtime, 'startup_gate', return_value=None), \
          patch.object(runtime, 'activate_play_provider', return_value=None), \
          patch.object(runtime, '_create_executor', return_value=executor), \
          patch.object(runtime.tap_trace, 'write', return_value='mock/no-disk'), \
          patch.object(VisualMask, 'from_image', side_effect=mask), \
          patch.object(runtime_module, '_capture_frame', side_effect=context.capture), \
          patch.object(runtime_module, 'MusicVisionEngine', side_effect=new_engine):
+        if TapHoldChain is not None:
+            stack.enter_context(patch.object(TapHoldChain, 'refresh', new=refresh))
         result = runtime.play(first)
     heads = []
     for row in runtime.head_action_trace:
         ordinal, track, lane, gesture, timestamp, late, flags = row.split(':')
         heads.append({'ordinal': int(ordinal), 'track': int(track), 'lane': int(lane), 'gesture': gesture,
                       'time': float(timestamp), 'late_ms': float(late), 'flags': flags})
-    return {'schema': 2, 'mode': 'production-loop', 'branch': str(args.branch_root.resolve()),
+    cpu_rows = list(cpu_frames.values())
+    for row in cpu_rows:
+        row['total_tracking_cpu_ms'] = row['engine_update_cpu_ms'] + row['identity_prepass_cpu_ms']
+    return {'schema': 3, 'mode': 'production-loop', 'branch': str(args.branch_root.resolve()),
             'source': str(args.video or args.candidates), 'provider': runtime.provider.name,
             'frames': context.decoded, 'captures': context.captures, 'cost_profile': profile,
             'heads': heads, 'actions': context.actions, 'scheduled': scheduled,
             'pending_at_clip_end': len(pending_snapshot), 'timing_ms': metric_summary(samples),
+            'full_tracking_timing_ms': metric_summary([row['total_tracking_cpu_ms'] for row in cpu_rows]),
+            'identity_prepass_timing_ms': metric_summary([row['identity_prepass_cpu_ms'] for row in cpu_rows]),
+            'tracking_cpu_by_frame': cpu_rows,
+            'cpu_timing_notes': 'timing_ms is legacy engine.update only; full_tracking_timing_ms adds external gold qualification prepass without counting inline refresh twice. Excludes provider, mask, OCR, input and release_events/refine_pending queue planning. Actual perf_counter CPU time includes probe overhead. metrics_ms is simulated host-clock timing, not measured CPU. Decoded PTS are identical input, but serviced snapshots/action sequences can differ.',
             'metrics_ms': runtime.metrics.summaries(executor.action_durations),
             'stop': {'status': result.status, 'reason': result.reason, 'cleanup_failure': runtime.cleanup_failure},
             'game_bad_miss': 'unavailable: compressed video / known candidates, simulated input and OCR',

@@ -306,6 +306,81 @@ class TapHoldFoundationTests(unittest.TestCase):
         self.assertGreaterEqual(clock.now, event.deadline)
         self.assertTrue(hold_note_registry(engine).states[event.event_id].cancelled)
 
+    def test_local_recovery_keeps_physical_event_and_source_without_fabricating_owner_proof(self):
+        engine, owner = tap_engine()
+        for i in range(3):
+            feed(engine, 1.+i*.1, i, [gold(.80+i*.05)])
+        marker = next(iter(engine.sustain_tracker.markers.values()))
+        event = engine.release_events(1.2)[0]
+        anchor = engine.tap_hold_chain.anchors[owner.track_id]
+        proof, votes = anchor.last_evidence, (marker.terminal_votes, marker.sustain_votes)
+        recovered = gold(.95, topology='unknown', owner_lanes=())
+        with patch('agent.music.gold_recovery.recover_gold_markers', return_value={marker.marker_id: recovered}):
+            feed(engine, 1.3, 3, [])
+            feed(engine, 1.3, 3, [])
+        self.assertEqual(len(marker.observations), 4)
+        self.assertEqual(set(engine.sustain_tracker.markers), {marker.marker_id})
+        self.assertEqual(marker.owner, owner.track_id)
+        self.assertEqual(marker.observations[-1].capture_finished, 1.3)
+        self.assertEqual(anchor.last_evidence, proof)
+        self.assertEqual((marker.terminal_votes, marker.sustain_votes), votes)
+        pending = refine_hold_note_events(engine, [event], 1.3)
+        self.assertEqual([e.event_id for e in pending], [event.event_id])
+
+    def test_actual_down_identity_is_never_locally_recovered_or_resent(self):
+        engine, owner = tap_engine()
+        for i in range(3):
+            feed(engine, 1.+i*.1, i, [gold(.80+i*.05)])
+        event = engine.release_events(1.2)[0]
+        marker_event(engine, event, 1.25)
+        marker = engine.sustain_tracker.markers[event.marker_id]
+        with patch('agent.music.gold_recovery.recover_gold_markers') as recover:
+            feed(engine, 1.3, 3, [])
+        recover.assert_not_called()
+        self.assertEqual(len(marker.observations), 3)
+        self.assertEqual(engine.release_events(1.3), [])
+
+    def test_fresh_explicit_contradiction_cannot_be_bypassed_by_local_recovery(self):
+        engine, _ = tap_engine()
+        for i in range(3):
+            feed(engine, 1.+i*.1, i, [gold(.60+i*.05)])
+        marker = next(iter(engine.sustain_tracker.markers.values()))
+        with patch('agent.music.gold_recovery.recover_gold_markers') as recover:
+            feed(engine, 1.3, 3, [gold(.75, owner_lanes=(4,))])
+        recover.assert_not_called()
+        self.assertEqual(len(marker.observations), 3)
+        self.assertFalse(engine.tap_hold_chain.eligible(marker, 1.3))
+
+    def test_positive_second_frame_reappearance_can_recover_after_coast_jitter(self):
+        engine, owner = tap_engine()
+        for i in range(3):
+            feed(engine, 1.+i*.05, i, [gold(.80+i*.025)])
+        marker = next(iter(engine.sustain_tracker.markers.values()))
+        self.assertAlmostEqual(engine.tap_hold_chain.coast_budget, .1)
+        event = engine.release_events(1.1)[0]
+        expired = 1.200010
+        self.assertFalse(engine.tap_hold_chain.eligible(marker, expired))
+        self.assertEqual(refine_hold_note_events(engine, [event], expired), [])
+        reappearance = gold(.90, topology='unknown', owner_lanes=())
+        with patch('agent.music.gold_recovery.recover_gold_markers',
+                   return_value={marker.marker_id: reappearance}) as recover:
+            feed(engine, expired, 4, [])
+        recover.assert_called_once()
+        self.assertEqual(marker.last_seen_time, expired)
+        restored = engine.release_events(expired)
+        self.assertEqual([e.event_id for e in restored], [event.event_id])
+
+    def test_second_frame_without_positive_pixels_cannot_refresh_expired_prediction(self):
+        engine, _ = tap_engine()
+        for i in range(3):
+            feed(engine, 1.+i*.05, i, [gold(.80+i*.025)])
+        marker = next(iter(engine.sustain_tracker.markers.values()))
+        event = engine.release_events(1.1)[0]
+        with patch('agent.music.gold_recovery.recover_gold_markers', return_value={}):
+            feed(engine, 1.200010, 4, [])
+        self.assertEqual(marker.last_seen_time, 1.1)
+        self.assertEqual(refine_hold_note_events(engine, [event], 1.200010), [])
+
     def test_old_quiet_same_lane_anchor_cannot_claim_new_head_gold(self):
         engine, old = tap_engine()
         feed(engine, 1., 1, [])
