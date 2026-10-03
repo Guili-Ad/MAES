@@ -35,9 +35,9 @@ class TapTrace:
         # Full per-event changes remain critical. Repeated candidates/whole
         # frame marker inventories cannot evict an input or an identity change.
         visual = kind in {'flick_detected', 'hold_markers', 'head_component_merged',
-                          'tap_contour_repeat'}
+                          'tap_contour_repeat', 'gold_observation'}
         if visual:
-            key = (kind, fields.get('track'), fields.get('lane'))
+            key = (kind, fields.get('track'), fields.get('lane'), fields.get('marker'))
             stamp = fields.get('time')
             previous = self._visual_seen.get(key)
             if isinstance(stamp, (float, int)) and previous is not None and 0 <= stamp-previous < .25:
@@ -67,7 +67,7 @@ class TapTrace:
         root = Path(__file__).resolve().parents[2] / 'logs' / 'tap-traces'
         root.mkdir(parents=True, exist_ok=True)
         path = root / (self.run_id + '.jsonl')
-        header = {'schema': 4, **self.identity, 'run_id': self.run_id,
+        header = {'schema': 5, **self.identity, 'run_id': self.run_id,
                   'calibration_hash': self.calibration_hash,
                   'effective_calibration_hash': self.effective_calibration_hash,
                   'config_hash': self.config_hash, 'config': self.config,

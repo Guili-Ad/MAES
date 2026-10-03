@@ -52,8 +52,10 @@ def calibration() -> MusicCalibrationData:
     )
 
 
-def detection(progress: float, lane: int, exits: int = 2, topology: str = "checkpoint") -> HoldTailDetection:
-    return HoldTailDetection(progress, 0.8, 100, lane, (640.0, 300.0), 0.0, exits, topology, None)
+def detection(progress: float, lane: int, exits: int = 2, topology: str | None = None) -> HoldTailDetection:
+    topology = topology or ('terminal' if exits == 1 else 'checkpoint')
+    return HoldTailDetection(progress, 0.8, 100, lane,
+        (float(calibration().points[lane][0]), 140.+480.*progress), 0.0, exits, topology, None)
 
 
 def make_frame(moment: float, sequence: int) -> MusicFrame:
@@ -75,7 +77,26 @@ def tap_engine(**kwargs) -> tuple[MusicVisionEngine, NoteTrack]:
     track.state = TrackState.HOLDING
     track.predicted_hit_time = 0.0
     engine.tracks[track.track_id] = track
+    register_head(engine, track)
     return engine, track
+
+
+def register_head(engine, track, now=0.):
+    """Fixtures must acknowledge actual head input, not inject HOLDING."""
+    event = MusicActionEvent(f'fixture-head-{track.track_id}', track.track_id, track.lane,
+                            NoteGesture.HOLD_START, now, tuple(engine.calibration.points[track.lane]))
+    engine.tap_hold_chain.acknowledge_head(event, SimpleNamespace(
+        down_call_started=now, down_call_finished=now+.001,
+        up_call_finished=now+.002, error=''))
+
+
+def linked_owner(engine, owner):
+    other = NoteTrack(6, 4, gesture=NoteGesture.HOLD_START,
+                      state=TrackState.HOLDING, predicted_hit_time=0.)
+    owner.linked_partner_id, other.linked_partner_id = 6, owner.track_id
+    engine.tracks[6] = other
+    register_head(engine, other)
+    return other
 
 
 def add_marker(
@@ -106,6 +127,7 @@ class HoldNoteTapTests(unittest.TestCase):
         engine, track = tap_engine()
         add_marker(engine, 7, track.track_id, 3, hit=2.0, now=1.0)
         self.assertEqual(engine.release_events(1.0), [])
+        add_marker(engine, 7, track.track_id, 3, hit=2.0, now=1.7)
         events = engine.release_events(1.7)
         self.assertEqual(len(events), 1)
         event = events[0]
@@ -119,8 +141,9 @@ class HoldNoteTapTests(unittest.TestCase):
 
     def test_simultaneous_markers_form_one_chord_group(self) -> None:
         engine, track = tap_engine()
+        other = linked_owner(engine, track)
         add_marker(engine, 7, track.track_id, 2, hit=2.0, now=1.8)
-        add_marker(engine, 8, track.track_id, 4, hit=2.01, now=1.8)
+        add_marker(engine, 8, other.track_id, 4, hit=2.01, now=1.8)
         events = engine.release_events(1.8)
         self.assertEqual(len(events), 2)
         groups = {event.tap_group_id for event in events}
@@ -133,6 +156,9 @@ class HoldNoteTapTests(unittest.TestCase):
         engine, track = tap_engine()
         add_marker(engine, 7, track.track_id, 3, hit=2.0, now=1.8)
         add_marker(engine, 8, track.track_id, 3, hit=2.05, now=1.8)
+        # This case is an actual duplicate contour, not a nearby real note.
+        engine.sustain_tracker.markers[8].observations = type(engine.sustain_tracker.markers[7].observations)(
+            engine.sustain_tracker.markers[7].observations, maxlen=12)
         events = engine.release_events(1.8)
         self.assertEqual(len(events), 1)
         self.assertIn(7, track.hold_sustain_planned_ids)
@@ -148,17 +174,13 @@ class HoldNoteTapTests(unittest.TestCase):
         ))
         self.assertTrue(all(event.gesture == NoteGesture.TAP for event in events))
 
-    def test_anchor_finalizes_without_touch_events(self) -> None:
+    def test_old_release_time_does_not_finalize_tap_anchor(self) -> None:
         engine, track = tap_engine()
         track.hold_release_time = 1.0
         events = engine.release_events(1.0)
         self.assertEqual(events, [])
-        self.assertTrue(track.hold_sustain_final_emitted)
-        self.assertEqual(track.state, TrackState.RELEASED)
-        self.assertTrue(any(
-            record.get('kind') == 'hold_note_anchor_done'
-            for record in engine.tap_trace.records
-        ))
+        self.assertFalse(track.hold_sustain_final_emitted)
+        self.assertEqual(track.state, TrackState.HOLDING)
 
     def test_flick_binding_disabled_in_tap_mode(self) -> None:
         engine, track = tap_engine()

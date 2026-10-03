@@ -81,7 +81,7 @@ class HoldNoteEventRegistry:
                 owner.hold_sustain_planned_ids.add(canonical)
             if state.cancelled:
                 continue
-            key = (state.event.owner_id, canonical)
+            key = canonical if engine.tap_hold_chain is not None else (state.event.owner_id, canonical)
             prior = by_marker.get(key)
             if prior is None:
                 by_marker[key] = state
@@ -101,11 +101,24 @@ class HoldNoteEventRegistry:
         events = []
         horizon = engine.config.hold_note_tap_horizon_ms / 1000.
         advance = engine.config.tap_action_advance_ms / 1000.
+        chain = engine.tap_hold_chain
+        prior_by_marker = {s.event.marker_id: s for s in self.states.values()}
         for owner in engine.tracks.values():
             if owner.state != TrackState.HOLDING:
                 continue
             for marker in engine.sustain_tracker.targets(owner.track_id, engine.config, now):
-                if marker.marker_id in owner.hold_sustain_planned_ids:
+                if chain is not None and not chain.eligible(marker, now):
+                    continue
+                prior = prior_by_marker.get(marker.marker_id)
+                if prior is not None:
+                    # Revoked, unstarted physical events can legally reacquire.
+                    if prior.cancelled and prior.started is None and chain is not None:
+                        prior.cancelled = False
+                        prior.event = replace(prior.event, owner_id=owner.track_id,
+                                              tap_frozen=False, tap_group_id=None)
+                        events.append(prior.event)
+                    continue
+                if chain is None and marker.marker_id in owner.hold_sustain_planned_ids:
                     continue
                 prediction = _finite_prediction(engine, marker)
                 if prediction is None:
@@ -125,16 +138,19 @@ class HoldNoteEventRegistry:
                     continue
                 latest = marker.observations[-1]
                 event = MusicActionEvent(
-                    event_id=f'holdnote-{owner.track_id}-{marker.marker_id}',
+                    event_id=(f'holdnote-{marker.marker_id}' if chain is not None
+                              else f'holdnote-{owner.track_id}-{marker.marker_id}'),
                     track_id=-marker.marker_id, lane=lane, gesture=NoteGesture.TAP,
                     deadline=max(now, hit - advance), coordinate=engine._lane_point(lane),
                     tap_reference_hit_time=hit,
                     source_capture_started=latest.capture_started,
                     source_capture_finished=latest.capture_finished,
                     origin='hold_note', owner_id=owner.track_id, marker_id=marker.marker_id,
-                    marker_terminal=marker.is_terminal() and owner.hold_terminal_confirmed,
+                    marker_terminal=(chain.terminal(marker) if chain is not None
+                                     else marker.is_terminal() and owner.hold_terminal_confirmed),
                 )
                 self.states[event.event_id] = HoldNoteEventState(event)
+                prior_by_marker[marker.marker_id] = self.states[event.event_id]
                 owner.hold_sustain_planned_ids.add(marker.marker_id)
                 events.append(event)
                 engine.tap_trace.add('hold_note_tap', time=now, event=event.event_id,
@@ -145,9 +161,12 @@ class HoldNoteEventRegistry:
         revised = {event.event_id: event for event in self.refine(engine, candidates, now)}
         return [revised[event.event_id] for event in events if event.event_id in revised]
 
-    def _valid(self, engine, state):
+    def _valid(self, engine, state, now):
         owner = engine.tracks.get(state.event.owner_id)
         marker = engine.sustain_tracker.markers.get(state.event.marker_id)
+        if engine.tap_hold_chain is not None:
+            return bool(not state.cancelled and state.started is None and marker is not None
+                        and engine.tap_hold_chain.eligible(marker, now))
         return bool(not state.cancelled and state.started is None
                     and owner is not None and owner.state == TrackState.HOLDING
                     and marker is not None and marker.owner == owner.track_id)
@@ -155,6 +174,8 @@ class HoldNoteEventRegistry:
     def _pair_allowed(self, engine, left, right):
         if left.lane == right.lane:
             return False
+        if engine.tap_hold_chain is not None:
+            return engine.tap_hold_chain.linked(left.owner_id, right.owner_id)
         if left.owner_id == right.owner_id:
             return True
         a, b = engine.tracks.get(left.owner_id), engine.tracks.get(right.owner_id)
@@ -175,20 +196,24 @@ class HoldNoteEventRegistry:
                 state = HoldNoteEventState(event)
                 self.states[event.event_id] = state
             event = state.event
-            if not self._valid(engine, state):
+            if not self._valid(engine, state, now):
                 if state.started is None and not state.cancelled:
                     state.cancelled = True
                     engine.tap_trace.add('hold_note_cancelled', time=now,
                                          event=event.event_id, reason='invalid-owner-or-marker')
                 continue
             marker = engine.sustain_tracker.markers[event.marker_id]
+            if engine.tap_hold_chain is not None and marker.owner != state.event.owner_id:
+                state.event = replace(state.event, owner_id=marker.owner)
+                event = state.event
             prediction = _finite_prediction(engine, marker)
             frozen = state.event.tap_frozen or event.tap_frozen or state.event.deadline <= now + .02
             if frozen:
                 frozen_before_update.add(event.event_id)
             updated = replace(state.event, tap_frozen=frozen)
             owner = engine.tracks[event.owner_id]
-            updated = replace(updated, marker_terminal=marker.is_terminal() and owner.hold_terminal_confirmed)
+            updated = replace(updated, marker_terminal=(engine.tap_hold_chain.terminal(marker)
+                if engine.tap_hold_chain is not None else marker.is_terminal() and owner.hold_terminal_confirmed))
             if not frozen and prediction is not None:
                 hit, lane = prediction
                 latest = marker.observations[-1]
@@ -291,6 +316,9 @@ class HoldNoteEventRegistry:
             owner=event.owner_id, marker=event.marker_id,
             started=state.started, completed=state.completed, error=state.error)
         if state.completed is None or error or state.started is None:
+            return True
+        if engine.tap_hold_chain is not None:
+            engine.tap_hold_chain.completed_marker(state.event, state.completed, self)
             return True
         owner = engine.tracks.get(event.owner_id)
         resolver = getattr(engine.sustain_tracker, 'resolve_id', lambda marker_id: marker_id)

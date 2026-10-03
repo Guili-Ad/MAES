@@ -100,39 +100,19 @@ def late_birth_ready(track, project):
 
 
 def tap_structure_ready(track, frame):
-    """Reject an observed tiny HUD stroke, not an unobserved/occluded head.
+    """All ordinary owners use current positive/negative/unknown shape evidence.
 
-    Only two-sample ordinary heads need this extra evidence. A fresh compact
-    teal candidate must have the white core and surrounding disc already used
-    by owner-only occlusion recovery. Missing pixels, stale positions, larger
-    heads and uncertain bonus/hold/flick sprites keep their existing path.
+    Maturity and queueing do not make a HUD stroke a head. Missing pixels,
+    stale positions and covered white cores remain unknown; they do not revoke
+    a healthy coast. Hold/bonus/flick classification keeps its independent path.
     """
-    if not ordinary_tap(track) or len(track.observations) != 2:
+    if frame is None or not ordinary_tap(track) or not track.observations:
         return True
     last = track.observations[-1]
     if last.frame_sequence != frame.sequence or last.progress < .45:
         return True
-    candidate = last.candidate
-    x, y, w, h = candidate.box
-    if max(w, h) > 32 or min(w, h) < 8 or not .65 <= w / h <= 1.55:
-        return True
-    import numpy as np
-    if (not isinstance(frame.image, np.ndarray) or frame.image.ndim != 3
-            or frame.image.shape[2] < 3 or x < 0 or y < 0
-            or x+w > frame.image.shape[1] or y+h > frame.image.shape[0]):
-        return True
-    patch = frame.image[y:y+h, x:x+w, :3]
-    b, g, r = (patch[..., i].astype(np.int16) for i in range(3))
-    teal = (b >= 70) & (g >= 110) & (g > r+35) & (b > r+25)
-    if not teal.any():
-        return True  # colour evidence unavailable, never infer non-existence
-    yy, xx = np.ogrid[:h, :w]
-    d = ((xx-(w-1)/2)/max(w/2, 1))**2 + ((yy-(h-1)/2)/max(h/2, 1))**2
-    core = d < .20**2
-    disc = (d > .35**2) & (d < .72**2)
-    white = (patch.min(axis=2) >= 190) & (patch.max(axis=2)-patch.min(axis=2) < 55)
-    return bool(core.any() and disc.any()
-                and white[core].mean() >= .25 and teal[disc].mean() >= .65)
+    from .tap_physical_identity import contour_evidence
+    return contour_evidence(last.candidate, frame).verdict != 'negative'
 
 
 def retire_bonus_fragments(tracks, stars, frame, project, trace):

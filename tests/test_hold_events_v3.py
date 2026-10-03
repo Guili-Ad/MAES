@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent.music.models import NoteGesture, NoteTrack, TrackState
-from test_hold_note_taps import add_marker, detection, make_frame, tap_engine
+from test_hold_note_taps import add_marker, detection, make_frame, tap_engine, register_head, linked_owner
 
 
 def shift_marker(engine, marker_id, dx):
@@ -45,6 +45,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         owner.linked_partner_id = other.track_id
         other.linked_partner_id = owner.track_id
         engine.tracks[other.track_id] = other
+        register_head(engine, other)
         add_marker(engine, 7, owner.track_id, 2, hit=2.0, now=1.8)
         add_marker(engine, 8, other.track_id, 4, hit=2.02, now=1.8)
         events = engine.release_events(1.8)
@@ -58,6 +59,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         other = NoteTrack(6, 4, gesture=NoteGesture.HOLD_START,
                           state=TrackState.HOLDING, predicted_hit_time=0.)
         engine.tracks[other.track_id] = other
+        register_head(engine, other)
         add_marker(engine, 7, owner.track_id, 2, hit=2.0, now=1.8)
         add_marker(engine, 8, other.track_id, 4, hit=2.02, now=1.8)
         self.assertTrue(all(event.tap_group_id is None
@@ -83,8 +85,9 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
 
     def test_group_updates_and_freezes_as_one(self):
         engine, owner = tap_engine()
+        other = linked_owner(engine, owner)
         add_marker(engine, 7, owner.track_id, 2, hit=2.0, now=1.8)
-        add_marker(engine, 8, owner.track_id, 4, hit=2.02, now=1.8)
+        add_marker(engine, 8, other.track_id, 4, hit=2.02, now=1.8)
         events = engine.release_events(1.8)
         events = self.refine(engine, events, events[0].deadline - .019)
         self.assertTrue(all(event.tap_frozen for event in events))
@@ -100,6 +103,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
                           state=TrackState.HOLDING, predicted_hit_time=0.)
         owner.linked_partner_id, other.linked_partner_id = 6, 5
         engine.tracks[6] = other
+        register_head(engine, other)
         add_marker(engine, 7, 5, 2, hit=2.0, now=1.8)
         add_marker(engine, 8, 6, 4, hit=2.02, now=1.8)
         events = engine.release_events(1.8)
@@ -138,6 +142,10 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
     def test_weak_single_exit_does_not_release_owner(self):
         engine, owner = tap_engine()
         add_marker(engine, 7, owner.track_id, 2, hit=2.0, now=1.8, exits=1)
+        # Three positive terminal observations are strong in the new mode;
+        # make this genuinely weak/unknown evidence instead of an old flag.
+        marker = engine.sustain_tracker.markers[7]
+        marker.terminal_votes = marker.sustain_votes = 0
         event = engine.release_events(1.8)[0]
         self.acknowledge(engine, event)
         self.assertEqual(owner.state, TrackState.HOLDING)
@@ -192,11 +200,12 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
 
     def test_late_partner_joins_frozen_side_without_moving_its_deadline(self):
         engine, owner = tap_engine()
+        other = linked_owner(engine, owner)
         add_marker(engine, 7, owner.track_id, 2, hit=2., now=1.8)
         left = engine.release_events(1.8)[0]
         left = self.refine(engine, [left], left.deadline - .019)[0]
         self.assertTrue(left.tap_frozen)
-        add_marker(engine, 8, owner.track_id, 4, hit=2.02, now=1.856)
+        add_marker(engine, 8, other.track_id, 4, hit=2.02, now=1.856)
         new_events = engine.release_events(1.856)
         self.assertEqual(len(new_events), 1)
         combined = self.refine(engine, [left, new_events[0]], 1.856)
@@ -207,10 +216,11 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
 
     def test_frozen_events_with_distinct_deadlines_cannot_be_merged(self):
         engine, owner = tap_engine()
+        other = linked_owner(engine, owner)
         add_marker(engine, 7, owner.track_id, 2, hit=2., now=1.8)
         left = engine.release_events(1.8)[0]
         left = self.refine(engine, [left], left.deadline - .019)[0]
-        add_marker(engine, 8, owner.track_id, 4, hit=2.02, now=1.88)
+        add_marker(engine, 8, other.track_id, 4, hit=2.02, now=1.88)
         right = engine.release_events(1.88)[0]
         # The new right side is already inside its own 20 ms freeze window.
         self.assertNotEqual(left.deadline, right.deadline)
@@ -223,6 +233,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
                           state=TrackState.HOLDING, predicted_hit_time=0.)
         owner.linked_partner_id, other.linked_partner_id = 6, 5
         engine.tracks[6] = other
+        register_head(engine, other)
         add_marker(engine, 7, 5, 2, hit=2., now=1.8)
         add_marker(engine, 8, 6, 4, hit=2.05, now=1.8)
         events = engine.release_events(1.8)
@@ -237,6 +248,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         owner.hold_terminal_confirmed = True
         owner.linked_partner_id, other.linked_partner_id = 6, 5
         engine.tracks[6] = other
+        register_head(engine, other)
         add_marker(engine, 7, 5, 2, hit=2., now=1.8, exits=1)
         add_marker(engine, 8, 6, 4, hit=2.02, now=1.8, exits=1)
         events = engine.release_events(1.8)
@@ -247,14 +259,13 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         self.assertEqual(self.refine(engine, events, 1.91), [])
         self.assertEqual(engine.release_events(1.91), [])
 
-    def test_nonfinite_prediction_keeps_last_valid_deadline(self):
+    def test_nonfinite_prediction_cannot_execute_invalid_visual_fit(self):
         engine, owner = tap_engine()
         add_marker(engine, 7, owner.track_id, 2, hit=2., now=1.8)
         event = engine.release_events(1.8)[0]
         marker = engine.sustain_tracker.markers[7]
         marker.observations[-1] = replace(marker.observations[-1], progress=float('nan'))
-        revised = self.refine(engine, [event], 1.81)[0]
-        self.assertEqual(revised.deadline, event.deadline)
+        self.assertEqual(self.refine(engine, [event], 1.81), [])
 
     def test_late_visual_correction_preserves_real_deadline_and_diagnostic(self):
         engine, owner = tap_engine()
@@ -271,8 +282,9 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
 
     def test_group_late_correction_freezes_updated_mean_not_old_deadline(self):
         engine, owner = tap_engine()
+        other = linked_owner(engine, owner)
         add_marker(engine, 7, owner.track_id, 2, hit=2., now=1.8)
-        add_marker(engine, 8, owner.track_id, 4, hit=2.02, now=1.8)
+        add_marker(engine, 8, other.track_id, 4, hit=2.02, now=1.8)
         events = engine.release_events(1.8)
         for mid in (7, 8):
             marker = engine.sustain_tracker.markers[mid]

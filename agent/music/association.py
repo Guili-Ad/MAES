@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from agent.common import LOGGER
 from .models import FLICK_GESTURES, MusicCandidate, MusicFrame, NoteGesture, TrackObservation, TrackState
 from .tap_tracking import associate_taps, repeated_head_pixels
+from .tap_physical_identity import normalize_tap_entries
 from .vision import VisualMask
 from .holds import bonus_hold_ribbon_present, hold_head_color_ratio
 if TYPE_CHECKING:
@@ -70,6 +71,14 @@ def associate_lane(
         return (candidate.variant != "bonus_star"
                 and (not engine.config.enable_holds or cached_head_ratio(candidate) < engine.config.hold_head_color_ratio)
                 and cached_flick(candidate) not in FLICK_GESTURES)
+
+    # Rectangles joined to judgement text are not physical head contours.
+    # Classify only ordinary candidates, before recovery ownership and motion
+    # association, so Hold/Star/Flick retain their independent evidence path.
+    from .tracking import assign_lane
+    entries = normalize_tap_entries(entries, frame,
+                                    lambda note: assign_lane(note, engine.calibration),
+                                    engine.tap_trace, ordinary=safe_tap_candidate)
 
     recovery_owners = {}
     for tid, (candidate, projection) in (recovered or {}).items():

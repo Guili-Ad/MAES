@@ -7,10 +7,11 @@ Only the track's own observations can revoke its not-yet-started input.
 from __future__ import annotations
 
 from .models import NoteGesture, TrackState
-from .tap_identity import coastable_tap, discontinuity, ordinary_tap
+from .tap_identity import coastable_tap, discontinuity, ordinary_tap, tap_structure_ready
 
 
-def _failure_reason(track, config, now, *, sequence=None, min_speed=None):
+def _failure_reason(track, config, now, *, sequence=None, min_speed=None, frame=None,
+                    coast_eligible=None):
     if track.state in {TrackState.LOST, TrackState.RELEASED}:
         return 'terminal-track'
     if track.tap_input_started is not None:
@@ -24,6 +25,8 @@ def _failure_reason(track, config, now, *, sequence=None, min_speed=None):
     # decision; do not consult or mutate its timing/lifecycle here.
     if not ordinary_tap(track):
         return None
+    if not tap_structure_ready(track, frame):
+        return 'current-pixels-prove-non-head-contour'
     reason = discontinuity(track, last.progress, last.timestamp)
     if reason is not None:
         return reason
@@ -36,16 +39,26 @@ def _failure_reason(track, config, now, *, sequence=None, min_speed=None):
         missing = False
     if now - last.timestamp > config.coast_max_age_ms / 1000.:
         return 'visual-age-exceeds-coast-budget'
-    if missing and not coastable_tap(track, config, now=now, min_speed=min_speed):
-        return 'visual-dropout-without-coast-evidence'
+    if missing:
+        if not coastable_tap(track, config, now=now, min_speed=min_speed):
+            return 'visual-dropout-without-coast-evidence'
+        # Birth and queue qualification must consult the same centre-lane and
+        # physical owner decision. Queued is not evidence of independent head
+        # ownership. Callback omitted retains synthetic/legacy compatibility.
+        if coast_eligible is not None and not coast_eligible(track):
+            return 'visual-dropout-without-coast-ownership'
     return None
 
 
-def valid_pending(event, tracks, config, now, trace, *, sequence=None, min_speed=None):
+def valid_pending(event, tracks, config, now, trace, *, sequence=None, min_speed=None, frame=None,
+                  coast_eligible=None):
     """Return whether a not-yet-sent event still owns valid visual evidence.
 
     ``sequence`` and ``min_speed`` should be the engine's current frame sequence
-    and adaptive coast speed. Hold marker/centre-special events have independent
+    and adaptive coast speed. ``frame`` is the latest fully processed image;
+    it is optional for legacy/synthetic owners. ``coast_eligible(track)`` is the
+    engine's same centre/owner qualification used before initial queueing.
+    Hold marker/centre-special events have independent
     owners and are deliberately not reinterpreted by this ordinary tap policy.
     This function does not read rejection log records or choose new deadlines.
     """
@@ -60,7 +73,8 @@ def valid_pending(event, tracks, config, now, trace, *, sequence=None, min_speed
                       reason='observed-owner-pruned', source='pending-eligibility')
             return False
         return True  # unknown legacy owner is not a negative visual finding
-    reason = _failure_reason(track, config, now, sequence=sequence, min_speed=min_speed)
+    reason = _failure_reason(track, config, now, sequence=sequence, min_speed=min_speed, frame=frame,
+                             coast_eligible=coast_eligible)
     if reason is None:
         return True
     if reason not in {'terminal-track', 'input-already-started'}:

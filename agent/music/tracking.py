@@ -148,7 +148,14 @@ class MusicVisionEngine:
         self.last_frame_sequence = 0
         self.hold_policy = HoldTimingPolicy(config)
         self.sustain_tracker = SustainMarkerTracker(trigger_progress=calibration.trigger_progress)
+        self.tap_hold_chain = None
+        if config.hold_notes_as_taps:
+            from .tap_hold_chain import TapHoldChain
+            self.tap_hold_chain = TapHoldChain(self)
+            self.sustain_tracker = self.tap_hold_chain.tracker
         self.previous_hold_tail_ids: list[int] = []
+        self.last_frame = None
+        self.tap_physical_aliases = {}
 
     def _new_track(self, lane: int, first_seen_time: float | None = None) -> NoteTrack:
         track = NoteTrack(
@@ -835,6 +842,9 @@ class MusicVisionEngine:
         self.sustain_tracker.prune(frame.midpoint)
 
     def _update_active_hold_tails(self, frame: MusicFrame) -> None:
+        if self.tap_hold_chain is not None:
+            self.tap_hold_chain.refresh(frame)
+            return
         active = [
             track
             for track in self.tracks.values()
@@ -1585,6 +1595,7 @@ class MusicVisionEngine:
 
     def update(self, frame: MusicFrame, candidates: Iterable[MusicCandidate], visual: VisualMask) -> list[MusicActionEvent]:
         self.last_frame_sequence = frame.sequence
+        self.last_frame = frame
         self._expire_approaching_tracks(frame)
         ordinary_candidates = list(candidates)
         bonus_candidates = detect_bonus_star_notes(frame.image, self.calibration) if self.config.enable_holds else []
@@ -1636,6 +1647,11 @@ class MusicVisionEngine:
         for lane, entries in by_lane.items():
             entries = unique_head_candidates(entries, self.tap_trace, frame)
             self._associate_lane(lane, entries, frame, visual, recovered)
+        from .tap_physical_identity import reconcile_tap_identities
+        aliases = reconcile_tap_identities(self.tracks, frame, self.config, self.tap_trace)
+        self.tap_physical_aliases.update(aliases)
+        for owner_id in set(aliases.values()):
+            self._update_motion(self.tracks[owner_id])
         self._update_linked_tap_pairs(frame)
         retire_converged_shadows(self.tracks, frame, self.tap_trace)
         self._stabilize_dense_tap_timing(frame)
@@ -1785,7 +1801,13 @@ class MusicVisionEngine:
                                    observations=[(o.timestamp,o.progress) for o in track.observations][-6:])
         if self.config.enable_holds:
             self._update_active_hold_tails(frame)
-            self._synchronize_linked_hold_releases(frame)
+            if self.tap_hold_chain is not None:
+                # Pending-gold qualification may already have consumed this
+                # screenshot before head association. Bind newly found flicks
+                # after association without recording a second gold sample.
+                self.tap_hold_chain.bind_flicks(frame)
+            if self.tap_hold_chain is None:
+                self._synchronize_linked_hold_releases(frame)
         self._prune_terminal_tracks(frame)
         return events
 
@@ -1797,11 +1819,19 @@ class MusicVisionEngine:
         maximum_age = self.config.max_schedule_horizon_ms / 1000.0 + 0.5
         refined: list[MusicActionEvent] = []
         for event in pending:
+            if event.track_id in self.tap_physical_aliases:
+                self.tap_trace.add('cancelled', time=now, event=event.event_id,
+                    track=event.track_id, reason='physical-alias-unstarted-shadow',
+                    owner=self.tap_physical_aliases[event.track_id])
+                continue
             if event.origin == 'hold_note':
                 refined.append(event)
                 continue
             if not valid_pending(event, self.tracks, self.config, now, self.tap_trace,
-                                 sequence=self.last_frame_sequence, min_speed=self.coast_speed_threshold):
+                                 sequence=self.last_frame_sequence, min_speed=self.coast_speed_threshold,
+                                 frame=self.last_frame,
+                                 coast_eligible=(lambda t: self._coast_eligible(t, self.last_frame))
+                                     if self.last_frame else None):
                 continue
             original_event = event
             if event.source_capture_finished is not None and now - event.source_capture_finished > maximum_age:
@@ -2144,6 +2174,9 @@ class MusicVisionEngine:
 
     def _finalize_hold_note_anchor(self, track: NoteTrack, now: float) -> None:
         from .hold_note_events import hold_note_registry
+        if self.tap_hold_chain is not None:
+            self.tap_hold_chain.finalize(now, hold_note_registry(self))
+            return
         if hold_note_registry(self).has_pending(track.track_id):
             return
         if track.hold_sustain_final_emitted:
