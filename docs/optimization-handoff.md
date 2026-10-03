@@ -1,6 +1,6 @@
 # 2026-10-03优化候选交接
 
-本页保留第一阶段v1.0.1的历史验证。第二轮8份录像复核后，当前候选为v1.0.3-marker-candidate，见`marker-fix-review.md`；v1.0.2的记录见`fixed-songs-review.md`。随机曲验收暂停，先完成固定四曲；旧候选包及其测试证据保持不变。
+本页保留第一阶段v1.0.1的历史验证。Test3的12轮分析与后续修复已迁至当前交接`tap-chain-handoff.md`（v1.0.4）；Test2见`marker-fix-review.md`，Test1见`fixed-songs-review.md`。随机曲验收暂停，当前先完成六首固定曲各两轮；旧候选包及其测试证据保持不变。
 
 用户已确认当前测试账号没有将Bad/Miss转换成Perfect的Support技能，本阶段直接以Bad/Miss验收。下文Support字段及12轮安排属于旧阶段记录，不要求本阶段统计不存在的技能救回。Test2-3为真实的单轮0 Bad、0 Miss，但其余轮次未通过，不能据此宣称稳定FC。
 

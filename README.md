@@ -1,7 +1,7 @@
 # MAES
 
 基于 MaaFramework 5.12.2 与 ProjectInterface V2 ，依托Deepseek和Codex实现的《偶像梦幻祭2》打歌自动化项目。
-当前源码 **v1.0.3-marker-candidate**，为待实战验证的长按小音符修复候选，不代表稳定FC版本。独立包为`MAES_MarkerFix_Candidate`，旧发行目录保持不变，复核与下一轮说明见`docs/marker-fix-review.md`。
+当前源码 **v1.0.4-tapchain-candidate**，为待实战验证的物理身份与双划修复候选，不代表稳定FC版本。独立包为`MAES_TapChain_Candidate`，旧发行目录保持不变，修复与下一轮说明见`docs/tap-chain-handoff.md`。
 
 ## 功能范围
 
@@ -14,7 +14,7 @@
 
 ## 使用（普通用户）
 
-1. 从本仓库 Releases 下载最新版本压缩包并解压到任意目录。
+1. 本轮候选使用本地 `dist/MAES_TapChain_Candidate`，不上传或发布Release；历史发行包仍可从仓库Releases取得。
 2. 系统要求：Windows 10/11 x64；.NET Desktop Runtime 10；VC++ 2015-2022 Redistributable；安卓模拟器（支持 ADB）或实机设备。
    缺少运行库时，以管理员身份运行包内 `DependencySetup_依赖库安装_win.bat` 可自动安装。
 3. 打开 `MFAAvalonia.exe`，添加你的模拟器设备；确认设备“输入模式”为 Default（打歌必需）。
@@ -52,11 +52,11 @@ powershell -ExecutionPolicy Bypass -File tools/bootstrap.ps1
 # 2. 项目检查（含离线运行时与原生库校验）
 runtime\python\python.exe -B tools\check_project.py --require-runtime
 
-# 3. 单元测试（当前338项；以运行输出为准）
+# 3. 单元测试（本轮基线338项；候选交付时509项通过）
 runtime\python\python.exe -B tools\run_tests.py
 
 # 4. 构建独立候选包；目标已存在时拒绝覆盖
-powershell -ExecutionPolicy Bypass -File tools/package.ps1 -OutputName MAES_MarkerFix_Candidate
+powershell -ExecutionPolicy Bypass -File tools/package.ps1 -OutputName MAES_TapChain_Candidate
 ```
 
 目录说明：

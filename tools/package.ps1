@@ -199,7 +199,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $GuiRoot "MFAAvalonia.exe"))) {
 }
 Copy-Item -Path (Join-Path $GuiRoot "*") -Destination $Target -Recurse -Force
 
-$ProjectItems = @("interface.json", "LICENSE.md", "README.md", "THIRD_PARTY_NOTICES.md", "requirements.lock", "agent", "resource", "LICENSES")
+$ProjectItems = @("interface.json", "LICENSE.md", "README.md", "THIRD_PARTY_NOTICES.md", "requirements.lock", "agent", "resource", "LICENSES", "docs")
 foreach ($Item in $ProjectItems) {
     Copy-Item -LiteralPath (Join-Path $AppRoot $Item) -Destination $Target -Recurse
 }
