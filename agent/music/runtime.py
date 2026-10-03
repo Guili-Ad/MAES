@@ -226,8 +226,13 @@ class MusicRuntime:
     def result_identity(self) -> dict:
         calibration_hash = digest(asdict(self.calibration)) if self.calibration else ''
         self.tap_trace.calibration_hash = calibration_hash
+        effective = asdict(self.calibration) if self.calibration else None
+        if effective is not None:
+            effective.pop('created_at', None)
+        self.tap_trace.effective_calibration_hash = digest(effective) if effective is not None else ''
         return {**self.tap_trace.identity, 'run_id': self.tap_trace.run_id,
                 'config_hash': self.tap_trace.config_hash, 'calibration_hash': calibration_hash,
+                'effective_calibration_hash': self.tap_trace.effective_calibration_hash,
                 'segment_id': self.tap_trace.segment_id, 'cleanup_failure': self.cleanup_failure}
 
     def _check_cancelled(self) -> None:
@@ -658,6 +663,15 @@ class MusicRuntime:
         # timestamp: doing so can turn an otherwise on-time isolated tap into the
         # single late action of a song.
         now = max(now, self.clock())
+        # A hold's larger eligibility window must not lend its blind wait to
+        # a mixed tap queue. Consider the earliest deadline of ALL pending
+        # events; filtering taps then sleeping to a later hold would still
+        # block the tap's next visual correction. Hold-only contracts retain
+        # their existing execution window.
+        if (wait and tap_wait_ms is not None and pending
+                and any(event.gesture == NoteGesture.TAP for event in pending)
+                and min(event.deadline for event in pending) > now + max(0., tap_wait_ms) / 1000.):
+            return
         base_window = self.config.deadline_execution_window_ms / 1000.0 if wait else 0.0
         lookahead = base_window
         for event in pending:
@@ -1054,7 +1068,7 @@ class MusicRuntime:
         try:
             executor = self._create_executor()
             executor.begin_segment(self.tap_trace.run_id, 0)
-            self.tap_trace.calibration_hash = digest(asdict(self.calibration))
+            self.result_identity()
             self.action_durations = executor.action_durations
             self._in_flight_taps: dict[str, MusicActionEvent] = {}
             engine = MusicVisionEngine(self.calibration, self.config, tap_trace=self.tap_trace)
