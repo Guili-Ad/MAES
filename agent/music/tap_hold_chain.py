@@ -397,7 +397,8 @@ class TapHoldChain:
                                    state='quiescent', reason='no-current-ribbon-evidence')
         if detections is None:
             from .holds import detect_hold_tails
-            detections = detect_hold_tails(frame.image, self.engine.calibration, self.engine.config)
+            detections = detect_hold_tails(frame.image, self.engine.calibration,
+                                          self.engine.config, physical_only=True)
         self.tracker.associate_detections(detections, frame)
         self.tracker.recover_missing(detections, frame)
         self.bind_flicks(frame)

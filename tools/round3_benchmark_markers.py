@@ -65,8 +65,8 @@ def main():
     image = np.zeros((720,1280,3), np.uint8)
     detector_output = [[]]
     # The sole visual boundary replacement is identical in both roots.
-    tracking.detect_hold_tails = lambda *unused: detector_output[0]
-    holds.detect_hold_tails = lambda *unused: detector_output[0]
+    tracking.detect_hold_tails = lambda *unused, **options: detector_output[0]
+    holds.detect_hold_tails = lambda *unused, **options: detector_output[0]
 
     class Clock:
         def __init__(self):

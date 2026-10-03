@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from .models import MusicCalibrationData, MusicCandidate, MusicConfig
 from .vision import build_color_mask, connected_components
 from .hold_topology import marker_evidence
+from .gold_mask import build_gold_mask
 
 try:
     import numpy as np
@@ -336,6 +337,8 @@ def detect_hold_tails(
     image: object,
     calibration: MusicCalibrationData,
     config: MusicConfig,
+    *,
+    physical_only: bool = False,
 ) -> list[HoldTailDetection]:
     """Return pale-gold hold caps inside calibrated lane corridors.
 
@@ -343,6 +346,10 @@ def detect_hold_tails(
     orange head reaches the judgement line.  Detection is therefore global and
     independent of the compact head track.  Temporal association and release
     prediction are handled by ``MusicVisionEngine``.
+
+    The optional tap-mode fast path discards only candidates already rejected
+    by the physical marker tracker. Default and sustained-touch callers keep
+    the complete historical output, including non-ring diagnostic contours.
     """
     if np is None:
         raise RuntimeError("NumPy is required by the hold tracker")
@@ -360,7 +367,7 @@ def detect_hold_tails(
     # saturation ceiling excludes the orange head fill; an expanded orange-halo
     # check below rejects its pale inner ring too.
     sample = 3
-    mask = build_color_mask(array[y0:y1:sample, x0:x1:sample], [[7, 5, 145]], [[45, 200, 255]])
+    mask = build_gold_mask(array[y0:y1:sample, x0:x1:sample])
     detections: list[HoldTailDetection] = []
     for box, sampled_pixels in connected_components(mask, max(3, config.hold_tail_min_pixels // (sample * sample))):
         sampled_x, sampled_y, sampled_width, sampled_height = box
@@ -405,6 +412,14 @@ def detect_hold_tails(
             )
             if float(lime.mean()) > 0.05:
                 continue
+        marker_box = (x0 + local_x, y0 + local_y, width, height)
+        physical_ring = None
+        if physical_only and config.hold_notes_as_taps:
+            # This is the existing shape verdict, before the expensive ribbon
+            # ownership calculation. It does not change any mask or threshold.
+            physical_ring = gold_ring_shape(array, marker_box)
+            if not physical_ring:
+                continue
         topology, owners, _, owner_scores = marker_evidence(array, center, longer / 2.0, target_lane, calibration)
         # Directional/local-contrast evidence replaces the old 24-sector scan.
         # Keep the compatibility field, but do not pay for both classifiers.
@@ -420,12 +435,12 @@ def detect_hold_tails(
                 ribbon_exits,
                 topology,
                 owners,
-                (x0 + local_x, y0 + local_y, width, height),
-                (gold_ring_coverage(array, (x0 + local_x, y0 + local_y, width, height))
+                marker_box,
+                (gold_ring_coverage(array, marker_box)
                  if config.hold_notes_as_taps else None),
                 owner_scores,
-                gold_ring_shape(array, (x0 + local_x, y0 + local_y, width, height))
-                    if config.hold_notes_as_taps else None,
+                ((physical_ring if physical_ring is not None else gold_ring_shape(array, marker_box))
+                 if config.hold_notes_as_taps else None),
             )
         )
     return sorted(detections, key=lambda item: (item.progress, item.center[1], item.center[0]))
