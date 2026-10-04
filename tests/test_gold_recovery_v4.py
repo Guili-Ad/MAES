@@ -77,22 +77,28 @@ class GoldRecoveryTests(unittest.TestCase):
         hourglass(setup[-1].image, setup[2].observations[-1].center)
         self.assertEqual(self.call(setup), {})
 
-    def test_stale_stationary_unowned_and_nonphysical_histories_are_rejected(self):
-        for kind in ('stale', 'stationary', 'unowned', 'nonphysical', 'legacy'):
+    def test_stale_stationary_and_nonphysical_histories_are_rejected(self):
+        for kind in ('stale', 'stationary', 'nonphysical', 'legacy'):
             setup = list(self.setup())
             if kind == 'stale':
                 setup[-1] = replace(setup[-1], midpoint=1.3, sequence=20)
             elif kind == 'stationary':
                 setup[2].observations = type(setup[2].observations)(
                     [replace(o, center=(640., 540.), progress=.8) for o in setup[2].observations], maxlen=12)
-            elif kind == 'unowned':
-                setup[2].owner = None
             elif kind == 'nonphysical':
                 setup[3] = replace(setup[3], physical_ring=None)
             else:
                 setup[1] = replace(setup[1], hold_notes_as_taps=False)
             with self.subTest(kind=kind):
                 self.assertEqual(self.call(setup), {})
+
+    def test_positive_unowned_physical_history_is_recovered_without_owner_proof(self):
+        setup = list(self.setup(owner=None))
+        result = self.call(setup)
+        self.assertEqual(set(result), {7})
+        self.assertTrue(result[7].physical_ring)
+        self.assertEqual(result[7].owner_lanes, ())
+        self.assertIsNone(setup[2].owner)
 
     def test_positive_reacquisition_after_two_periods_does_not_mean_unbounded_coast(self):
         setup = list(self.setup())

@@ -40,9 +40,9 @@ def _finite_prediction(engine, marker):
     return hit, lane
 
 
-def _same_pixels(left, right):
+def _same_pixels(left, right, *, ignore_owner=False):
     """Repeated structural identity is required, not merely close timing."""
-    if left.owner != right.owner or left.lane() != right.lane():
+    if (not ignore_owner and left.owner != right.owner) or left.lane() != right.lane():
         return False
     a, b = list(left.observations)[-3:], list(right.observations)[-3:]
     if len(a) < 3 or len(b) < 3:
@@ -243,7 +243,7 @@ class HoldNoteEventRegistry:
             if frozen:
                 frozen_before_update.add(event.event_id)
             updated = replace(state.event, tap_frozen=frozen)
-            owner = engine.tracks[event.owner_id]
+            owner = engine.tracks.get(event.owner_id)
             updated = replace(updated, marker_terminal=(engine.tap_hold_chain.terminal(marker)
                 if engine.tap_hold_chain is not None else marker.is_terminal() and owner.hold_terminal_confirmed))
             if not frozen and prediction is not None:
@@ -375,6 +375,11 @@ class HoldNoteEventRegistry:
 
 
 def hold_note_registry(engine):
+    if engine.tap_hold_chain is not None:
+        from .point_events import point_registry
+        registry = point_registry(engine)
+        engine.hold_note_event_registry = registry
+        return registry
     registry = getattr(engine, 'hold_note_event_registry', None)
     if registry is None:
         registry = HoldNoteEventRegistry()
@@ -383,6 +388,11 @@ def hold_note_registry(engine):
 
 
 def refine_hold_note_events(engine, pending, now):
+    if engine.tap_hold_chain is not None:
+        # A queued head can have been physically proved to be the same gold
+        # circle without changing its event ID. Canonicalize it before checking
+        # the compatibility origin field of the old pending representation.
+        return hold_note_registry(engine).refine(engine, pending, now)
     if not any(event.origin == 'hold_note' for event in pending):
         return pending
     return hold_note_registry(engine).refine(engine, pending, now)

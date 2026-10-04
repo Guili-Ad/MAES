@@ -91,7 +91,7 @@ class Round2RuntimeTests(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertGreater(pending[0].deadline, event.deadline)
         self.assertEqual(pending[0].origin, 'hold_note')
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def test_terminal_marker_runtime_receipt_retires_only_after_touchup(self):
         engine, owner, event, clock, runtime, executor = self.marker_setup(exits=1)
@@ -104,8 +104,9 @@ class Round2RuntimeTests(unittest.TestCase):
         with patch.object(executor, '_run', side_effect=action):
             runtime._execute_due(executor, pending, clock.now, RuntimeMetrics(), engine, wait=False)
         self.assertEqual([kind for kind, _ in seen], ['TouchDown', 'TouchUp'])
-        self.assertTrue(all(state == TrackState.HOLDING for _, state in seen))
-        self.assertEqual(owner.state, TrackState.RELEASED)
+        self.assertTrue(all(state == TrackState.TAP_PENDING for _, state in seen))
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
+        self.assertEqual(engine.tap_hold_chain.anchors[owner.track_id].state.value, 'closed')
         self.assertFalse(pending)
         inputs = [r for r in runtime.tap_trace.records if r['kind'] == 'input']
         self.assertEqual(inputs[0]['origin'], 'hold_note')

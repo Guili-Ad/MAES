@@ -706,10 +706,20 @@ class NoteTrack:
     # Point-mode identity is independent of visual HoldStart classification.
     # Legacy continuous holds and flicks do not enter this lifecycle.
     point_mode: bool = False
+    # Side-channel ribbon evidence never changes gesture/timing or the old
+    # sustained branch. Green heads need independent, forward strict frames
+    # before a metadata anchor is created; one-sided scenery is insufficient.
+    point_ribbon_confirmed: bool = False
+    point_ribbon_streak: int = 0
+    point_ribbon_last_sequence: int | None = None
+    point_ribbon_last_progress: float | None = None
+    point_ribbon_last_center: tuple[float, float] | None = None
+    point_ribbon_last_box: tuple[int, int, int, int] | None = None
     physical_id: str | None = None
     visual_family: str = ""
     timing_profile: str = ""
     point_static_origin: bool = False
+    point_requalification_sequence: int | None = None
 
 
 @dataclass

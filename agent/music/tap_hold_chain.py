@@ -53,6 +53,8 @@ class GoldMarkerTracker(SustainMarkerTracker):
         self.chain = chain
         self.descriptors = {}
         self.rejected = {}
+        self.stationary_origins = set()
+        self.moving_origins = set()
 
     def observe(self, marker_id, detection, frame, owner=None):
         state = super().observe(marker_id, detection, frame, owner)
@@ -64,11 +66,22 @@ class GoldMarkerTracker(SustainMarkerTracker):
     def associate_detections(self, detections, frame):
         prior = [m for m in self.markers.values() if m.observations
                  and 0 <= frame.midpoint-m.last_seen_time <= .6]
+        for marker in prior:
+            history = list(marker.observations)
+            if marker.marker_id in self.moving_origins or len(history) < 3:
+                continue
+            span = max(o.progress for o in history)-min(o.progress for o in history)
+            if span > .005 and marker.speed() > self.chain.engine.config.hold_sustain_marker_min_speed:
+                self.moving_origins.add(marker.marker_id)
+            elif history[-1].timestamp-history[0].timestamp >= .085 and span < .007:
+                self.stationary_origins.add(marker.marker_id)
         edges = {}
         for i, d in enumerate(detections):
-            if d.physical_ring is False or (d.ring_coverage is not None and d.ring_coverage < .50):
+            if d.physical_ring is not True or (d.ring_coverage is not None and d.ring_coverage < .50):
                 continue
             for j, m in enumerate(prior):
+                if m.marker_id in self.stationary_origins:
+                    continue
                 history = list(m.observations)
                 last = history[-1]
                 dt = frame.midpoint-last.timestamp
@@ -93,13 +106,8 @@ class GoldMarkerTracker(SustainMarkerTracker):
                 expected_progress = last.progress+max(0., m.speed())*dt
                 if len(history) >= 3 and abs(d.progress-expected_progress) > .12:
                     continue
-                # A known ribbon cannot be measured by a contradictory HUD blob.
-                if (m.owner is not None and d.owner_lanes
-                        and not self.chain.owner_allowed(m.owner, d)):
-                    if not (self.chain.migration_allowed(m.owner, d, m, frame, residual)
-                            or self.chain.route_continuity(m.owner, d, m, frame)):
-                        self.rejected[m.marker_id] = (frame.sequence, OwnerEvidence.CONTRADICTED)
-                        continue
+                # Connector/owner evidence is metadata, never a veto on a
+                # positively identified ring's geometric motion continuity.
                 edges[i, j] = residual
         # Solve connected conflicts only. Most rings have one possible edge.
         matches, visited, ambiguous_overflow = {}, set(), set()
@@ -148,8 +156,8 @@ class GoldMarkerTracker(SustainMarkerTracker):
                         # also monotone. The used-state carries that constraint
                         # into recursion, rather than rejecting only its single
                         # already-selected unconstrained best solution.
-                        if prior[j].owner is not None and any(
-                            used & (1 << k) and prior[previous[k]].owner == prior[j].owner
+                        if any(
+                            used & (1 << k) and prior[previous[k]].lane() == prior[j].lane()
                             and prior[previous[k]].last_seen_frame == prior[j].last_seen_frame
                             and prior[previous[k]].observations[-1].center[1]
                                 > prior[j].observations[-1].center[1]+2.
@@ -163,7 +171,7 @@ class GoldMarkerTracker(SustainMarkerTracker):
         for i, d in enumerate(detections):
             if i in ambiguous_overflow:
                 continue
-            if d.physical_ring is False or (d.ring_coverage is not None and d.ring_coverage < .50):
+            if d.physical_ring is not True or (d.ring_coverage is not None and d.ring_coverage < .50):
                 continue
             mid = matches.get(i)
             if mid is None:
@@ -184,9 +192,6 @@ class GoldMarkerTracker(SustainMarkerTracker):
                 route_pending = self.chain.route_continuity(m.owner, d, m, frame)
             owner, evidence = ((None, OwnerEvidence.UNKNOWN) if route_pending
                                else self.chain.choose_owner(d, m, frame))
-            if evidence == OwnerEvidence.CONTRADICTED:
-                self.rejected[mid] = (frame.sequence, evidence)
-                continue
             # A positively observed circular gold sprite may keep its physical
             # motion through a hidden ribbon. It does not manufacture ownership
             # evidence or turn a missing connection into a terminal vote.
@@ -196,6 +201,9 @@ class GoldMarkerTracker(SustainMarkerTracker):
             if m is not None and m.observations:
                 last = m.observations[-1]
                 if d.center == last.center and abs(d.progress-last.progress) <= 1e-6:
+                    if (mid not in self.moving_origins and len(m.observations) <= 2 and
+                            frame.midpoint-m.observations[0].timestamp >= .085):
+                        self.stationary_origins.add(mid)
                     continue  # repeated pixels are not another velocity sample
             self.rejected.pop(mid, None)
             state = (super().observe(mid, d, frame, None) if evidence == OwnerEvidence.UNKNOWN
@@ -210,6 +218,8 @@ class GoldMarkerTracker(SustainMarkerTracker):
         alive = set(self.markers)
         self.descriptors = {k:v for k,v in self.descriptors.items() if k in alive}
         self.rejected = {k:v for k,v in self.rejected.items() if k in alive}
+        self.stationary_origins.intersection_update(alive)
+        self.moving_origins.intersection_update(alive)
 
     def recover_missing(self, detections, frame):
         """A current local ring can restore motion, never ownership or tail votes."""
@@ -221,16 +231,12 @@ class GoldMarkerTracker(SustainMarkerTracker):
         for mid, marker in self.markers.items():
             if mid in excluded or marker.last_seen_frame == frame.sequence:
                 continue
-            anchor = self.chain.anchors.get(marker.owner)
-            track = self.chain.engine.tracks.get(marker.owner)
             rejected = self.rejected.get(mid)
             # Reacquiring *new positive pixels* is not permission to execute
             # an expired prediction. The execution age check happens after
             # the observation; a jittered second frame need not fit exactly
             # inside the median-based coast allowance to prove reappearance.
-            if (anchor is None or anchor.state == AnchorState.CLOSED or track is None
-                    or not self.chain.current_connection(anchor)
-                    or track.state != TrackState.HOLDING
+            if (mid in self.stationary_origins
                     or not 0 < frame.midpoint-marker.last_seen_time <= .6
                     or not 0 < frame.sequence-marker.last_seen_frame <= 2
                     or (rejected is not None and rejected[0] >= marker.last_seen_frame)
@@ -281,12 +287,19 @@ class TapHoldChain:
         return min(.6, 2*period)
 
     def acknowledge_head(self, event, receipt):
-        if (event.gesture != NoteGesture.HOLD_START or receipt.down_call_finished is None
+        if (receipt.down_call_finished is None
                 or receipt.up_call_finished is None or receipt.error):
             return
         track = self.engine.tracks.get(event.track_id)
         if track is None or track.track_id in self.anchors:
             return
+        family = event.visual_family or track.visual_family
+        profile = event.timing_profile or track.timing_profile
+        if not (family == 'yellow_head' or
+                (family == 'bonus' and (
+                    track.point_ribbon_confirmed if track.point_mode else
+                    profile == 'yellow_head' and track.hold_evidence_frames > 0))):
+            return  # color alone, including a green star, is not ribbon proof
         self.anchors[track.track_id] = TapHoldAnchor(track.track_id, event.event_id,
             receipt.down_call_started, track.lane, track.linked_partner_id,
             last_evidence=receipt.up_call_finished)
@@ -294,7 +307,6 @@ class TapHoldChain:
         self.connection_epochs[track.lane] = epoch
         self.anchors[track.track_id].connection_epoch = epoch
         self.anchors[track.track_id].connection_lane = track.lane
-        track.state = TrackState.HOLDING  # compatibility label; not ownership authority
         self.trace.add('tap_hold_anchor', time=receipt.up_call_finished,
                        track=track.track_id, state='active', reason='head-input-completed')
 
@@ -363,7 +375,9 @@ class TapHoldChain:
     def choose_owner(self, detection, marker, frame):
         if detection.topology == 'unknown' or detection.owner_lanes == ():
             return None, OwnerEvidence.UNKNOWN
-        if marker is not None and marker.owner is not None and self.owner_allowed(marker.owner, detection):
+        if (marker is not None and marker.owner is not None
+                and self.owner_allowed(marker.owner, detection)
+                and self.current_connection(self.anchors[marker.owner])):
             return marker.owner, OwnerEvidence.CONFIRMED
         eligible = [a for a in self.anchors.values() if a.state != AnchorState.CLOSED
                     and self.current_connection(a)
@@ -407,21 +421,18 @@ class TapHoldChain:
         return self.eligibility_reason(marker, now) is None
 
     def eligibility_reason(self, marker, now):
-        anchor = self.anchors.get(marker.owner)
-        track = self.engine.tracks.get(marker.owner)
-        if anchor is None or anchor.state == AnchorState.CLOSED or track is None:
-            return 'owner-unconfirmed-or-closed'
-        if not self.current_connection(anchor):
-            return 'superseded-head-connection'
-        if track.state != TrackState.HOLDING or not marker.stable(self.engine.config, now, self.engine.calibration.trigger_progress):
-            return 'owner-state-or-motion-unqualified'
+        descriptor = self.tracker.descriptors.get(marker.marker_id)
+        if (descriptor is None or descriptor.physical_ring is not True
+                or (descriptor.ring_coverage is not None and descriptor.ring_coverage < .50)):
+            return 'physical-ring-unconfirmed'
+        if marker.marker_id in self.tracker.stationary_origins:
+            return 'stationary-physical-origin'
+        if not marker.stable(self.engine.config, now, self.engine.calibration.trigger_progress):
+            return 'gold-motion-unqualified'
         if now-marker.last_seen_time > self.coast_budget:
             return 'gold-observation-age-exceeded'
         if self.last_frame_sequence-marker.last_seen_frame > 2:
             return 'gold-observation-frame-budget-exceeded'
-        rejected = self.tracker.rejected.get(marker.marker_id)
-        if rejected is not None and rejected[0] >= marker.last_seen_frame:
-            return 'contradictory-owner-evidence'
         return None
 
     def linked(self, left_id, right_id):
@@ -431,7 +442,8 @@ class TapHoldChain:
         if a is None or b is None or a.state == AnchorState.CLOSED or b.state == AnchorState.CLOSED:
             return False
         ta, tb = self.engine.tracks.get(left_id), self.engine.tracks.get(right_id)
-        return bool(ta and tb and ta.linked_partner_id == right_id and tb.linked_partner_id == left_id)
+        return bool((a.partner_id == right_id and b.partner_id == left_id)
+                    or (ta and tb and ta.linked_partner_id == right_id and tb.linked_partner_id == left_id))
 
     def bind_flicks(self, frame):
         for track in self.engine.tracks.values():
@@ -508,9 +520,5 @@ class TapHoldChain:
             if future:
                 continue
             a.state = AnchorState.CLOSED
-            track = self.engine.tracks.get(a.track_id)
-            if track is not None:
-                track.state = TrackState.RELEASED
-                track.hold_sustain_final_emitted = True
             self.trace.add('hold_note_anchor_done', time=now, track=a.track_id,
                            marker=a.terminal_marker, reason='physical-terminal-input-completed')

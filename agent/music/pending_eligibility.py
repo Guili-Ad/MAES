@@ -7,7 +7,16 @@ Only the track's own observations can revoke its not-yet-started input.
 from __future__ import annotations
 
 from .models import NoteGesture, TrackState
-from .tap_identity import coastable_tap, discontinuity, ordinary_tap, tap_structure_ready
+from .tap_identity import (coastable_tap, discontinuity, ordinary_tap, point_clickable,
+                           point_reobservation_ready, tap_structure_ready)
+
+
+_RECOVERABLE_POINT_FAILURES = frozenset({
+    'visual-age-exceeds-coast-budget',
+    'visual-dropout-without-coast-evidence',
+    'visual-dropout-without-coast-ownership',
+    'awaiting-valid-reobservation',
+})
 
 
 def _failure_reason(track, config, now, *, sequence=None, min_speed=None, frame=None,
@@ -23,8 +32,23 @@ def _failure_reason(track, config, now, *, sequence=None, min_speed=None, frame=
     last = observations[-1]
     # Promotion to a hold or bonus classification remains that subsystem's
     # decision; do not consult or mutate its timing/lifecycle here.
-    if not ordinary_tap(track):
+    if not (ordinary_tap(track) or point_clickable(track)):
         return None
+    if point_clickable(track):
+        from .head_identity import stationary_from_birth
+        if stationary_from_birth(track):
+            return 'stationary-origin'
+        reason = discontinuity(track, last.progress, last.timestamp)
+        if reason is not None:
+            return reason
+    if point_clickable(track) and not point_reobservation_ready(track, frame):
+        # A currently proven non-head remains a hard contradiction. An
+        # unknown/absent observation only keeps the same identity dormant.
+        if frame is not None and last.frame_sequence == frame.sequence:
+            from .tap_physical_identity import contour_evidence
+            if contour_evidence(last.candidate, frame, family=track.visual_family).verdict == 'negative':
+                return 'current-pixels-prove-non-head-contour'
+        return 'awaiting-valid-reobservation'
     if not tap_structure_ready(track, frame):
         return 'current-pixels-prove-non-head-contour'
     reason = discontinuity(track, last.progress, last.timestamp)
@@ -77,9 +101,19 @@ def valid_pending(event, tracks, config, now, trace, *, sequence=None, min_speed
                              coast_eligible=coast_eligible)
     if reason is None:
         return True
-    if reason not in {'terminal-track', 'input-already-started'}:
+    recoverable = point_clickable(track) and reason in _RECOVERABLE_POINT_FAILURES
+    if recoverable:
+        # Cancelling a queue record is not deleting a physical object. Re-arm
+        # only after a new positive observation; never continue coasting on the
+        # old prediction. The original event and physical ids stay intact.
+        track.state = TrackState.APPROACHING
+        track.action_executed = False
+        if track.point_requalification_sequence is None:
+            track.point_requalification_sequence = (
+                sequence if sequence is not None else track.observations[-1].frame_sequence)
+    elif reason not in {'terminal-track', 'input-already-started'}:
         track.state = TrackState.LOST
     trace.add('cancelled', time=now, event=event.event_id, track=track.track_id,
-              reason=reason, source='pending-eligibility',
+              reason=reason, source='pending-eligibility', recoverable=recoverable,
               last_visual_time=track.observations[-1].timestamp if track.observations else None)
     return False

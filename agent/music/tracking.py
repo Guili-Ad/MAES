@@ -162,6 +162,7 @@ class MusicVisionEngine:
             track_id=self.next_track_id,
             lane=lane,
             first_seen_time=first_seen_time,
+            point_mode=self.config.hold_notes_as_taps,
         )
         self.tracks[track.track_id] = track
         self.next_track_id += 1
@@ -1348,6 +1349,9 @@ class MusicVisionEngine:
                 or (track.gesture == NoteGesture.TAP
                     and track.state == TrackState.TAP_PENDING
                     and track.tap_input_started is None)
+                or (track.point_mode and track.state == TrackState.TAP_PENDING
+                    and track.gesture == NoteGesture.HOLD_START
+                    and track.tap_input_started is None)
                 # A bonus-star head becomes structurally recognisable a few
                 # frames after its ordinary partner.  Keep the still-visible
                 # held head eligible so the connector can bind the pair in
@@ -1507,6 +1511,11 @@ class MusicVisionEngine:
         """
         if not coastable_tap(track, self.config, now=frame.midpoint, min_speed=self.coast_speed_threshold):
             return False
+        if track.point_mode:
+            # Occlusion is evidence about an object, not about the lane index.
+            # Real dense siblings retain independent identities; proven aliases
+            # are resolved by the physical registry, not proximity/track age.
+            return True
         center = self.calibration.lane_count // 2
         if abs(track.lane - center) > 1:
             return False
@@ -1542,6 +1551,28 @@ class MusicVisionEngine:
         threshold = self.config.bonus_hold_min_evidence if track.bonus_star else 2
         return track.hold_evidence_frames >= threshold
 
+    def _point_rejected(self, track: NoteTrack, frame: MusicFrame, reason: str) -> bool:
+        """Explain unqueued points without a full-rate per-candidate log."""
+        if track.point_mode and track.gesture in {NoteGesture.TAP, NoteGesture.HOLD_START}:
+            from .point_events import point_registry
+            registry = point_registry(self)
+            track.physical_id = registry._identity('track', track.track_id)
+            seen = getattr(self, '_point_qualification_seen', None)
+            if seen is None:
+                seen = self._point_qualification_seen = {}
+            key = (track.track_id, reason)
+            previous = seen.get(key)
+            if previous is None or frame.midpoint - previous >= .25:
+                self.tap_trace.add('point_qualification', time=frame.midpoint, frame=frame.sequence,
+                    source='track', source_id=track.track_id, physical_id=track.physical_id,
+                    family=track.visual_family, timing_profile=track.timing_profile,
+                    reason=reason, latest_visual_time=(track.observations[-1].timestamp
+                        if track.observations else None), raw_hit=track.predicted_hit_time)
+                seen[key] = frame.midpoint
+                if len(seen) > 256:
+                    seen.pop(next(iter(seen)))
+        return False
+
     def _ready_to_schedule(self, track: NoteTrack, frame: MusicFrame) -> bool:
         if (
             track.action_executed
@@ -1553,7 +1584,7 @@ class MusicVisionEngine:
         last = observations[-1] if observations else None
         from .tap_identity import tap_structure_ready
         if not tap_structure_ready(track, frame):
-            return False
+            return self._point_rejected(track, frame, 'head-physical-evidence-unqualified')
         coast_ready = last is not None and self._coast_eligible(track, frame)
         # A prediction is useful for a short visual dropout, but never after a
         # track has been absent for the full lost-frame window.  This is the
@@ -1561,9 +1592,9 @@ class MusicVisionEngine:
         # Coast-eligible tracks keep their bounded prediction while the
         # judgement text tints/fragments the centre-lane pixels.
         if last is None or (frame.sequence - last.frame_sequence > 2 and not coast_ready):
-            return False
-        if not coast_ready and not late_birth_ready(track, lambda c: assign_lane(c, self.calibration)):
-            return False
+            return self._point_rejected(track, frame, 'head-observation-frame-budget-exceeded')
+        if (track.point_mode or not coast_ready) and not late_birth_ready(track, lambda c: assign_lane(c, self.calibration)):
+            return self._point_rejected(track, frame, 'head-birth-motion-unqualified')
         standard_ready = len(observations) >= 4 or coast_ready
         scheduled_hit_time = (
             self.tap_policy.hit_time(track)
@@ -1580,9 +1611,9 @@ class MusicVisionEngine:
         else:
             urgent_ready = False
         if not standard_ready and not urgent_ready:
-            return False
+            return self._point_rejected(track, frame, 'head-sample-budget-unqualified')
         if track.speed < self.config.min_downward_progress:
-            return False
+            return self._point_rejected(track, frame, 'head-motion-speed-unqualified')
         if scheduled_hit_time - frame.midpoint > self.config.max_schedule_horizon_ms / 1000.0:
             return False
         if not 0.35 <= last.progress < 0.99:
@@ -1650,14 +1681,29 @@ class MusicVisionEngine:
         from .tap_physical_identity import reconcile_tap_identities
         aliases = reconcile_tap_identities(self.tracks, frame, self.config, self.tap_trace)
         self.tap_physical_aliases.update(aliases)
+        if self.config.hold_notes_as_taps:
+            from .point_events import point_registry
+            registry = point_registry(self)
+            for shadow, canonical in aliases.items():
+                registry.alias('track', shadow, 'track', canonical)
         for owner_id in set(aliases.values()):
             self._update_motion(self.tracks[owner_id])
         self._update_linked_tap_pairs(frame)
         retire_converged_shadows(self.tracks, frame, self.tap_trace)
         self._stabilize_dense_tap_timing(frame)
         self._bind_hold_end_flicks(frame)
+        point_shadows = set()
+        if self.tap_hold_chain is not None:
+            # Both visual adapters must see this screenshot before either can
+            # register a click. refresh() is frame-watermarked; the legacy
+            # compatibility path and the end-of-frame binding remain intact.
+            self.tap_hold_chain.refresh(frame)
+            from .point_sources import reconcile_point_sources
+            point_shadows = reconcile_point_sources(self, frame)
         events: list[MusicActionEvent] = list(special_events)
         for track in sorted(self.tracks.values(), key=lambda item: item.track_id):
+            if track.track_id in point_shadows:
+                continue
             if track.hold_end_owner is not None:
                 # A ribbon-tip flick bound to a hold never swipes on its own;
                 # its prediction drives the hold's held-flick release instead.
@@ -1689,7 +1735,10 @@ class MusicVisionEngine:
                 event_hit_time = (track.predicted_hit_time + partner.predicted_hit_time) / 2.0
             event_id = f"track-{track.track_id}@{int(event_hit_time * 1000)}"
             track.action_event_id = event_id
-            if track.gesture == NoteGesture.HOLD_START:
+            point_head = self.config.hold_notes_as_taps and track.gesture in {NoteGesture.TAP, NoteGesture.HOLD_START}
+            if point_head:
+                track.state = TrackState.TAP_PENDING
+            elif track.gesture == NoteGesture.HOLD_START:
                 start_deadline = track.predicted_hit_time - self.hold_policy.action_advance_ms(track) / 1000.0
                 duplicate = next(
                     (
@@ -1741,15 +1790,22 @@ class MusicVisionEngine:
                 event_id=event_id,
                 track_id=track.track_id,
                 lane=track.lane,
-                gesture=track.gesture,
+                gesture=NoteGesture.TAP if point_head else track.gesture,
                 deadline=event_hit_time - advance_ms / 1000.0,
                 coordinate=(int(point[0]), int(point[1])),
                 direction=track.gesture if track.gesture in FLICK_GESTURES else NoteGesture.UNKNOWN,
-                contact_policy="persistent" if track.gesture == NoteGesture.HOLD_START else "auto",
+                contact_policy="persistent" if track.gesture == NoteGesture.HOLD_START and not point_head else "auto",
                 source_capture_started=frame.capture_started,
                 source_capture_finished=frame.capture_finished,
-                tap_reference_hit_time=event_hit_time if track.gesture == NoteGesture.TAP else None,
+                tap_reference_hit_time=event_hit_time if track.gesture == NoteGesture.TAP or point_head else None,
             ))
+            if point_head:
+                adopted = registry.adopt_track(events.pop(), track)
+                if adopted is None:
+                    track.action_executed = True
+                    continue
+                track.action_event_id = adopted.event_id
+                events.append(adopted)
             if linked_note and partner is not None and track.track_id < partner.track_id:
                 LOGGER.info(
                     "Music linked %s pair scheduled tracks=%s/%s shared_deadline=%.3f raw_skew_ms=%.1f",
@@ -1816,6 +1872,10 @@ class MusicVisionEngine:
         from .hold_note_events import refine_hold_note_events
         from .pending_eligibility import valid_pending
         pending = refine_hold_note_events(self, pending, now)
+        registry = None
+        if self.config.hold_notes_as_taps:
+            from .point_events import point_registry
+            registry = point_registry(self)
         maximum_age = self.config.max_schedule_horizon_ms / 1000.0 + 0.5
         refined: list[MusicActionEvent] = []
         for event in pending:
@@ -1823,6 +1883,8 @@ class MusicVisionEngine:
                 self.tap_trace.add('cancelled', time=now, event=event.event_id,
                     track=event.track_id, reason='physical-alias-unstarted-shadow',
                     owner=self.tap_physical_aliases[event.track_id])
+                if registry is not None:
+                    registry.cancel(event.event_id, 'physical-alias-unstarted-shadow')
                 continue
             if event.origin == 'hold_note':
                 refined.append(event)
@@ -1832,6 +1894,8 @@ class MusicVisionEngine:
                                  frame=self.last_frame,
                                  coast_eligible=(lambda t: self._coast_eligible(t, self.last_frame))
                                      if self.last_frame else None):
+                if registry is not None:
+                    registry.cancel(event.event_id, 'pending-qualification')
                 continue
             original_event = event
             if event.source_capture_finished is not None and now - event.source_capture_finished > maximum_age:
@@ -1855,7 +1919,7 @@ class MusicVisionEngine:
                 continue
             track = self.tracks.get(event.track_id)
             if track is not None:
-                if (event.gesture == NoteGesture.TAP and track.gesture == NoteGesture.HOLD_START
+                if (not self.config.hold_notes_as_taps and event.gesture == NoteGesture.TAP and track.gesture == NoteGesture.HOLD_START
                         and track.state == TrackState.HOLD_PENDING and track.tap_input_started is None):
                     event = replace(event, gesture=NoteGesture.HOLD_START, contact_policy='persistent',
                                     tap_group_id=None, tap_frozen=False)
@@ -1936,8 +2000,12 @@ class MusicVisionEngine:
         ordinary = self.tap_chords.refine([e for e in refined if e.origin != 'hold_note'],
                                          self.tracks, now, self.last_frame_sequence)
         by_id = {e.event_id: e for e in ordinary}
-        return [e if e.origin == 'hold_note' else by_id[e.event_id] for e in refined
-                if e.origin == 'hold_note' or e.event_id in by_id]
+        result = [e if e.origin == 'hold_note' else by_id[e.event_id] for e in refined
+                  if e.origin == 'hold_note' or e.event_id in by_id]
+        if registry is not None:
+            result = [updated for event in result
+                      if (updated := registry.revise(event) if event.physical_id is not None else event) is not None]
+        return result
 
     def _lane_point(self, lane: int) -> tuple[int, int]:
         point = self.calibration.points[lane]

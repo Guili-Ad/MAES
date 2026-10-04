@@ -13,6 +13,41 @@ if TYPE_CHECKING:
     from .tracking import LaneProjection
 
 
+def observe_point_ribbon_metadata(track, frame, candidate, projection, evidence):
+    """Two distinct, forward strict frames establish optional ribbon metadata.
+
+    The click classifier and its historical hold_evidence_frames are untouched.
+    Exact capture repeats may retain one valid frame, but cannot count as the
+    second. Missing/unknown evidence breaks the unconfirmed streak; it never
+    invents confirmation or revokes a previously confirmed physical head.
+    """
+    if not track.point_mode or not track.bonus_star:
+        return
+    positive = evidence.get('strict_bilateral', False) is True
+    previous_sequence = track.point_ribbon_last_sequence
+    repeated = (candidate.box == track.point_ribbon_last_box
+                and candidate.center == track.point_ribbon_last_center
+                and projection.progress == track.point_ribbon_last_progress)
+    if not positive:
+        track.point_ribbon_streak = 0
+    elif previous_sequence == frame.sequence:
+        return  # the same processed frame is never another observation
+    elif repeated:
+        pass  # positive but unchanged owned pixels are absent motion evidence
+    elif (previous_sequence is not None and previous_sequence+1 == frame.sequence
+          and track.point_ribbon_streak > 0
+          and projection.progress-(track.point_ribbon_last_progress or 0.) > .002):
+        track.point_ribbon_streak += 1
+    else:
+        track.point_ribbon_streak = 1
+    if track.point_ribbon_streak >= 2:
+        track.point_ribbon_confirmed = True
+    track.point_ribbon_last_sequence = frame.sequence
+    track.point_ribbon_last_progress = projection.progress
+    track.point_ribbon_last_center = candidate.center
+    track.point_ribbon_last_box = candidate.box
+
+
 def associate_lane(
     engine,
     lane: int,
@@ -26,11 +61,14 @@ def associate_lane(
             track.lane == lane
             and track.state in {TrackState.TAP_PENDING, TrackState.FLICK_PENDING}
             and (
-                (track.gesture == NoteGesture.TAP
+                ((track.gesture == NoteGesture.TAP or
+                  (track.point_mode and track.gesture == NoteGesture.HOLD_START))
                  and track.tap_input_started is not None
                  and track.tap_executed_hit_time is not None
                  and frame.midpoint > track.tap_executed_hit_time + 0.12)
-                or (track.gesture != NoteGesture.TAP and track.action_executed
+                or (track.gesture != NoteGesture.TAP
+                    and not (track.point_mode and track.gesture == NoteGesture.HOLD_START)
+                    and track.action_executed
                     and track.predicted_hit_time is not None
                     and frame.midpoint > track.predicted_hit_time + 0.12)
             )
@@ -155,7 +193,13 @@ def associate_lane(
         track.direction_evidence.append(flick)
         if engine.config.enable_holds and track.state not in {TrackState.RELEASED, TrackState.LOST}:
             if track.bonus_star:
-                hold_evidence = bonus_hold_ribbon_present(frame.image, candidate, projection.tangent)
+                if track.point_mode:
+                    ribbon_metadata = {}
+                    hold_evidence = bonus_hold_ribbon_present(frame.image, candidate, projection.tangent,
+                                                            evidence=ribbon_metadata)
+                    observe_point_ribbon_metadata(track, frame, candidate, projection, ribbon_metadata)
+                else:
+                    hold_evidence = bonus_hold_ribbon_present(frame.image, candidate, projection.tangent)
             else:
                 head_ratio = cached_head_ratio(candidate)
                 hold_evidence = head_ratio >= engine.config.hold_head_color_ratio
@@ -174,7 +218,7 @@ def associate_lane(
             # A queued event is not a physical press. Late structural
             # evidence may promote this same head without a second input.
             track.gesture = NoteGesture.HOLD_START
-            track.state = TrackState.HOLD_PENDING
+            track.state = TrackState.TAP_PENDING if track.point_mode else TrackState.HOLD_PENDING
             engine.tap_trace.add('head_promoted_to_hold', time=frame.midpoint,
                                track=track.track_id, event=track.action_event_id)
         if not track.action_executed:
@@ -193,6 +237,11 @@ def associate_lane(
                 track.gesture = flick
             else:
                 track.gesture = NoteGesture.TAP
+        if track.point_mode and not track.flick:
+            track.visual_family = ('bonus' if track.bonus_star else
+                                   'yellow_head' if track.gesture == NoteGesture.HOLD_START else 'ordinary')
+            track.timing_profile = ('yellow_head' if track.gesture == NoteGesture.HOLD_START else
+                                    'bonus' if track.bonus_star else 'ordinary')
 
     for track_id in unmatched_tracks:
         track = engine.tracks[track_id]

@@ -19,7 +19,7 @@ from .holds import HoldTailDetection, _project_to_line, gold_ring_coverage, gold
 @dataclass(frozen=True)
 class _Prediction:
     marker_id: int
-    owner: int
+    owner: int | None
     last: object
     center: tuple[float, float]
     diameter: float
@@ -38,7 +38,7 @@ class _Proposal:
 
 def _prediction(marker, descriptor, frame, config):
     history = list(marker.observations)
-    if (len(history) < 3 or marker.owner is None or descriptor is None
+    if (len(history) < 3 or descriptor is None
             or descriptor.box is None or descriptor.physical_ring is not True
             or descriptor.ring_coverage is None
             or not math.isfinite(descriptor.ring_coverage) or descriptor.ring_coverage < .5):
@@ -219,7 +219,7 @@ def _search(frame, calibration, prediction, global_detections):
 
 def _ordered(first, second):
     a, b = first.prediction, second.prediction
-    if a.owner != b.owner or a.last.frame_sequence != b.last.frame_sequence:
+    if a.last.lane != b.last.lane or a.last.frame_sequence != b.last.frame_sequence:
         return True
     old = a.last.progress-b.last.progress
     new = first.detection.progress-second.detection.progress

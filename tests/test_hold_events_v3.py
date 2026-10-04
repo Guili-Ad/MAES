@@ -107,7 +107,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         add_marker(engine, 7, 5, 2, hit=2.0, now=1.8)
         add_marker(engine, 8, 6, 4, hit=2.02, now=1.8)
         events = engine.release_events(1.8)
-        other.state = TrackState.LOST
+        engine.sustain_tracker.markers.pop(8)
         events = self.refine(engine, events, 1.82)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].owner_id, 5)
@@ -120,24 +120,26 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         self.acknowledge(engine, event, up=None, error='touch up failed')
         self.assertEqual(self.refine(engine, [event], 1.91), [])
         self.assertEqual(engine.release_events(1.91), [])
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def test_mid_checkpoint_completion_does_not_release_owner(self):
         engine, owner = tap_engine()
         add_marker(engine, 7, owner.track_id, 2, hit=2.0, now=1.8, exits=2)
         event = engine.release_events(1.8)[0]
         self.acknowledge(engine, event)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
         self.assertFalse(owner.hold_sustain_final_emitted)
 
-    def test_confirmed_terminal_completion_releases_owner(self):
+    def test_confirmed_terminal_completion_closes_metadata_without_releasing_point(self):
         engine, owner = tap_engine()
         owner.hold_terminal_confirmed = True
         add_marker(engine, 7, owner.track_id, 2, hit=2.0, now=1.8, exits=1)
         event = engine.release_events(1.8)[0]
         self.acknowledge(engine, event)
-        self.assertEqual(owner.state, TrackState.RELEASED)
-        self.assertTrue(owner.hold_sustain_final_emitted)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
+        self.assertFalse(owner.hold_sustain_final_emitted)
+        from agent.music.tap_hold_chain import AnchorState
+        self.assertEqual(engine.tap_hold_chain.anchors[owner.track_id].state, AnchorState.CLOSED)
 
     def test_weak_single_exit_does_not_release_owner(self):
         engine, owner = tap_engine()
@@ -148,7 +150,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         marker.terminal_votes = marker.sustain_votes = 0
         event = engine.release_events(1.8)[0]
         self.acknowledge(engine, event)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def test_later_real_checkpoint_blocks_terminal_owner_retirement(self):
         engine, owner = tap_engine()
@@ -158,7 +160,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         shift_marker(engine, 8, 20)
         event = engine.release_events(1.8)[0]
         self.acknowledge(engine, event)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def test_alias_keeps_event_id_without_replanning_a_marker(self):
         engine, owner = tap_engine()
@@ -180,7 +182,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         event = engine.release_events(1.8)[0]
         self.acknowledge(engine, event, up=None, error='touch up failed')
         engine.release_events(2.2)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def test_pending_marker_blocks_fallback_anchor_retirement(self):
         engine, owner = tap_engine()
@@ -188,7 +190,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         add_marker(engine, 7, owner.track_id, 2, hit=2.0, now=1.8)
         self.assertEqual(len(engine.release_events(1.8)), 1)
         engine.release_events(2.2)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def test_new_segment_new_engine_has_empty_marker_registry(self):
         engine, owner = tap_engine()
@@ -254,7 +256,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         events = engine.release_events(1.8)
         self.acknowledge(engine, events[0])
         self.acknowledge(engine, events[1], up=None, error='touch-up failed')
-        self.assertEqual(owner.state, TrackState.RELEASED)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
         self.assertEqual(other.state, TrackState.HOLDING)
         self.assertEqual(self.refine(engine, events, 1.91), [])
         self.assertEqual(engine.release_events(1.91), [])
@@ -305,7 +307,7 @@ class HoldNoteEventLifecycleTests(unittest.TestCase):
         self.assertEqual(self.refine(engine, [ordinary, event], 1.81)[0], ordinary)
         self.acknowledge(engine, event)
         self.assertEqual(engine.release_events(1.91), [])
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
 
 if __name__ == '__main__':

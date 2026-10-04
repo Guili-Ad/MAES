@@ -2,6 +2,55 @@
 from .models import FLICK_GESTURES, NoteGesture, TrackState
 
 
+def point_clickable(track):
+    """Four visual adapters may yield one click; sustained/flick stays separate."""
+    return (getattr(track, 'point_mode', False)
+            and getattr(track, 'visual_family', '') in {'ordinary', 'bonus', 'yellow_head', 'gold'}
+            and track.gesture in {NoteGesture.TAP, NoteGesture.HOLD_START}
+            and not track.flick
+            and not any(g in FLICK_GESTURES for g in track.direction_evidence))
+
+
+def point_reobservation_ready(track, frame):
+    """A cancelled unknown dropout needs a later positive owned observation.
+
+    Merely passing time, retaining a prediction or seeing an exact old contour
+    again cannot revive a cancelled input. Preserve physical/event identity;
+    only the family adapter's current positive observation clears this gate.
+    """
+    required = getattr(track, 'point_requalification_sequence', None)
+    if required is None:
+        return True
+    if frame is None or not track.observations:
+        return False
+    last = track.observations[-1]
+    if last.frame_sequence <= required or last.frame_sequence != frame.sequence:
+        return False
+    from .tap_physical_identity import contour_evidence
+    if contour_evidence(last.candidate, frame, family=track.visual_family).verdict != 'positive':
+        return False
+    track.point_requalification_sequence = None
+    return True
+
+
+def point_structure_ready(track, frame):
+    """Current family-specific negative evidence revokes a click, unknown does not."""
+    if not point_clickable(track):
+        return True
+    from .head_identity import stationary_from_birth
+    if stationary_from_birth(track):
+        return False
+    if not point_reobservation_ready(track, frame):
+        return False
+    if frame is None or not track.observations:
+        return True
+    last = track.observations[-1]
+    if last.frame_sequence != frame.sequence or last.progress < .45:
+        return True
+    from .tap_physical_identity import contour_evidence
+    return contour_evidence(last.candidate, frame, family=track.visual_family).verdict != 'negative'
+
+
 def ordinary_tap(track):
     return (track.gesture == NoteGesture.TAP and not track.bonus_star
             and not track.hold_evidence_frames
@@ -17,7 +66,7 @@ def discontinuity(track, progress, timestamp):
     also survives. Thresholds are deliberately looser than the 1--2 frame
     dropout budget, but reject Test2's 364--968 ms stationary anchors.
     """
-    if not ordinary_tap(track) or not track.observations:
+    if not (ordinary_tap(track) or point_clickable(track)) or not track.observations:
         return None
     values = [(o.timestamp, o.progress) for o in track.observations]
     values.append((timestamp, progress))
@@ -36,9 +85,17 @@ def coastable_tap(track, config, *, now=None, sequence=None, min_speed=None):
     hold, flick and stationary tracks are not eligible; the speed and span
     gates reject static glyphs and short noise fragments.
     """
-    if track is None or not config.coast_enabled or track.bonus_star:
+    if track is None or not config.coast_enabled:
         return False
-    if track.gesture != NoteGesture.TAP or track.hold_evidence_frames:
+    if point_clickable(track):
+        # Gold keeps its independent physical-ring stability/freshness
+        # contract. Common head coasting never substitutes for that adapter.
+        if track.visual_family == 'gold':
+            return False
+        from .head_identity import stationary_from_birth
+        if stationary_from_birth(track):
+            return False
+    elif track.gesture != NoteGesture.TAP or track.bonus_star or track.hold_evidence_frames:
         return False
     if any(g in FLICK_GESTURES for g in track.direction_evidence):
         return False
@@ -76,7 +133,7 @@ def late_birth_ready(track, project):
     first seen near the line cannot become an urgent tap after a backward
     jitter plus one jump onto a real circle (Test2 replay's duplicate bursts).
     """
-    if not ordinary_tap(track) or not track.observations:
+    if not (ordinary_tap(track) or point_clickable(track)) or not track.observations:
         return True
     observations = list(track.observations)
     if min(o.progress for o in observations) < .50:
@@ -86,6 +143,17 @@ def late_birth_ready(track, project):
         if distinct and o.candidate.box == distinct[-1].candidate.box and o.center == distinct[-1].center:
             continue
         distinct.append(o)
+    if point_clickable(track):
+        # A near-line HUD fragment with two samples cannot bypass normal
+        # four-sample / urgent-three-sample evidence through the coast rescue.
+        # Earlier healthy flights and repeated captures retain their history.
+        if len(distinct) < 3:
+            return False
+        first = distinct[:3]
+        if not all(b.progress-a.progress > .002
+                   and 0 < b.frame_sequence-a.frame_sequence <= 3
+                   for a, b in zip(first, first[1:])):
+            return False
     recent = distinct[-3:]
     # A repeated captured frame is missing evidence, not proof of a fake.
     # Reject observed backward jitter, not an otherwise valid two-point fit.
@@ -106,6 +174,8 @@ def tap_structure_ready(track, frame):
     stale positions and covered white cores remain unknown; they do not revoke
     a healthy coast. Hold/bonus/flick classification keeps its independent path.
     """
+    if point_clickable(track):
+        return point_structure_ready(track, frame)
     if frame is None or not ordinary_tap(track) or not track.observations:
         return True
     last = track.observations[-1]

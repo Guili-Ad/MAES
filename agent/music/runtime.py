@@ -181,6 +181,10 @@ class MusicCancelled(RuntimeError):
     pass
 
 
+class MusicCandidateError(RuntimeError):
+    """Only mask/provider faults; tracking faults retain internal-error handling."""
+
+
 class MusicRuntime:
     def __init__(
         self,
@@ -281,6 +285,8 @@ class MusicRuntime:
                 marker = engine.sustain_tracker.markers.get(marker_id)
             marker_latest = marker.observations[-1] if marker is not None and marker.observations else None
             self.tap_trace.add('input', event=event.event_id, group=event.tap_group_id,
+                               physical_id=event.physical_id, visual_family=event.visual_family,
+                               timing_profile=event.timing_profile,
                                deadline=event.deadline, receipt=asdict(receipt),
                                origin=event.origin, owner=event.owner_id, marker=event.marker_id,
                                raw_hit=(marker.predicted_hit(engine.calibration.trigger_progress) if marker
@@ -291,7 +297,11 @@ class MusicRuntime:
                                latest_box=latest.candidate.box if latest else None,
                                source_capture_started=event.source_capture_started,
                                source_capture_finished=event.source_capture_finished)
-            acknowledge_hold_note_event(engine, event, receipt)
+            if engine is not None and engine.config.hold_notes_as_taps and event.physical_id is not None:
+                from .point_events import point_registry
+                point_registry(engine).acknowledge(engine, event, receipt)
+            else:
+                acknowledge_hold_note_event(engine, event, receipt)
             if engine is not None and engine.tap_hold_chain is not None:
                 engine.tap_hold_chain.acknowledge_head(event, receipt)
             if track is not None and event.gesture == NoteGesture.TAP and receipt.down_call_started is not None:
@@ -401,11 +411,46 @@ class MusicRuntime:
         from .pending_eligibility import valid_pending
         aliases = getattr(engine, 'tap_physical_aliases', {})
         frame = getattr(self, '_dispatch_frame', None) or engine.last_frame
-        pending[:] = [event for event in refine_hold_note_events(engine, pending, now)
-                      if (event.track_id not in aliases and valid_pending(event, engine.tracks, self.config, now, self.tap_trace,
-                                       sequence=engine.last_frame_sequence,
-                                       min_speed=engine.coast_speed_threshold, frame=frame,
-                                       coast_eligible=(lambda t: engine._coast_eligible(t, frame)) if frame else None))]
+        registry = None
+        if engine.config.hold_notes_as_taps:
+            from .point_events import point_registry
+            registry = point_registry(engine)
+        qualified = []
+        for event in refine_hold_note_events(engine, pending, now):
+            if event.track_id in aliases or not valid_pending(event, engine.tracks, self.config, now, self.tap_trace,
+                    sequence=engine.last_frame_sequence, min_speed=engine.coast_speed_threshold, frame=frame,
+                    coast_eligible=(lambda t: engine._coast_eligible(t, frame)) if frame else None):
+                if registry is not None:
+                    registry.cancel(event.event_id, 'dispatch-qualification')
+                continue
+            if registry is not None and event.physical_id is not None:
+                event = registry.revise(event)
+                if event is None:
+                    continue
+            qualified.append(event)
+        pending[:] = qualified
+
+    def _point_wait_needs_refresh(self, pending, engine, deadline, now):
+        """Do not knowingly outwait a point's existing observation budget."""
+        if engine is None or not engine.config.hold_notes_as_taps or deadline <= now:
+            return False
+        for event in pending:
+            if event.deadline > deadline or event.physical_id is None:
+                continue
+            if event.origin == 'hold_note' and engine.tap_hold_chain is not None:
+                marker = engine.sustain_tracker.markers.get(event.marker_id)
+                latest = marker.last_seen_time if marker is not None else None
+                budget = engine.tap_hold_chain.coast_budget
+            else:
+                track = engine.tracks.get(event.track_id)
+                latest = track.observations[-1].timestamp if track is not None and track.observations else None
+                budget = self.config.coast_max_age_ms / 1000.
+            if latest is not None and deadline > latest + budget:
+                self.tap_trace.add('point_refresh_before_wait', time=now, event=event.event_id,
+                    physical_id=event.physical_id, deadline=event.deadline,
+                    latest_visual_time=latest, coast_budget=budget)
+                return True
+        return False
 
     def _flush_due_taps(
         self,
@@ -837,6 +882,8 @@ class MusicRuntime:
             return
         earliest = min(event.deadline for event in near)
         if earliest > now:
+            if self._point_wait_needs_refresh(near, engine, earliest, now):
+                return
             wait_started = self.clock()
             while earliest - self.clock() > 0.008:
                 self._check_cancelled()
@@ -1143,6 +1190,22 @@ class MusicRuntime:
         if self.pending_within(pending, now, self.config.pre_capture_deadline_guard_ms):
             self._execute_due(executor, pending, now, metrics, engine)
 
+    def _observe_frame(self, engine, frame):
+        """One image/one update, reusable before OCR for pending point inputs."""
+        try:
+            started = self.clock()
+            visual = VisualMask.from_image(frame.image, self.calibration)
+            self.metrics.mask.append((self.clock()-started)*1000.)
+            started = self.clock()
+            candidates = self.provider.detect(frame, visual)
+            self.metrics.provider.append((self.clock()-started)*1000.)
+        except Exception as error:
+            raise MusicCandidateError(str(error)) from error
+        started = self.clock()
+        events = engine.update(frame, candidates, visual)
+        self.metrics.tracking.append((self.clock()-started)*1000.)
+        return events
+
     @staticmethod
     def chart_activity_present(
         engine: MusicVisionEngine,
@@ -1266,7 +1329,25 @@ class MusicRuntime:
                 now = self.clock()
                 executor.enforce_contact_limits(self.clock())
                 self._dispatch_frame = frame
-                if engine.tap_hold_chain is not None and any(e.origin == 'hold_note' for e in pending):
+                giant_terminal = (now >= schedule_started + self.config.terminal_initial_delay_ms / 1000.0
+                                  and giant_live_title_present(frame.image))
+                prepared_events = None
+                if self.config.hold_notes_as_taps and not giant_terminal and any(e.physical_id is not None for e in pending):
+                    # Fresh pixels qualify every point family before any old
+                    # prediction can execute. Reuse this update after OCR; no
+                    # second warm-up, second fit or cross-frame visual cache.
+                    try:
+                        prepared_events = self._observe_frame(engine, frame)
+                        provider_failures = 0
+                    except MusicCandidateError as error:
+                        provider_failures += 1
+                        if provider_failures >= self.config.max_provider_failures:
+                            return self._failure(MusicFailureCode.CANDIDATE_FAILURE, f"Candidate Provider failed three times: {error}", task_id)
+                        continue
+                    pending.extend(prepared_events)
+                    pending.extend(engine.release_events(self.clock()))
+                    pending[:] = engine.refine_pending(pending, self.clock())
+                elif engine.tap_hold_chain is not None and any(e.origin == 'hold_note' for e in pending):
                     # A newly acquired image must qualify physical rings before
                     # frozen deadlines execute. Refresh once; engine.update
                     # reuses the same frame watermark rather than warming twice.
@@ -1275,9 +1356,10 @@ class MusicRuntime:
                     self.metrics.identity_refresh.append((self.clock()-identity_started)*1000.)
                 # Service deadlines already predicted by prior frames before any
                 # relatively expensive UI recognition can block the action loop.
-                self._execute_due(executor, pending, now, self.metrics, engine, wait=False)
+                if not (self.config.hold_notes_as_taps and giant_terminal):
+                    self._execute_due(executor, pending, self.clock(), self.metrics, engine, wait=False)
                 now = self.clock()
-                if now >= schedule_started + self.config.terminal_initial_delay_ms / 1000.0 and giant_live_title_present(frame.image):
+                if giant_terminal:
                     LOGGER.info("Music terminal detected by strict giant LIVE visual confirmation")
                     return MusicRunResult(
                         status="succeeded",
@@ -1315,21 +1397,13 @@ class MusicRuntime:
                         provider_failures = 0
                         continue
                 try:
-                    mask_started = self.clock()
-                    visual = VisualMask.from_image(frame.image, self.calibration)
-                    self.metrics.mask.append((self.clock() - mask_started) * 1000.)
-                    provider_started = self.clock()
-                    candidates = self.provider.detect(frame, visual)
-                    self.metrics.provider.append((self.clock() - provider_started) * 1000.0)
+                    new_events = self._observe_frame(engine, frame) if prepared_events is None else prepared_events
                     provider_failures = 0
-                except Exception as error:
+                except MusicCandidateError as error:
                     provider_failures += 1
                     if provider_failures >= self.config.max_provider_failures:
                         return self._failure(MusicFailureCode.CANDIDATE_FAILURE, f"Candidate Provider failed three times: {error}", task_id)
                     continue
-                tracking_started = self.clock()
-                new_events = engine.update(frame, candidates, visual)
-                self.metrics.tracking.append((self.clock() - tracking_started) * 1000.)
                 self.metrics.tracks_created = max(self.metrics.tracks_created, engine.next_track_id - 1)
                 self.metrics.tracks_retained_peak = max(self.metrics.tracks_retained_peak, len(engine.tracks))
                 self.metrics.tracks_expired = engine.expired_track_count
@@ -1338,7 +1412,8 @@ class MusicRuntime:
                 self.metrics.isolated_same_lane_heads = engine.isolated_same_lane_head_count
                 self.metrics.unscheduled_head_losses = engine.unscheduled_head_loss_count
                 self.metrics.events_scheduled += len(new_events)
-                pending.extend(new_events)
+                if prepared_events is None:
+                    pending.extend(new_events)
                 # Candidate, hold-tail and route analysis can consume 10--40 ms.
                 # Reusing the pre-analysis timestamp makes a near event appear
                 # outside its precision window, permits one more screenshot,

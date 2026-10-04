@@ -66,16 +66,17 @@ class TapHoldFoundationTests(unittest.TestCase):
         engine, owner = tap_engine()
         owner.hold_release_time = .1
         engine.release_events(1.)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
-    def test_holding_label_without_input_receipt_cannot_own_gold(self):
+    def test_ghost_holding_label_cannot_veto_independent_gold(self):
         engine = MusicVisionEngine(calibration(), MusicConfig(hold_notes_as_taps=True,
                                    hold_sustain_enabled=False, enable_holds=True))
         ghost = NoteTrack(5, 2, gesture=NoteGesture.HOLD_START,
                           state=TrackState.HOLDING, predicted_hit_time=0.)
         engine.tracks[5] = ghost
         add_marker(engine, 7, 5, 3, hit=2., now=1.8)
-        self.assertEqual(engine.release_events(1.8), [])
+        self.assertEqual(len(engine.release_events(1.8)), 1)
+        self.assertEqual(engine.tap_hold_chain.anchors, {})
 
     def test_tap_mode_never_updates_persistent_cap_fields(self):
         engine, owner = tap_engine()
@@ -163,7 +164,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         feed(engine, 1.3, 3, [gold(.75, topology='unknown', owner_lanes=(), ring=None, physical=None)])
         self.assertEqual(tuple(physical.observations), before)
 
-    def test_explicit_owner_lane_contradiction_does_not_update_known_ring(self):
+    def test_owner_lane_metadata_does_not_veto_positive_ring_motion(self):
         engine, owner = tap_engine()
         for i in range(3):
             feed(engine, 1.+i*.1, i, [gold(.60+i*.05)])
@@ -171,9 +172,9 @@ class TapHoldFoundationTests(unittest.TestCase):
         before = tuple(physical.observations)
         evidence = engine.tap_hold_chain.anchors[owner.track_id].last_evidence
         feed(engine, 1.3, 3, [gold(.75, owner_lanes=(4,))])
-        self.assertEqual(tuple(physical.observations), before)
+        self.assertEqual(len(physical.observations), len(before)+1)
         self.assertEqual(engine.tap_hold_chain.anchors[owner.track_id].last_evidence, evidence)
-        self.assertFalse(engine.tap_hold_chain.eligible(physical, 1.3))
+        self.assertTrue(engine.tap_hold_chain.eligible(physical, 1.3))
 
     def test_checkpoint_empty_connection_is_unknown_preserves_physical_motion_not_owner_proof(self):
         engine, owner = tap_engine()
@@ -271,7 +272,7 @@ class TapHoldFoundationTests(unittest.TestCase):
     def test_dormant_virtual_anchor_does_not_permanently_block_end_ocr(self):
         engine, owner = tap_engine()
         executor = SimpleNamespace(active_contacts={})
-        self.assertTrue(MusicRuntime.chart_activity_present(engine, executor, [], 10))
+        self.assertFalse(MusicRuntime.chart_activity_present(engine, executor, [], 10))
         engine.tap_hold_chain.anchors[owner.track_id].state = AnchorState.QUIESCENT
         self.assertFalse(MusicRuntime.chart_activity_present(engine, executor, [], 10))
         pending = [MusicActionEvent('real-pending', 8, 3, NoteGesture.TAP, 1., (640,620))]
@@ -285,7 +286,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         self.assertFalse(MusicRuntime.chart_activity_present(
             engine, SimpleNamespace(active_contacts={}), [], 10))
 
-    def test_precision_wait_rechecks_visual_qualification_before_actual_down(self):
+    def test_precision_wait_requests_refresh_before_visual_qualification_expires(self):
         from test_round2_runtime import Clock
         engine, owner = tap_engine()
         add_marker(engine, 7, owner.track_id, 2, hit=1.975, now=1.82)
@@ -302,8 +303,12 @@ class TapHoldFoundationTests(unittest.TestCase):
         with patch.object(executor, '_run') as run:
             runtime._execute_due(executor, pending, clock.now, RuntimeMetrics(), engine)
         run.assert_not_called()
-        self.assertFalse(pending)
-        self.assertGreaterEqual(clock.now, event.deadline)
+        self.assertEqual([item.event_id for item in pending], [event.event_id])
+        self.assertLess(clock.now, event.deadline)
+        self.assertFalse(hold_note_registry(engine).states[event.event_id].cancelled)
+        # Deferral is not an age-budget extension. Without positive new pixels,
+        # the exact same event is still ineligible when its old evidence expires.
+        self.assertEqual(refine_hold_note_events(engine, pending, event.deadline), [])
         self.assertTrue(hold_note_registry(engine).states[event.event_id].cancelled)
 
     def test_local_recovery_keeps_physical_event_and_source_without_fabricating_owner_proof(self):
@@ -340,7 +345,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         self.assertEqual(len(marker.observations), 3)
         self.assertEqual(engine.release_events(1.3), [])
 
-    def test_fresh_explicit_contradiction_cannot_be_bypassed_by_local_recovery(self):
+    def test_positive_global_ring_does_not_need_local_recovery_despite_owner_metadata(self):
         engine, _ = tap_engine()
         for i in range(3):
             feed(engine, 1.+i*.1, i, [gold(.60+i*.05)])
@@ -348,8 +353,8 @@ class TapHoldFoundationTests(unittest.TestCase):
         with patch('agent.music.gold_recovery.recover_gold_markers') as recover:
             feed(engine, 1.3, 3, [gold(.75, owner_lanes=(4,))])
         recover.assert_not_called()
-        self.assertEqual(len(marker.observations), 3)
-        self.assertFalse(engine.tap_hold_chain.eligible(marker, 1.3))
+        self.assertEqual(len(marker.observations), 4)
+        self.assertTrue(engine.tap_hold_chain.eligible(marker, 1.3))
 
     def test_positive_second_frame_reappearance_can_recover_after_coast_jitter(self):
         engine, owner = tap_engine()
@@ -396,7 +401,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         events = engine.release_events(1.4)
         self.assertEqual({e.owner_id for e in events}, {new.track_id})
 
-    def test_new_head_epoch_revokes_old_known_marker_claim_without_reassigning_history(self):
+    def test_new_head_changes_owner_metadata_not_physical_ring_qualification(self):
         engine, old = tap_engine()
         for i in range(3):
             feed(engine, .8+i*.1, i, [gold(.60+i*.05)])
@@ -405,8 +410,8 @@ class TapHoldFoundationTests(unittest.TestCase):
         engine.tracks[6] = new
         register_head(engine, new, now=1.05)
         feed(engine, 1.1, 3, [gold(.75)])
-        self.assertFalse(engine.tap_hold_chain.eligible(physical, 1.1))
-        self.assertEqual(physical.owner, old.track_id)
+        self.assertTrue(engine.tap_hold_chain.eligible(physical, 1.1))
+        self.assertEqual(physical.owner, new.track_id)
 
     def test_route_exit_does_not_steal_another_anchor_connection_epoch(self):
         engine, old = tap_engine()
@@ -470,7 +475,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         self.assertEqual(chain.anchors[6].connection_epoch, 1)
         self.assertEqual(chain.anchors[6].connection_lane, 3)
         self.assertTrue(chain.current_connection(chain.anchors[6]))
-        self.assertEqual(engine.tracks[6].state, TrackState.HOLDING)
+        self.assertEqual(engine.tracks[6].state, TrackState.HOLD_PENDING)
 
     def test_head_requires_successful_down_and_up_receipt_not_compatibility_label(self):
         for down, up, error in ((None, .1, ''), (.05, None, ''), (.05, .1, 'input-failed')):
@@ -499,7 +504,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         engine.release_events(18.)
         anchor = engine.tap_hold_chain.anchors[owner.track_id]
         self.assertEqual(anchor.state, AnchorState.ACTIVE)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
         self.assertAlmostEqual(anchor.last_evidence, 18.)
         self.assertEqual(owner.hold_release_time, .1)
         self.assertFalse(owner.hold_sustain_final_emitted)
@@ -510,7 +515,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         event = engine.release_events(1.8)[0]
         self.assertFalse(event.marker_terminal)
         self.assertTrue(marker_event(engine, event))
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
         self.assertIsNone(engine.tap_hold_chain.anchors[owner.track_id].terminal_completed)
 
     def test_two_confirmed_terminal_votes_close_only_after_successful_input(self):
@@ -518,10 +523,10 @@ class TapHoldFoundationTests(unittest.TestCase):
         add_marker(engine, 7, owner.track_id, 2, hit=2., now=1.8, exits=1)
         event = engine.release_events(1.8)[0]
         self.assertTrue(event.marker_terminal)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
         self.assertTrue(marker_event(engine, event))
         self.assertEqual(engine.tap_hold_chain.anchors[owner.track_id].state, AnchorState.CLOSED)
-        self.assertEqual(owner.state, TrackState.RELEASED)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def test_checkpoint_history_is_not_overwritten_by_two_terminal_flash_votes(self):
         engine, _ = tap_engine()
@@ -537,7 +542,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         add_marker(engine, 8, owner.track_id, 2, hit=2.4, now=1.8, exits=2)
         event = next(e for e in engine.release_events(1.8) if e.marker_id == 7)
         marker_event(engine, event)
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
         self.assertNotEqual(engine.tap_hold_chain.anchors[owner.track_id].state, AnchorState.CLOSED)
 
     def test_stale_phantom_future_circle_does_not_block_true_terminal_close(self):
@@ -546,7 +551,7 @@ class TapHoldFoundationTests(unittest.TestCase):
         add_marker(engine, 7, owner.track_id, 2, hit=2., now=1.8, exits=1)
         event = next(e for e in engine.release_events(1.8) if e.marker_id == 7)
         marker_event(engine, event)
-        self.assertEqual(owner.state, TrackState.RELEASED)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def bind_one_flick(self):
         engine, owner = tap_engine()
@@ -566,12 +571,12 @@ class TapHoldFoundationTests(unittest.TestCase):
         engine, owner, event = self.bind_one_flick()
         engine.tap_hold_chain.completed_flick(event, success_receipt(1.1), hold_note_registry(engine))
         self.assertEqual(engine.tap_hold_chain.anchors[owner.track_id].state, AnchorState.CLOSED)
-        self.assertEqual(owner.state, TrackState.RELEASED)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
 
     def test_bound_flick_failure_does_not_close_or_fake_completion(self):
         engine, owner, event = self.bind_one_flick()
         engine.tap_hold_chain.completed_flick(event, success_receipt(1.1, error='swipe-failed'), hold_note_registry(engine))
-        self.assertEqual(owner.state, TrackState.HOLDING)
+        self.assertEqual(owner.state, TrackState.TAP_PENDING)
         self.assertIsNone(engine.tap_hold_chain.anchors[owner.track_id].terminal_completed)
 
     def test_dual_tail_identity_survives_candidate_order_and_owners_never_cross(self):
@@ -593,8 +598,8 @@ class TapHoldFoundationTests(unittest.TestCase):
         self.assertEqual(events[0].deadline, events[1].deadline)
         for event in events:
             marker_event(engine, event, start=1.3)
-        self.assertEqual(left.state, TrackState.RELEASED)
-        self.assertEqual(right.state, TrackState.RELEASED)
+        self.assertEqual(left.state, TrackState.TAP_PENDING)
+        self.assertEqual(right.state, TrackState.TAP_PENDING)
 
     def test_dual_tail_partial_input_failure_closes_only_completed_owner(self):
         engine, left = tap_engine()
@@ -607,8 +612,8 @@ class TapHoldFoundationTests(unittest.TestCase):
         marker_event(engine, left_event)
         acknowledge_hold_note_event(engine, right_event, SimpleNamespace(
             down_call_started=1.9, down_call_finished=1.901, up_call_finished=None, error='right-up-failed'))
-        self.assertEqual(left.state, TrackState.RELEASED)
-        self.assertEqual(right.state, TrackState.HOLDING)
+        self.assertEqual(left.state, TrackState.TAP_PENDING)
+        self.assertEqual(right.state, TrackState.TAP_PENDING)
         self.assertEqual(engine.tap_hold_chain.anchors[left.track_id].state, AnchorState.CLOSED)
         self.assertIsNone(engine.tap_hold_chain.anchors[right.track_id].terminal_completed)
         engine.sustain_tracker.observe(8, gold(.97, 4, topology='terminal'), make_frame(2., 7), owner=right.track_id)

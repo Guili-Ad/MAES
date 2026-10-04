@@ -16,7 +16,9 @@ class TapChord:
 
 def valid_tap_pair(left, right, sequence: int) -> bool:
     return bool(left is not None and right is not None
-                and left.gesture == right.gesture == NoteGesture.TAP
+                and (left.gesture == right.gesture == NoteGesture.TAP
+                     or (left.point_mode and right.point_mode
+                         and left.gesture == right.gesture == NoteGesture.HOLD_START))
                 and left.lane != right.lane
                 and left.linked_partner_id == right.track_id
                 and right.linked_partner_id == left.track_id
@@ -61,7 +63,7 @@ class TapChordManager:
                                    reason='incoherent-predictions',
                                    raw_hits=[left.predicted_hit_time, right.predicted_hit_time])
                 continue
-            advance = self.policy.config.tap_action_advance_ms / 1000.0
+            advance = self.policy.action_advance_ms(left) / 1000.0
             max_skew = self.policy.config.tap_chord_max_skew_ms / 1000.0
             if max_skew > 0 and abs(left.predicted_hit_time - right.predicted_hit_time) > max_skew:
                 # Sharing one deadline would fire one side tens of ms off its
@@ -87,7 +89,7 @@ class TapChordManager:
             for member in member_events:
                 grouped[member.event_id] = replace(member, deadline=group.deadline,
                                                    tap_group_id=gid, tap_frozen=group.frozen,
-                                                   tap_reference_hit_time=group.deadline + self.policy.config.tap_action_advance_ms / 1000.)
+                                                   tap_reference_hit_time=group.deadline + advance)
             if old != (group.deadline, group.frozen) or any(e.tap_group_id != gid for e in member_events):
                 self.trace.add('chord', time=now, group=gid, members=members,
                                deadline=group.deadline, frozen=group.frozen)

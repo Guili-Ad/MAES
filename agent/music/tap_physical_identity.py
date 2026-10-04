@@ -33,6 +33,9 @@ _evidence_cache = {}
 
 
 def _ordinary(track):
+    from .tap_identity import point_clickable
+    if point_clickable(track):
+        return track.visual_family != 'gold'
     return (track.gesture == NoteGesture.TAP and not track.bonus_star
             and not track.flick and not track.hold_evidence_frames
             and not any(g in FLICK_GESTURES for g in track.direction_evidence))
@@ -55,21 +58,77 @@ def _disc_metrics(teal, white, cx, cy, rx, ry):
     return float(white[core].mean()), float(teal[disc].mean())
 
 
-def contour_evidence(candidate, frame):
+def contour_evidence(candidate, frame, *, family='ordinary'):
     global _evidence_frame, _evidence_cache
     if _evidence_frame is not frame:
         _evidence_frame, _evidence_cache = frame, {}
-    key = (candidate.box, candidate.center, candidate.variant)
+    key = (candidate.box, candidate.center, candidate.variant, family)
     evidence = _evidence_cache.get(key)
     if evidence is None:
-        evidence = _inspect_contour(candidate, frame)
+        evidence = (_inspect_contour(candidate, frame) if family == 'ordinary'
+                    else _inspect_family_contour(candidate, frame, family))
         if len(_evidence_cache) < 96:
             _evidence_cache[key] = evidence
             if evidence.verdict == 'positive' and evidence.candidate is not None:
                 normalized = evidence.candidate
-                normalized_key = (normalized.box, normalized.center, normalized.variant)
+                normalized_key = (normalized.box, normalized.center, normalized.variant, family)
                 _evidence_cache[normalized_key] = TapContourEvidence('positive', normalized, evidence.reason)
     return evidence
+
+
+def _inspect_family_contour(candidate, frame, family):
+    """Use the accepted adapter's own pixels, not an ordinary teal disguise.
+
+    This bounded qualification is not a new detector. An obscured core/ring is
+    unknown; only an isolated observed colour stroke is negative. Gold's full
+    ring detector remains the dedicated marker channel's source of truth.
+    """
+    x, y, w, h = candidate.box
+    image = frame.image
+    if (min(w, h) < 8 or max(w, h) > 192
+            or not isinstance(image, np.ndarray) or image.ndim != 3
+            or image.shape[2] < 3 or x < 0 or y < 0
+            or x+w > image.shape[1] or y+h > image.shape[0]
+            or family not in {'bonus', 'yellow_head', 'gold'}
+            or candidate.variant == 'flick'):
+        return TapContourEvidence('unknown', reason='family-pixels-unavailable')
+    if family == 'gold':
+        from .holds import gold_ring_shape
+        if gold_ring_shape(image, candidate.box):
+            return TapContourEvidence('positive', candidate, 'gold-physical-ring')
+        return TapContourEvidence('unknown', reason='gold-ring-covered-or-unproven')
+    patch = image[y:y+h, x:x+w, :3]
+    b, g, r = (patch[..., i].astype(np.int16) for i in range(3))
+    if family == 'bonus':
+        color = ((g >= 105) & (r >= 15) & (r <= g-12)
+                 & (b <= g-12) & (b <= r-15))
+    else:
+        # Same orange colour classifier as the accepted yellow-head adapter.
+        from .vision import build_color_mask
+        color = build_color_mask(patch, [[5, 70, 130]], [[32, 255, 255]])
+    if not color.any():
+        return TapContourEvidence('unknown', reason=f'{family}-colour-unavailable')
+    minimum, maximum = patch.min(axis=2), patch.max(axis=2)
+    white = (minimum >= 185) & (maximum-minimum <= 55)
+    if .80 <= w/h <= 1.25:
+        yy, xx = np.ogrid[:h, :w]
+        distance = ((xx-(w-1)/2)/(w/2))**2+((yy-(h-1)/2)/(h/2))**2
+        disc = (distance > .35**2) & (distance < .72**2)
+        central = distance < .60**2
+        if (disc.any() and central.any() and color[disc].mean() >= .55
+                and white[central].mean() >= .04):
+            return TapContourEvidence('positive', candidate, f'{family}-disc-with-white-structure')
+    rows, cols = np.nonzero(color)
+    extent_x, extent_y = int(cols.max()-cols.min()+1), int(rows.max()-rows.min()+1)
+    if (min(extent_x, extent_y) <= max(extent_x, extent_y)*.24
+            and max(extent_x, extent_y) >= min(w, h)*.65
+            and int(color.sum()) >= max(12, min(w, h))):
+        return TapContourEvidence('negative', reason=f'{family}-isolated-narrow-hud-stroke')
+    return TapContourEvidence('unknown', reason=f'{family}-partly-occluded-contour')
+
+
+def _family(track):
+    return track.visual_family if getattr(track, 'point_mode', False) else 'ordinary'
 
 
 def _inspect_contour(candidate, frame):
@@ -246,7 +305,7 @@ def _bridge_evidence(old, new, frame, new_contour):
     # Same currently observed physical circle is pixel proof, provided these
     # identities have never been simultaneously observed as separated heads.
     if last_old.frame_sequence == frame.sequence:
-        old_contour = contour_evidence(last_old.candidate, frame)
+        old_contour = contour_evidence(last_old.candidate, frame, family=_family(old))
         if old_contour.verdict != 'positive':
             return None
         extent = min(*old_contour.candidate.box[2:], *new_contour.candidate.box[2:])
@@ -299,7 +358,7 @@ def reconcile_tap_identities(tracks, frame, config, trace):
                 and t.linked_partner_id is None and _moving(list(t.observations))]
     current = [t for t in eligible if t.observations[-1].frame_sequence == frame.sequence
                and t.tap_input_started is None and t.tap_input_completed is None]
-    contours = {t.track_id: contour_evidence(t.observations[-1].candidate, frame) for t in current}
+    contours = {t.track_id: contour_evidence(t.observations[-1].candidate, frame, family=_family(t)) for t in current}
     pairs = []
     for new in current:
         if contours[new.track_id].verdict != 'positive':

@@ -64,6 +64,8 @@ def bonus_hold_ribbon_present(
     image: object,
     candidate: MusicCandidate,
     tangent: tuple[float, float],
+    *,
+    evidence: dict | None = None,
 ) -> bool:
     """Confirm the bright ribbon immediately upstream of a bonus-star head.
 
@@ -72,6 +74,12 @@ def bonus_hold_ribbon_present(
     star taps expose only the stage.  Comparing the local ribbon strip with two
     side strips rejects pale backgrounds and the white judgement arc.
     """
+    # Optional point-mode metadata is stricter than the historical return.
+    # Callers that classify/tune clicks continue to consume the exact old bool.
+    # Reuse the existing near/far masks below instead of rescanning the image.
+    if evidence is not None:
+        evidence.clear()
+        evidence['strict_bilateral'] = False
     if np is None:
         raise RuntimeError("NumPy is required by the hold tracker")
     array = np.asarray(image)
@@ -146,6 +154,22 @@ def bonus_hold_ribbon_present(
             and outer_contrast >= 0.16
             and (inner_contrast >= 0.18 or outer_contrast >= 0.35)
         ):
+            if evidence is not None:
+                signed_across = -relative_x * tangent_y + relative_y * tangent_x
+                bilateral = True
+                # Averaging left/right sides lets a bright stage wall on one
+                # side and blue stage on the other masquerade as a ribbon.
+                # Both edges must separately contrast with the near/far body.
+                for region, body_ratio, contrast in (
+                    (inner_sides, inner_ratio, .18),
+                    (outer_sides, outer_ratio, .16),
+                ):
+                    for sign in (-1, 1):
+                        side = region & (signed_across * sign > 0)
+                        if (int(side.sum()) < 10
+                                or body_ratio - float(strict_neutral[side].mean()) < contrast):
+                            bilateral = False
+                evidence['strict_bilateral'] = bilateral
             return True
 
     # Preserve the original high-confidence straight neutral-ribbon path.  It

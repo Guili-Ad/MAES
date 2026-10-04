@@ -95,7 +95,11 @@ def associate_taps(tracks, entries, frame, config, safe_candidate, trace, owned=
     by_candidate = {}
     by_track = {}
     lookup = {t.track_id: t for t in tracks}
-    owned = owned or {}
+    # A recovery hint is not a zero-cost exemption from physical continuity.
+    # Reject the stale identity only; its moving candidate remains a legal birth.
+    owned = {index: tid for index, tid in (owned or {}).items()
+             if tid in lookup and (not lookup[tid].point_mode
+                 or identity_continuity_allowed(lookup[tid], *entries[index], frame))}
     reserved = set(owned.values())
     safe = {i: safe_candidate(*entry) for i, entry in enumerate(entries)}
     rejected = set()

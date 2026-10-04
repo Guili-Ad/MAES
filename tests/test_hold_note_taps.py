@@ -55,7 +55,8 @@ def calibration() -> MusicCalibrationData:
 def detection(progress: float, lane: int, exits: int = 2, topology: str | None = None) -> HoldTailDetection:
     topology = topology or ('terminal' if exits == 1 else 'checkpoint')
     return HoldTailDetection(progress, 0.8, 100, lane,
-        (float(calibration().points[lane][0]), 140.+480.*progress), 0.0, exits, topology, None)
+        (float(calibration().points[lane][0]), 140.+480.*progress), 0.0, exits, topology, None,
+        physical_ring=True)
 
 
 def make_frame(moment: float, sequence: int) -> MusicFrame:
@@ -74,7 +75,10 @@ def tap_engine(**kwargs) -> tuple[MusicVisionEngine, NoteTrack]:
     engine = MusicVisionEngine(calibration(), config)
     track = NoteTrack(track_id=5, lane=2)
     track.gesture = NoteGesture.HOLD_START
-    track.state = TrackState.HOLDING
+    track.state = TrackState.TAP_PENDING
+    track.point_mode = True
+    track.visual_family = 'yellow_head'
+    track.timing_profile = 'yellow_head'
     track.predicted_hit_time = 0.0
     engine.tracks[track.track_id] = track
     register_head(engine, track)
@@ -83,8 +87,12 @@ def tap_engine(**kwargs) -> tuple[MusicVisionEngine, NoteTrack]:
 
 def register_head(engine, track, now=0.):
     """Fixtures must acknowledge actual head input, not inject HOLDING."""
+    track.point_mode = True
+    track.visual_family = 'yellow_head'
+    track.timing_profile = 'yellow_head'
     event = MusicActionEvent(f'fixture-head-{track.track_id}', track.track_id, track.lane,
-                            NoteGesture.HOLD_START, now, tuple(engine.calibration.points[track.lane]))
+                            NoteGesture.TAP, now, tuple(engine.calibration.points[track.lane]),
+                            visual_family='yellow_head', timing_profile='yellow_head')
     engine.tap_hold_chain.acknowledge_head(event, SimpleNamespace(
         down_call_started=now, down_call_finished=now+.001,
         up_call_finished=now+.002, error=''))
@@ -92,7 +100,7 @@ def register_head(engine, track, now=0.):
 
 def linked_owner(engine, owner):
     other = NoteTrack(6, 4, gesture=NoteGesture.HOLD_START,
-                      state=TrackState.HOLDING, predicted_hit_time=0.)
+                      state=TrackState.TAP_PENDING, predicted_hit_time=0.)
     owner.linked_partner_id, other.linked_partner_id = 6, owner.track_id
     engine.tracks[6] = other
     register_head(engine, other)
@@ -137,7 +145,8 @@ class HoldNoteTapTests(unittest.TestCase):
         self.assertAlmostEqual(event.deadline, 2.0 - engine.config.tap_action_advance_ms / 1000.0)
         self.assertAlmostEqual(event.tap_reference_hit_time, 2.0)
         self.assertIsNone(event.tap_group_id)
-        self.assertIn(7, track.hold_sustain_planned_ids)
+        self.assertEqual(event.visual_family, 'gold_ring')
+        self.assertIsNotNone(event.physical_id)
 
     def test_simultaneous_markers_form_one_chord_group(self) -> None:
         engine, track = tap_engine()
@@ -161,8 +170,9 @@ class HoldNoteTapTests(unittest.TestCase):
             engine.sustain_tracker.markers[7].observations, maxlen=12)
         events = engine.release_events(1.8)
         self.assertEqual(len(events), 1)
-        self.assertIn(7, track.hold_sustain_planned_ids)
-        self.assertIn(8, track.hold_sustain_planned_ids)
+        from agent.music.point_events import point_registry
+        self.assertIs(point_registry(engine).state_for('gold', 7),
+                      point_registry(engine).state_for('gold', 8))
 
     def test_marker_never_emits_sustain_events(self) -> None:
         engine, track = tap_engine()
@@ -180,7 +190,7 @@ class HoldNoteTapTests(unittest.TestCase):
         events = engine.release_events(1.0)
         self.assertEqual(events, [])
         self.assertFalse(track.hold_sustain_final_emitted)
-        self.assertEqual(track.state, TrackState.HOLDING)
+        self.assertEqual(track.state, TrackState.TAP_PENDING)
 
     def test_flick_binding_disabled_in_tap_mode(self) -> None:
         engine, track = tap_engine()
