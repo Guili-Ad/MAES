@@ -103,9 +103,10 @@ def bonus_hold_ribbon_present(
     if x1 <= x0 or y1 <= y0:
         return False
     crop = array[y0:y1, x0:x1, :3].astype(np.int16)
-    minimum = crop.min(axis=2)
-    maximum = crop.max(axis=2)
-    rows, columns = np.indices(crop.shape[:2])
+    b, g, r = (crop[..., channel] for channel in range(3))
+    minimum = np.minimum(np.minimum(b, g), r)
+    maximum = np.maximum(np.maximum(b, g), r)
+    rows, columns = np.ogrid[:crop.shape[0], :crop.shape[1]]
     relative_x = columns + x0 - center_x
     relative_y = rows + y0 - center_y
     tangent_x, tangent_y = tangent
