@@ -202,6 +202,8 @@ class GoldMarkerTracker(SustainMarkerTracker):
                 last = m.observations[-1]
                 if d.center == last.center and abs(d.progress-last.progress) <= 1e-6:
                     if (mid not in self.moving_origins and len(m.observations) <= 2 and
+                            max(o.progress for o in m.observations)
+                                - min(o.progress for o in m.observations) <= .005 and
                             frame.midpoint-m.observations[0].timestamp >= .085):
                         self.stationary_origins.add(mid)
                     continue  # repeated pixels are not another velocity sample

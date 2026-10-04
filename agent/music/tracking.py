@@ -1685,7 +1685,7 @@ class MusicVisionEngine:
             from .point_events import point_registry
             registry = point_registry(self)
             for shadow, canonical in aliases.items():
-                registry.alias('track', shadow, 'track', canonical)
+                registry.bind_track_source(shadow, canonical, frame.midpoint)
         for owner_id in set(aliases.values()):
             self._update_motion(self.tracks[owner_id])
         self._update_linked_tap_pairs(frame)
@@ -1805,6 +1805,7 @@ class MusicVisionEngine:
                     track.action_executed = True
                     continue
                 track.action_event_id = adopted.event_id
+                event_id = adopted.event_id
                 events.append(adopted)
             if linked_note and partner is not None and track.track_id < partner.track_id:
                 LOGGER.info(

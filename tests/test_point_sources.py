@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.music.models import MusicActionEvent, MusicCandidate, MusicConfig, NoteGesture, NoteTrack, TrackObservation
+from agent.music.models import MusicActionEvent, MusicCandidate, MusicConfig, NoteGesture, NoteTrack, TrackObservation, TrackState
 from agent.music.tracking import MusicVisionEngine
 from agent.music.point_sources import reconcile_point_sources
 from agent.music.point_events import point_registry
@@ -132,6 +132,72 @@ class PointSourceTests(unittest.TestCase):
         engine, _, _, frame = self.setup()
         self.assertEqual(reconcile_point_sources(engine, frame), {9})
         self.assertEqual(reconcile_point_sources(engine, make_frame(1.3, 3)), {9})
+
+    def assert_head_retires_after_input(self, engine, track, state):
+        from agent.music.association import associate_lane
+        from agent.music.vision import VisualMask
+        self.assertEqual(track.tap_input_started, state.started)
+        self.assertEqual(track.tap_input_completed, state.completed)
+        self.assertEqual(track.action_event_id, state.event.event_id)
+        self.assertTrue(track.action_executed)
+        frame = make_frame(track.tap_executed_hit_time+.121, 20)
+        associate_lane(engine, track.lane, [], frame,
+                       VisualMask.from_image(frame.image, engine.calibration))
+        self.assertEqual(track.state, TrackState.RELEASED)
+
+    def test_unqueued_head_inherits_gold_down_and_retires(self):
+        engine, track, marker, frame = self.setup()
+        reconcile_point_sources(engine, frame)
+        event = engine.release_events(frame.midpoint)[0]
+        registry = point_registry(engine)
+        registry.acknowledge(engine, event, success_receipt(1.275))
+        state = registry.state_for('gold', marker.marker_id)
+        self.assert_head_retires_after_input(engine, track, state)
+
+    def test_queued_head_converted_to_gold_inherits_ack_and_retires(self):
+        engine, track, marker, frame = self.setup()
+        first = self.head_event(engine, track)
+        track.state, track.action_executed = TrackState.TAP_PENDING, True
+        reconcile_point_sources(engine, frame)
+        registry = point_registry(engine)
+        event = registry.canonical_event(first)
+        self.assertLess(event.track_id, 0)
+        registry.acknowledge(engine, event, success_receipt(1.275))
+        state = registry.state_for('gold', marker.marker_id)
+        sent_event = state.event
+        self.assert_head_retires_after_input(engine, track, state)
+        self.assertEqual(state.event, sent_event)
+
+    def test_gold_down_before_late_proved_head_bind_inherits_ack_without_resend(self):
+        engine, track, marker, frame = self.setup()
+        event = engine.release_events(frame.midpoint)[0]
+        registry = point_registry(engine)
+        registry.acknowledge(engine, event, success_receipt(1.275))
+        sent_event = registry.states[event.event_id].event
+        self.assertIsNone(track.tap_input_started)
+        reconcile_point_sources(engine, frame)
+        self.assertEqual(engine.release_events(frame.midpoint), [])
+        self.assertIsNone(self.head_event(engine, track))
+        self.assertEqual(registry.states[event.event_id].event, sent_event)
+        self.assert_head_retires_after_input(engine, track,
+                                            registry.state_for('gold', marker.marker_id))
+
+    def test_distinct_actual_down_conflict_does_not_transfer_head_receipt(self):
+        engine, track, marker, frame = self.setup()
+        first = self.head_event(engine, track)
+        later_gold = engine.release_events(frame.midpoint)[0]
+        registry = point_registry(engine)
+        registry.acknowledge(engine, first, success_receipt(1.1))
+        registry.acknowledge(engine, later_gold, success_receipt(1.2))
+        original_head = registry.states[first.event_id].event
+        original_gold = registry.states[later_gold.event_id].event
+        registry.bind_gold_source(track.track_id, marker.marker_id, frame.midpoint)
+        self.assertNotEqual(registry.source_ids[('track', track.track_id)],
+                            registry.source_ids[('gold', marker.marker_id)])
+        self.assertEqual(track.tap_input_started, 1.1)
+        self.assertNotIn(track.track_id, registry.gold_shadows)
+        self.assertEqual(registry.states[first.event_id].event, original_head)
+        self.assertEqual(registry.states[later_gold.event_id].event, original_gold)
 
 
 if __name__ == '__main__':

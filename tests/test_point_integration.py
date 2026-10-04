@@ -127,6 +127,22 @@ class PointIntegrationTests(unittest.TestCase):
         self.assertEqual(records[0]['family'], 'yellow_head')
         self.assertNotIn('event', records[0])
 
+    def test_two_moving_gold_samples_are_not_static_after_screenshot_freeze(self):
+        from test_tap_hold_chain_v4 import feed, gold
+        engine, _ = self.head_engine()
+        feed(engine, 1., 0, [gold(.70, owner_lanes=())])
+        feed(engine, 1.1, 1, [gold(.75, owner_lanes=())])
+        tracker = engine.tap_hold_chain.tracker
+        marker_id = next(iter(tracker.markers))
+        feed(engine, 1.2, 2, [gold(.75, owner_lanes=())])
+        self.assertNotIn(marker_id, tracker.stationary_origins)
+        self.assertEqual(engine.release_events(1.2), [])
+        feed(engine, 1.3, 3, [gold(.85, owner_lanes=())])
+        self.assertEqual(set(tracker.markers), {marker_id})
+        events = engine.release_events(1.3)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].marker_id, marker_id)
+
 
 if __name__ == '__main__':
     unittest.main()

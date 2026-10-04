@@ -7,11 +7,12 @@ rings do not need a ribbon owner in order to become executable points.
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 
 from .hold_note_events import (
     HoldNoteEventRegistry, HoldNoteEventState, _finite_prediction, _same_pixels,
 )
-from .models import MusicActionEvent, NoteGesture
+from .models import MusicActionEvent, NoteGesture, TrackState
 
 PointEventState = HoldNoteEventState
 
@@ -95,7 +96,10 @@ class PointEventRegistry(HoldNoteEventRegistry):
             return event
         if state.cancelled or state.started is not None:
             return None
-        return state.event if state.event.origin != event.origin else event
+        # An alias can move visual authority within the same adapter as well
+        # as from head to gold. A queued old track representation must never
+        # cancel the retained event after its authority has moved elsewhere.
+        return state.event
 
     def cancel(self, event_id, reason=''):
         state = self.states.get(event_id)
@@ -138,6 +142,107 @@ class PointEventRegistry(HoldNoteEventRegistry):
             previous=loser, event=kept.event.event_id if kept else None)
         return winner
 
+    def _inherit_input_facts(self, state):
+        """Retire proved head adapters when their shared physical point fires.
+
+        The source map is the alias proof. A sent event or receipt is never
+        rewritten, and an unrelated already-started track is not overwritten.
+        This also applies when a head source is proved only after gold Down.
+        """
+        if state.started is None or state.event.physical_id is None:
+            return
+        event = state.event
+        for (source, key), physical in self.source_ids.items():
+            if source != 'track' or physical != event.physical_id:
+                continue
+            track = self.engine.tracks.get(key)
+            if (track is None or not track.point_mode
+                    or track.gesture not in {NoteGesture.TAP, NoteGesture.HOLD_START}):
+                continue
+            if track.tap_input_started is not None and track.tap_input_started != state.started:
+                self.engine.tap_trace.add('point_input_inheritance_conflict',
+                    physical_id=physical, event=event.event_id, track=key,
+                    stored_started=track.tap_input_started, inherited_started=state.started)
+                continue
+            track.physical_id = physical
+            track.tap_input_started = state.started
+            track.tap_input_completed = state.completed
+            track.action_event_id = event.event_id
+            track.tap_executed_hit_time = event.tap_reference_hit_time
+            if track.tap_executed_hit_time is None:
+                advance = (self.engine.config.tap_action_advance_ms
+                    if event.origin == 'hold_note' else
+                    self.engine.tap_policy.action_advance_ms(track))
+                track.tap_executed_hit_time = event.deadline+advance/1000.
+            track.action_executed = True
+            if track.state not in {TrackState.RELEASED, TrackState.LOST}:
+                track.state = TrackState.TAP_PENDING
+
+    def bind_track_source(self, shadow, canonical, now):
+        """Carry a proved head alias to its canonical visual adapter.
+
+        Identity is the first event (or actual Down fact), whereas the visual
+        owner is the track retained by association. These need not be the
+        same track. Sent facts never change; an unsent event can change only
+        its visual metadata and an unfrozen prediction.
+        """
+        physical = self.alias('track', shadow, 'track', canonical)
+        canonical_physical = self.source_ids[('track', canonical)]
+        if physical != canonical_physical:
+            # Both identities already attempted Down. alias() reports the
+            # conflict but intentionally retains both maps and input facts.
+            return canonical_physical
+        track = self.engine.tracks.get(canonical)
+        if track is None:
+            return physical
+        track.physical_id = physical
+        shadow_track = self.engine.tracks.get(shadow)
+        if shadow_track is not None:
+            shadow_track.physical_id = physical
+        state = self.state_for('track', canonical)
+        if state is None:
+            return physical
+        old = state.event
+        track.action_event_id = old.event_id
+        if state.started is not None:
+            # The canonical adapter must inherit the tombstone too, otherwise
+            # it can remain a live pending head and absorb the next note.
+            self._inherit_input_facts(state)
+            return physical
+        if old.origin == 'hold_note':
+            # A same-adapter head alias cannot take authority back from a
+            # dedicated gold source that already proved the shared contour.
+            self.gold_shadows[canonical] = old.marker_id
+            return physical
+        latest = track.observations[-1] if track.observations else None
+        frame = self.engine.last_frame
+        source_frame = (frame if frame is not None and latest is not None
+                        and latest.frame_sequence == frame.sequence else None)
+        hit = self.engine.tap_policy.hit_time(track)
+        finite_hit = hit is not None and math.isfinite(hit)
+        frozen = not state.cancelled and (old.tap_frozen or old.deadline <= now+.02)
+        deadline = old.deadline
+        if not frozen and finite_hit:
+            deadline = hit-self.engine.tap_policy.action_advance_ms(track)/1000.
+        state.event = replace(old, track_id=canonical, lane=track.lane,
+            coordinate=self.engine._lane_point(track.lane), deadline=deadline,
+            visual_family=track.visual_family or old.visual_family,
+            timing_profile=track.timing_profile or old.timing_profile,
+            tap_reference_hit_time=(hit if not frozen and finite_hit
+                                    else old.tap_reference_hit_time),
+            tap_frozen=frozen, tap_group_id=None,
+            source_capture_started=source_frame.capture_started if source_frame else None,
+            source_capture_finished=source_frame.capture_finished if source_frame else None)
+        if not state.cancelled:
+            track.action_executed = True
+            if track.state not in {TrackState.RELEASED, TrackState.LOST}:
+                track.state = TrackState.TAP_PENDING
+        self.engine.tap_trace.add('point_source_authority', time=now,
+            event=old.event_id, physical_id=physical, previous_source='track',
+            source='track', previous_track=old.track_id, track=canonical,
+            before=old.deadline, deadline=deadline, frozen=frozen)
+        return physical
+
     def _canonicalize(self, engine, now):
         resolver = engine.sustain_tracker.resolve_id
         for state in list(self.states.values()):
@@ -166,9 +271,16 @@ class PointEventRegistry(HoldNoteEventRegistry):
     def bind_gold_source(self, track_id, marker_id, now):
         """Transfer a proved shared contour to gold without a second event."""
         physical = self.alias('track', track_id, 'gold', marker_id)
+        if physical != self.source_ids[('gold', marker_id)]:
+            return physical  # two actual Down facts: not a proved shared lifecycle
         state = self.state_for('gold', marker_id)
         self.gold_shadows[track_id] = marker_id
-        if state is None or state.started is not None or state.event.origin == 'hold_note':
+        if state is None:
+            return physical
+        if state.started is not None:
+            self._inherit_input_facts(state)
+            return physical
+        if state.event.origin == 'hold_note':
             return physical
         marker = self.engine.sustain_tracker.markers.get(marker_id)
         prediction = _finite_prediction(self.engine, marker) if marker is not None else None
@@ -288,10 +400,12 @@ class PointEventRegistry(HoldNoteEventRegistry):
         # Source authority can change without an event ID change. Replace the
         # queued old head representation before gold qualification/refinement.
         canonical = []
+        seen = set()
         for event in pending:
             updated = self.canonical_event(event)
-            if updated is not None:
+            if updated is not None and updated.event_id not in seen:
                 canonical.append(updated)
+                seen.add(updated.event_id)
         result = super().refine(engine, canonical, now)
         # Old-compatible callers may replace an event without copying optional
         # point metadata. Registered lifecycle authority restores those fields.
@@ -326,6 +440,7 @@ class PointEventRegistry(HoldNoteEventRegistry):
             state.completed = completed
         if error:
             state.error = str(error)
+        self._inherit_input_facts(state)
         if before == (state.started, state.completed, state.error):
             return True
         engine.tap_trace.add('point_input', event=event.event_id,
