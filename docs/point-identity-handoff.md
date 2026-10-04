@@ -2,6 +2,8 @@
 
 当前版本为`v1.0.5-pointidentity-candidate`，独立包名`MAES_PointIdentity_Candidate`。这是等待实战验收的候选，不代表稳定FC；当前账号没有Support转化，Bad／Miss就是实际错误数。
 
+2026-10-05本地交付校验完成，包内构建编号`v1.0.5-pointidentity-candidate-67c1b5227274`；58项运行文件、1092项封装依赖完整校验通过，包内模块载入通过。候选只复制必要校准与触控状态，截图预览启用；没有复制旧结果/日志或连接模拟器进行测试。
+
 ## 基线与恢复
 
 基线提交`836a4b7`；本地分支`local/point-identity-20261004`，不推送远端、不改写main。完整恢复资料位于工作区`.work/point-identity-20261004/baseline/`：源码及新增文件快照、Git历史bundle、差异、校准/触控状态和依赖/现有发行文件哈希。恢复校验151份源码一致，189份备份文件通过；14个旧发行目录共24664文件受保护。
@@ -41,6 +43,8 @@
 原12观察拟合保留：6观察仅在压缩录像代理上改善，缺少实战完整历史/游戏真值，不满足采用标准。三个“已输入仍Miss”的金圈仍需实战复核，不能从模型到线时间推断游戏判定。
 
 本地详细资料位于`.work/point-identity-20261004/reports/`。恢复/保护检查为同目录上层`protection-check.json`；历史分析位于`app/temp/new12-analysis/`。旧交接文档保留为历史资料。
+
+最终证据：`point-loop-pixel-summary.json/.md`（完整生产循环及等价对照）、`point-strict-final-summary.json/.md`（逐片三种性能门槛）、`point-action-contract-pixel.json`（保护性动作契约）、`bonus-ribbon-pixel-equivalence.md`（像素等价与实景微测）。打包后保护核验通过：189份备份、151份恢复源码、1430项原依赖、14个旧发行目录24664文件及4项共享用户状态均一致，main历史未移动，未推送GitHub。
 
 ## 下一轮实战
 
