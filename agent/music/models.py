@@ -703,6 +703,13 @@ class NoteTrack:
     # velocity samples. Tap-only; hold timing never reads this timestamp.
     tap_contour_seen_time: float | None = None
     tap_executed_hit_time: float | None = None
+    # Point-mode identity is independent of visual HoldStart classification.
+    # Legacy continuous holds and flicks do not enter this lifecycle.
+    point_mode: bool = False
+    physical_id: str | None = None
+    visual_family: str = ""
+    timing_profile: str = ""
+    point_static_origin: bool = False
 
 
 @dataclass
@@ -735,6 +742,9 @@ class MusicActionEvent:
     owner_id: int | None = None
     marker_id: int | None = None
     marker_terminal: bool = False
+    physical_id: str | None = None
+    visual_family: str = ""
+    timing_profile: str = ""
 
 
 @dataclass(frozen=True)
