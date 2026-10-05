@@ -453,7 +453,7 @@ class MusicActionExecutor:
         raise MusicTouchError(message, receipts=receipts) from cause
 
     def swipe_many(self, submissions: Iterable[FlickSubmission], *, collect_due=None,
-                   tick=None, check_cancelled=None, on_started=None) -> list[FlickInputReceipt]:
+                   tick=None, check_cancelled=None, on_started=None, qualify=None) -> list[FlickInputReceipt]:
         """Interleave due standalone flicks using serial direct touch calls.
 
         No deadline is changed and no future member is waited for. Callers
@@ -469,7 +469,7 @@ class MusicActionExecutor:
             raise MusicTouchError('Touch backend is fused')
         self.last_flick_deferred = []
         session = SyncFlickSession(self, collect_due=collect_due, tick=tick,
-            check_cancelled=check_cancelled, on_started=on_started)
+            check_cancelled=check_cancelled, on_started=on_started, qualify=qualify)
         self._flick_session = session
         try:
             return session.run(list(submissions))

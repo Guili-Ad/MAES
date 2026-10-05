@@ -720,6 +720,11 @@ class NoteTrack:
     timing_profile: str = ""
     point_static_origin: bool = False
     point_requalification_sequence: int | None = None
+    # Standalone arrow authority is not a tap-registry or hold-owner state.
+    flick_static_origin: bool = False
+    flick_requalification_sequence: int | None = None
+    flick_input_started: float | None = None
+    flick_input_completed: float | None = None
 
 
 @dataclass

@@ -1582,6 +1582,13 @@ class MusicVisionEngine:
             return False
         observations = list(track.observations)
         last = observations[-1] if observations else None
+        if self.config.hold_notes_as_taps and track.gesture in FLICK_GESTURES:
+            from .flick_eligibility import failure_reason, record_rejection
+            reason = failure_reason(track, frame.midpoint, sequence=frame.sequence, frame=frame)
+            if reason is not None:
+                record_rejection(track, reason, frame.midpoint, self.tap_trace,
+                                 stage='birth', sequence=frame.sequence, event=track.action_event_id)
+                return False
         from .tap_identity import tap_structure_ready
         if not tap_structure_ready(track, frame):
             return self._point_rejected(track, frame, 'head-physical-evidence-unqualified')
@@ -1736,6 +1743,8 @@ class MusicVisionEngine:
                     continue
                 event_hit_time = (track.predicted_hit_time + partner.predicted_hit_time) / 2.0
             event_id = f"track-{track.track_id}@{int(event_hit_time * 1000)}"
+            if self.config.hold_notes_as_taps and track.gesture in FLICK_GESTURES and track.action_event_id:
+                event_id = track.action_event_id  # dormant reappearance is not another arrow
             track.action_event_id = event_id
             point_head = self.config.hold_notes_as_taps and track.gesture in {NoteGesture.TAP, NoteGesture.HOLD_START}
             if point_head:
@@ -1891,6 +1900,9 @@ class MusicVisionEngine:
                 continue
             if event.origin == 'hold_note':
                 refined.append(event)
+                continue
+            from .flick_eligibility import valid_flick_pending
+            if not valid_flick_pending(event, self, now, self.tap_trace, stage='planning'):
                 continue
             if not valid_pending(event, self.tracks, self.config, now, self.tap_trace,
                                  sequence=self.last_frame_sequence, min_speed=self.coast_speed_threshold,

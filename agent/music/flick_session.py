@@ -51,12 +51,13 @@ class _ActiveFlick:
 
 class SyncFlickSession:
     def __init__(self, executor, *, collect_due=None, tick=None,
-                 check_cancelled=None, on_started=None):
+                 check_cancelled=None, on_started=None, qualify=None):
         self.executor = executor
         self.collect_due = collect_due
         self.tick = tick
         self.check_cancelled = check_cancelled
         self.on_started = on_started
+        self.qualify = qualify
         self.active: list[_ActiveFlick] = []
         self.receipts: list[FlickInputReceipt] = []
         self.waiting = {}
@@ -136,6 +137,12 @@ class SyncFlickSession:
         for item in prepared:
             self._check()
             receipt, submission = item.receipt, item.submission
+            reason = self.qualify(submission) if self.qualify is not None else None
+            if reason:
+                self._defer(submission, reason)
+                self._release_confirmed(item)
+                self.active.remove(item)
+                continue  # no Down attempt, event remains available for real reappearance
             receipt.down_call_started = executor.clock()
             if submission.event_id:
                 executor._used_event_ids.add(executor._event_key(submission.event_id))

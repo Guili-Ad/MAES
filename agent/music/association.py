@@ -194,6 +194,9 @@ def associate_lane(
             track.flick = True
             track.flick_direction = candidate.flick_direction
             track.flick_color = candidate.flick_color
+            if track.point_mode:
+                from .flick_eligibility import observe_arrow_origin
+                observe_arrow_origin(track)
         track.missed_frames = 0
         track.tail_missing_frames = 0
         engine._update_motion(track)

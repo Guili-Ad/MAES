@@ -333,6 +333,9 @@ class MusicRuntime:
                 continue  # reserved, but never attempted: still belongs in queue
             track = engine.tracks.get(event.track_id) if engine else None
             last = track.observations[-1] if track and track.observations else None
+            if track is not None:
+                track.flick_input_started = receipt.down_call_started
+                track.flick_input_completed = receipt.up_call_finished
             self.tap_trace.add('input', event=event.event_id, deadline=event.deadline,
                 origin='flick', track=event.track_id, lane=event.lane,
                 raw_hit=track.predicted_hit_time if track else None,
@@ -362,15 +365,26 @@ class MusicRuntime:
         def started(submission, receipt):
             event = offered[submission.event_id]
             attempted[event.event_id] = event
+            track = engine.tracks.get(event.track_id) if engine else None
+            if track is not None:
+                track.flick_input_started = receipt.down_call_started
             pending[:] = [e for e in pending if e.event_id != event.event_id]
             self.tap_trace.add('flick_started', event=event.event_id, lane=event.lane,
                 deadline=event.deadline, time=receipt.down_call_started)
+        def qualify(submission):
+            from .flick_eligibility import valid_flick_pending
+            event = offered[submission.event_id]
+            if valid_flick_pending(event, engine, self.clock(), self.tap_trace, stage='before-down'):
+                return None
+            pending[:] = [e for e in pending if e.event_id != event.event_id]
+            return 'arrow-authority-revoked'
         initial = collect(getattr(executor, 'active_flick_lanes', ()), 0)
         if not initial:
             return
         try:
             receipts = executor.swipe_many(initial, collect_due=collect,
                 on_started=started, check_cancelled=self._check_cancelled,
+                qualify=qualify,
                 tick=lambda: self._flush_due_taps(executor, pending, engine, metrics))
         except Exception as error:
             self._acknowledge_flicks(getattr(error, 'receipts', ()), attempted.values(), engine, metrics)
@@ -409,6 +423,7 @@ class MusicRuntime:
             return
         from .hold_note_events import refine_hold_note_events
         from .pending_eligibility import valid_pending
+        from .flick_eligibility import valid_flick_pending
         aliases = getattr(engine, 'tap_physical_aliases', {})
         frame = getattr(self, '_dispatch_frame', None) or engine.last_frame
         registry = None
@@ -417,6 +432,8 @@ class MusicRuntime:
             registry = point_registry(engine)
         qualified = []
         for event in refine_hold_note_events(engine, pending, now):
+            if not valid_flick_pending(event, engine, now, self.tap_trace, frame=frame):
+                continue
             if event.track_id in aliases or not valid_pending(event, engine.tracks, self.config, now, self.tap_trace,
                     sequence=engine.last_frame_sequence, min_speed=engine.coast_speed_threshold, frame=frame,
                     coast_eligible=(lambda t: engine._coast_eligible(t, frame)) if frame else None):
@@ -435,6 +452,17 @@ class MusicRuntime:
         if engine is None or not engine.config.hold_notes_as_taps or deadline <= now:
             return False
         for event in pending:
+            if event.gesture in FLICK_GESTURES:
+                from .flick_eligibility import observation_budget, motion_observations
+                track = engine.tracks.get(event.track_id)
+                if track is not None and event.contact_policy != 'held_flick' and event.deadline <= deadline:
+                    history = motion_observations(track)
+                    latest = history[-1].timestamp if history else None
+                    budget = observation_budget(track)
+                    if latest is not None and deadline > latest+budget:
+                        self.tap_trace.add('flick_refresh_before_wait', time=now, event=event.event_id,
+                            deadline=event.deadline, latest_visual_time=latest, coast_budget=budget)
+                        return True
             if event.deadline > deadline or event.physical_id is None:
                 continue
             if event.origin == 'hold_note' and engine.tap_hold_chain is not None:
