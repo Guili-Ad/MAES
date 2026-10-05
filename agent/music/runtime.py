@@ -539,8 +539,8 @@ class MusicRuntime:
         this hook a tap or hold due in that window would fire tens of
         milliseconds late (recorded as Bad/Miss).  Taps are released with the
         usual chord rules; due hold starts/routes are dispatched through the
-        same owner-guarded path as the main loop.  Flicks intentionally stay
-        in ``pending`` so gestures never nest.
+        same owner-guarded path as the main loop. Other flicks stay in pending
+        here: the existing session collector interleaves them without nesting.
         """
         now = self.clock()
         self._qualify_pending(pending, engine, now)

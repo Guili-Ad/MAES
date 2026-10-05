@@ -95,11 +95,15 @@ def record_rejection(track, reason, now, trace, *, stage, sequence=None, event=N
         if previous is not None and previous[0] == reason and 0 <= now-previous[1] < .25:
             return
         track._flick_birth_rejection = (reason, now)
-    last = track.observations[-1] if track.observations else None
+    moving = motion_observations(track)
+    last = moving[-1] if moving else None
     trace.add('flick_qualification', time=now, event=event, track=track.track_id,
         lane=track.lane, stage=stage, reason=reason,
         first_seen_time=track.first_seen_time, latest_visual_time=last.timestamp if last else None,
         latest_box=last.candidate.box if last else None,
+        latest_capture_started=last.capture_started if last else None,
+        latest_capture_finished=last.capture_finished if last else None,
+        visual_age_ms=(now-last.timestamp)*1000. if last else None,
         observation_budget=observation_budget(track), frame=sequence)
 
 

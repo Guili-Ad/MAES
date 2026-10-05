@@ -69,6 +69,22 @@ def _templates():
             np.concatenate([unit*r for r in (.40, .55, .70)]), unit*1.06)
 
 
+@lru_cache(maxsize=17)
+def _offset_grid(span):
+    # Fixed sampling geometry only. No image, ownership or prediction cache.
+    offsets = np.arange(-span, span+1, 4., dtype=float)
+    yy, xx = np.meshgrid(offsets, offsets, indexing='ij')
+    grid = np.column_stack((xx.ravel(), yy.ravel()))
+    grid.flags.writeable = False
+    return grid
+
+
+def _bounds(pixels):
+    # Equivalent three-channel min/max without a strided axis reduction.
+    b, g, r = (pixels[..., i] for i in range(3))
+    return np.minimum(np.minimum(b, g), r), np.maximum(np.maximum(b, g), r)
+
+
 def _pixels(image, centers, radii, offsets):
     xs = np.rint(centers[:, 0, None]+radii[:, None]*offsets[None, :, 0]).astype(np.int32)
     ys = np.rint(centers[:, 1, None]+radii[:, None]*offsets[None, :, 1]).astype(np.int32)
@@ -82,9 +98,24 @@ def _color(pixels, family):
         return (b >= 70) & (g >= 110) & (g > r+35) & (b > r+25)
     if family == 'bonus':
         return (g >= 105) & (r >= 15) & (r <= g-12) & (b <= g-12) & (b <= r-15)
-    # Exactly the accepted yellow-head HSV window, applied to sampled pixels.
-    from .vision import build_color_mask
-    return build_color_mask(pixels.astype(np.uint8), [[5, 70, 130]], [[32, 255, 255]])
+    # Exact algebra for the accepted fixed HSV [5,70,130]..[32,255,255].
+    # Preserve the original UInt8 cast of sampled arrays. R wins maximum ties;
+    # degree [10,65] is 60*(g-b)>=10*delta in R, and
+    # floor(-60*(r-b)/delta)+120<=65 <=> 60*(r-b)>54*delta in G.
+    array = pixels.astype(np.uint8, copy=False)
+    b, g, r = (array[..., i].astype(np.int16) for i in range(3))
+    maximum = np.maximum(np.maximum(r, g), b)
+    delta = maximum-np.minimum(np.minimum(r, g), b)
+    saturation = np.multiply(delta, 255, dtype=np.int32) >= np.multiply(maximum, 70, dtype=np.int32)
+    red = (r >= g) & (r >= b) & (60*(g-b) >= 10*delta)
+    green = (g > r) & (g >= b) & (60*(r-b) > 54*delta)
+    return (maximum >= 130) & saturation & (red | green)
+
+
+def _quadrant_counts(disc):
+    # Three radii times four angles in each of the four quadrants: twelve
+    # Boolean samples. Exhaustive 4096-pattern test proves mean>=.65 iff sum>=8.
+    return disc.reshape(-1, 3, 4, 4).sum(axis=(1, 3), dtype=np.uint8)
 
 
 def _search(track, frame, prediction, project):
@@ -92,9 +123,7 @@ def _search(track, frame, prediction, project):
     image = np.asarray(frame.image)
     family = track.visual_family or 'ordinary'
     span = min(24, max(8, int(extent*.35)))
-    offsets = np.arange(-span, span+1, 4., dtype=float)
-    yy, xx = np.meshgrid(offsets, offsets, indexing='ij')
-    centers = np.column_stack((xx.ravel()+expected[0], yy.ravel()+expected[1]))
+    centers = _offset_grid(span)+np.asarray(expected)
     # Every supported head has a neutral white nucleus. Eliminate empty/color
     # centres before expanding radius hypotheses, rather than repeatedly
     # fetching the same background for every possible disc size.
@@ -103,7 +132,7 @@ def _search(track, frame, prediction, project):
               & (center_xy[:, 1] >= 0) & (center_xy[:, 1] < image.shape[0]))
     centers, center_xy = centers[inside], center_xy[inside]
     nucleus = image[center_xy[:, 1], center_xy[:, 0], :3]
-    low, high = nucleus.min(axis=1), nucleus.max(axis=1)
+    low, high = _bounds(nucleus)
     centers = centers[(low >= 190) & (high-low < 55)]
     if not len(centers):
         return []
@@ -118,7 +147,7 @@ def _search(track, frame, prediction, project):
         return []
     core_template, disc_template, outer_template = _templates()
     core_pixels = _pixels(image, centers, radii, core_template)
-    minimum, maximum = core_pixels.min(axis=2), core_pixels.max(axis=2)
+    minimum, maximum = _bounds(core_pixels)
     core = ((minimum >= 190) & (maximum-minimum < 55)).mean(axis=1)
     selected = core >= .60
     centers, radii, core = centers[selected], radii[selected], core[selected]
@@ -129,8 +158,8 @@ def _search(track, frame, prediction, project):
     coverage = disc.mean(axis=1)
     # Each quadrant has to surround the white centre. A coloured glyph next
     # to a white stroke is not a physical circle, and solid particles fail core.
-    quadrants = disc.reshape(-1, 3, 4, 4).mean(axis=(1, 3))
-    selected = (coverage >= .80) & (quadrants.min(axis=1) >= .65) & (outside <= .30)
+    quadrant_counts = _quadrant_counts(disc)
+    selected = (coverage >= .80) & (quadrant_counts.min(axis=1) >= 8) & (outside <= .30)
     indices = np.flatnonzero(selected)
     residuals = np.linalg.norm(centers-np.asarray(expected), axis=1)
     confidence = coverage+core*.20-outside*.4
@@ -152,7 +181,7 @@ def _search(track, frame, prediction, project):
         # Prove its dense disc directly before entering the generic adapter's
         # more expensive seed search (which has nothing to extract here).
         patch = image[y:y+h, x:x+w, :3]
-        minimum, maximum = patch.min(axis=2), patch.max(axis=2)
+        minimum, maximum = _bounds(patch)
         white = (minimum >= (190 if family == 'ordinary' else 185)) & (maximum-minimum <= 55)
         py, px = np.ogrid[:h, :w]
         distance = ((px-(w-1)/2)/(w/2))**2+((py-(h-1)/2)/(h/2))**2
@@ -278,7 +307,10 @@ def recover_point_heads(tracks, frame, calibration, project, *, entries=None, tr
         if trace is not None:
             trace.add('head_recovery_search', time=frame.midpoint, frame=frame.sequence,
                       track=track.track_id, family=track.visual_family,
+                      first_seen_time=track.first_seen_time,
                       latest_visual_time=last.timestamp, predicted_center=expected,
+                      latest_capture_started=last.capture_started,
+                      latest_capture_finished=last.capture_finished,
                       reason='positive-proposals' if found else 'no-owned-positive-contour', proposals=len(found))
     result = {}
     for p in _assign(proposals):

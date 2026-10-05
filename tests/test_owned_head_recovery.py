@@ -133,6 +133,56 @@ class OwnedHeadRecoveryTests(unittest.TestCase):
         assigned = _assign(self.crowded_proposals(swap=True))
         self.assertEqual({p.track.track_id for p in assigned}, {3, 4, 5})
 
+    def test_recovery_neutral_bounds_are_pixel_equivalent(self):
+        from agent.music.head_recovery import _bounds
+        generator = np.random.default_rng(20261005)
+        for dtype in (np.uint8, np.int16):
+            for shape in ((50, 3), (32, 48, 3), (90, 90, 3)):
+                pixels = generator.integers(0, 256, shape, dtype=dtype)
+                minimum, maximum = _bounds(pixels)
+                np.testing.assert_array_equal(minimum, pixels.min(axis=-1))
+                np.testing.assert_array_equal(maximum, pixels.max(axis=-1))
+
+    def test_recovery_geometry_cache_is_immutable_and_identical(self):
+        from agent.music.head_recovery import _offset_grid
+        for span in range(8, 25):
+            offsets = np.arange(-span, span+1, 4., dtype=float)
+            yy, xx = np.meshgrid(offsets, offsets, indexing='ij')
+            expected = np.column_stack((xx.ravel(), yy.ravel()))
+            actual = _offset_grid(span)
+            np.testing.assert_array_equal(actual, expected)
+            self.assertIs(actual, _offset_grid(span))
+            self.assertFalse(actual.flags.writeable)
+
+    def test_yellow_recovery_mask_all_uint8_values_is_exact(self):
+        from agent.music.head_recovery import _color
+        from agent.music.vision import build_color_mask
+        b, g = np.meshgrid(np.arange(256, dtype=np.uint8), np.arange(256, dtype=np.uint8))
+        pixels = np.empty((256, 256, 3), dtype=np.uint8)
+        pixels[..., 0], pixels[..., 1] = b, g
+        for red in range(256):
+            pixels[..., 2] = red
+            expected = build_color_mask(pixels, [[5, 70, 130]], [[32, 255, 255]])
+            self.assertTrue(np.array_equal(_color(pixels, 'yellow_head'), expected), f'red={red}')
+
+    def test_yellow_recovery_mask_preserves_uint8_cast_for_sample_arrays(self):
+        from agent.music.head_recovery import _color
+        from agent.music.vision import build_color_mask
+        pixels = np.random.default_rng(20261006).integers(-100, 512, (19, 41, 3), dtype=np.int16)
+        for view in (pixels, pixels[::-1, ::2], pixels.transpose(1, 0, 2), pixels.astype(np.float32)):
+            expected = build_color_mask(view.astype(np.uint8), [[5, 70, 130]], [[32, 255, 255]])
+            np.testing.assert_array_equal(_color(view, 'yellow_head'), expected)
+
+    def test_quadrant_integer_gate_all_4096_patterns_preserves_threshold(self):
+        from agent.music.head_recovery import _quadrant_counts
+        bits = ((np.arange(4096)[:, None] >> np.arange(12)) & 1).astype(bool)
+        # Shape is radial=3, quadrant=4, angular samples=4. Reducing axes
+        # (1,3) therefore averages 3*4=12 points, not the 4 quadrants.
+        samples = np.repeat(bits.reshape(4096, 3, 1, 4), 4, axis=2)
+        expected = samples.mean(axis=(1, 3)) >= .65
+        actual = _quadrant_counts(samples.reshape(4096, 48)) >= 8
+        np.testing.assert_array_equal(actual, expected)
+
 
 if __name__ == '__main__':
     unittest.main()
