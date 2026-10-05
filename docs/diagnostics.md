@@ -24,7 +24,7 @@
 1. 用 trace 头部 `build_id`、`run_id`、`config_hash`、`calibration_hash`确认实际运行身份；不能只看version。`effective_calibration_hash`排除创建时间，只比较实际几何/视觉参数；
 2. 在 `logs/log-*.log` 中检索 `Music head action trace ... entries=` 获取每个动作的 `late_ms`（迟到毫秒）；
 3. 结合录屏对齐分数出现时刻，区分“迟到点按”与“识别丢失”（`unscheduled head lost`）；
-4. 当前统一点按优先复核schema 5的`gold_observation / gold_recovered / point_*`及`hold_note_*`输入、资格；`tap_hold_anchor`记录旁路白带关系，不是金圈执行门禁。`hold start/tail acquired/release locked`用于旧持续按压兼容分支，不能用旧释放状态解释当前金圈资格；尾划动同时查看独立的`flick_* / input`回执。
+4. 当前候选trace为schema 6，保留schema 5旧字段；优先复核`gold_observation / gold_recovered / point_*`及`hold_note_*`输入、资格。`tap_hold_anchor`记录旁路白带关系，不是金圈执行门禁。`hold start/tail acquired/release locked`用于旧持续按压兼容分支，不能用旧释放状态解释当前金圈资格；尾划动同时查看独立的`flick_* / input`回执。
 
 ## 统一点按候选的事件链
 
@@ -40,7 +40,7 @@ v1.0.5仍兼容schema 5旧字段；`hold_note_*`仅表示金圈视觉来源，�
 
 ## 优化候选指标与限制
 
-结果格式为schema 3，当前trace为schema 5（旧字段保留），旧格式仍可读取。最近60项是精确窗口，不等同于全曲；`whole_run`是1 ms分桶全曲统计，分位数是桶上界。超过5000 ms的样本报告overflow，分位数落入溢出桶时为null，不能解释为0。
+结果格式为schema 3，当前trace为schema 6（旧字段保留），旧格式仍可读取。最近60项是精确窗口，不等同于全曲；`whole_run`是1 ms分桶全曲统计，分位数是桶上界。超过5000 ms的样本报告overflow，分位数落入溢出桶时为null，不能解释为0。
 `missing_source_times`记录来源未知的事件，它们不参与截图到输入的延迟统计。主机输入调用时间不是游戏判定时间，排队等待也不等于识别计算耗时。
 trace在内存中有界保存，结束写盘；`dropped_records`不为0时必须承认记录不完整。
 schema 4区分`critical_dropped`（关键事件截断）、`visual_dropped`（视觉采样记录截断）及`visual_sampled_out`（主动略过高频重复视觉记录）；两类缓冲隔离，视觉噪声不淘汰输入和身份变更。
@@ -56,3 +56,12 @@ schema 5补充`gold_observation`（采样的物理圆环、拓扑、归属证据
 
 开发回放支持`tap_replay.py --loop --cost-profile ... --config ...`，调用生产打歌循环并模拟截图、候选、跟踪、OCR和输入成本，可注入失败。配置可来自JSON或实战trace的JSONL头；未提供时明确警告默认配置不是实战配置。已知候选回放没有白色条带和连接弧线像素，视频回放使用压缩帧及NumPy；两者均不能证明实机Maa识别或游戏FC。关系及尾划保护回放须包含头部前导；金圈物理点击本身不再要求头部或所有者存在。
 当前测试账号没有Support转化技能，直接以Bad/Miss验收；有此技能的账号才另将救回Perfect按Miss记。记录须填写曲名、设置、构建编号和运行编号。
+
+## 局部恢复与划动保护（schema 6）
+
+- `head_recovery_search`：带原track、外观家族、首次发现、上次有效截图、预测中心与拒绝原因。它是限频的视觉记录，不能挤掉输入回执；`tap_mask_recovered`成功恢复记录保留，恢复不新增物理身份。
+- `flick_qualification`：出生／排队／等待／Down前拒绝，区分静止出生、方向、运动不足、观测年龄／帧预算及等待新正向箭头。可恢复拒绝不是永久删除；静止出生不能因一次小跳位变成真箭头。
+- `tap_dispatch_blocked`：划动期间到期点按因活动轨道、触点容量或单触兼容占用暂留队列，记录占用轨道、原deadline及组编号，不为绕开阻塞而改时。按事件、原因和恢复段限频，有界最多256个键。
+- `input.first_seen_time`是物理来源首次发现；`latest_visual_time`和`latest_capture_started/finished`来自最近有效运动观测，不是事件排队时的旧截图。`visual_age_ms`是Down主机调用开始距该观测的年龄，`deadline_lateness_ms`是Down主机调用开始距最终deadline的偏差。Flick重复像素不更新这些有效运动时间。
+- 旧`source_capture_*`和`perception_to_action / capture_to_action`保持事件来源口径及兼容，可能包含较长跟踪／等待，不能称为输入后端耗时。新增`latest_observation_to_action / latest_capture_to_action`单列最近观测／截图至主机Down的年龄，来源未知为null，排除于分位统计并计入`missing_latest_source_times`。
+- `head_recovery`与`pause_prefilter`测量实际主机局部恢复与暂停预过滤耗时，使用原最近60项及全曲有界直方图。模拟回放的其他clock成本仍是注入值，不能与这些实际CPU墙钟混成实机循环性能。暂停预过滤阈值、OCR确认及严格结束识别不变。

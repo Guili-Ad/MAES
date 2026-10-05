@@ -6,7 +6,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-VERSION = "v1.0.5-pointidentity-candidate"
+VERSION = "v1.0.6-residual-candidate"
 
 
 def digest(value) -> str:

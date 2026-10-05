@@ -40,4 +40,4 @@
 候选构建编号、运行编号和恢复段编号会写入诊断。Perfect下有Support小标时按Miss记录，不能只凭FC徽章认定验收通过。
 当前启用的是长按头部与内部小音符独立点按、尾端划动模式；兼容持续触控路径保留但未启用。
 
-当前候选为`MAES_PointIdentity_Candidate`（v1.0.5），从该独立目录启动GUI，不向旧发行目录复制文件。默认隔离包内`user-data`；六首固定回归及记录表见`point-identity-handoff.md`。当前账号没有Support转化，直接记录真实Bad／Miss。未通过12轮验收前，不称为稳定FC版本。
+当前候选为`MAES_PointIdentity_Refined_Candidate`（v1.0.6），从该独立目录启动GUI，不向旧发行目录复制文件。默认隔离包内`user-data`；六首固定回归及记录表见`residual-fix-handoff.md`。当前账号没有Support转化，直接记录真实Bad／Miss。维持原判定显示、难度、速度和模拟器条件；未通过12轮验收前，不称为稳定FC版本。

@@ -1,7 +1,7 @@
 # MAES
 
 基于 MaaFramework 5.12.2 与 ProjectInterface V2 ，依托Deepseek和Codex实现的《偶像梦幻祭2》打歌自动化项目。
-当前源码 **v1.0.5-pointidentity-candidate**，统一四类物理点按的身份、排队与输入回执，保留各自视觉和时序适配，不代表稳定FC版本。独立包为`MAES_PointIdentity_Candidate`，旧发行目录保持不变，修复与下一轮说明见`docs/point-identity-handoff.md`；旧交接说明保留为历史资料。
+当前源码 **v1.0.6-residual-candidate**，在统一物理点按上补充复合轮廓局部恢复及独立划动资格保护，保留各类视觉、时序和成功尾划，不代表稳定FC版本。独立包为`MAES_PointIdentity_Refined_Candidate`，旧发行目录保持不变，修复与下一轮说明见`docs/residual-fix-handoff.md`；旧交接说明保留为历史资料。
 
 ## 功能范围
 
@@ -14,7 +14,7 @@
 
 ## 使用（普通用户）
 
-1. 本轮候选使用本地 `dist/MAES_PointIdentity_Candidate`，不上传或发布Release；历史发行包仍可从仓库Releases取得。
+1. 本轮候选使用本地 `dist/MAES_PointIdentity_Refined_Candidate`，不上传或发布Release；历史发行包仍可从仓库Releases取得。
 2. 系统要求：Windows 10/11 x64；.NET Desktop Runtime 10；VC++ 2015-2022 Redistributable；安卓模拟器（支持 ADB）或实机设备。
    缺少运行库时，以管理员身份运行包内 `DependencySetup_依赖库安装_win.bat` 可自动安装。
 3. 打开 `MFAAvalonia.exe`，添加你的模拟器设备；确认设备“输入模式”为 Default（打歌必需）。
@@ -24,7 +24,7 @@
 7. 若打歌出现触控异常：暂停歌曲后运行「打歌触控能力检测」定位问题。
 
 **游戏内设置（重要）**：
-- **判定显示：关闭**。判定文字会绘制在屏幕中央并遮挡中轨音符，是丢失中轨判定的主要原因；请在演唱会设置中关闭判定文字显示。
+- **判定显示固定当前测试设置**。判定文字可能与中轨音符形成复合轮廓，本轮针对它修复局部恢复；为可信对照，不要同时更改显示与调度设置。若另测关闭判定显示，请明确记录为不同测试条件。
 - 音符样式 TypeA、音符大小 100%、判定线样式 TypeA、判定线位置常规、Combo 显示于右上角、2D 模式、简易背景。
 - 延迟校准 0.0、音符延迟调整固定 4.0。
 - 模拟器请关闭后台降帧/后台挂起渲染，并保持窗口可见；画面冻结期间音符仍会继续下落。
@@ -52,11 +52,11 @@ powershell -ExecutionPolicy Bypass -File tools/bootstrap.ps1
 # 2. 项目检查（含离线运行时与原生库校验）
 runtime\python\python.exe -B tools\check_project.py --require-runtime
 
-# 3. 单元测试（本轮基线509项；最终候选结果见当前交接说明）
+# 3. 单元测试（本轮基线591项；最终候选结果见当前交接说明）
 runtime\python\python.exe -B tools\run_tests.py
 
 # 4. 构建独立候选包；目标已存在时拒绝覆盖
-powershell -ExecutionPolicy Bypass -File tools/package.ps1 -OutputName MAES_PointIdentity_Candidate
+powershell -ExecutionPolicy Bypass -File tools/package.ps1 -OutputName MAES_PointIdentity_Refined_Candidate
 ```
 
 目录说明：

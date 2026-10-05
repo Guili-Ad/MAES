@@ -194,5 +194,9 @@ def run_loop(stream, calibration, config, args):
             'cpu_timing_notes': 'timing_ms is legacy engine.update only; full_tracking_timing_ms adds external gold qualification prepass without counting inline refresh twice. Excludes provider, mask, OCR, input and release_events/refine_pending queue planning. Actual perf_counter CPU time includes probe overhead. metrics_ms is simulated host-clock timing, not measured CPU. Decoded PTS are identical input, but serviced snapshots/action sequences can differ.',
             'metrics_ms': runtime.metrics.summaries(executor.action_durations),
             'stop': {'status': result.status, 'reason': result.reason, 'cleanup_failure': runtime.cleanup_failure},
+            'trace_buffer': {'dropped_records': runtime.tap_trace.dropped,
+                'critical_dropped': runtime.tap_trace.critical_dropped,
+                'visual_dropped': runtime.tap_trace.visual_dropped,
+                'visual_sampled_out': runtime.tap_trace.visual_sampled_out},
             'game_bad_miss': 'unavailable: compressed video / known candidates, simulated input and OCR',
             'trace': list(runtime.tap_trace.records), 'observations': observations}
