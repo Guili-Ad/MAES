@@ -201,10 +201,6 @@ def _assign(proposals):
         if key not in edges or p.residual < edges[key].residual:
             edges[key] = p
     ids = sorted({tid for tid, _ in edges})
-    if len(ids) > 4 or len(clusters) > 8:
-        return [p for (tid, index), p in edges.items()
-                if sum(t == tid for t, _ in edges) == 1 and sum(i == index for _, i in edges) == 1]
-    best, visited = [], 0
     def ordered(left, right):
         a, b = left.track.observations, right.track.observations
         if left.track.lane != right.track.lane:
@@ -215,6 +211,13 @@ def _assign(proposals):
             return False
         old = max(common)[1]
         return abs(old) > 1e-5 and old*(left.projection.progress-right.projection.progress) > 0
+    if len(ids) > 4 or len(clusters) > 8:
+        unique = [p for (tid, index), p in edges.items()
+                  if sum(t == tid for t, _ in edges) == 1 and sum(i == index for _, i in edges) == 1]
+        # Bounded fallback keeps the same ordering contract as the solver.
+        # Unique spatial edges alone do not prove that a dense run did not swap.
+        return [p for p in unique if all(p is other or ordered(p, other) for other in unique)]
+    best, visited = [], 0
     def walk(pos, chosen, used, cost):
         nonlocal visited
         visited += 1

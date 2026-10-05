@@ -112,6 +112,27 @@ class OwnedHeadRecoveryTests(unittest.TestCase):
                     track.flick = True; track.gesture = NoteGesture.FLICK_RIGHT
                 self.assertEqual(self.recover(cal, tracks, frame), {})
 
+    def crowded_proposals(self, swap=False):
+        from agent.music.head_recovery import RecoveryProposal
+        cal = calibration()
+        tracks = [point_track([(1., .70-i*.09), (1.05, .75-i*.09), (1.10, .80-i*.09)], tid=i+1)
+                  for i in range(5)]
+        progress = [.85-i*.09 for i in range(5)]
+        if swap:
+            progress[0], progress[1] = progress[1], progress[0]
+        return [RecoveryProposal(t, c, assign_lane(c, cal), 1., 1., c.center)
+                for t, p in zip(tracks, progress) for c in [candidate_at(cal, 3, p)]]
+
+    def test_bounded_fallback_preserves_five_distinct_confirmed_heads(self):
+        from agent.music.head_recovery import _assign
+        assigned = _assign(self.crowded_proposals())
+        self.assertEqual({p.track.track_id for p in assigned}, {1, 2, 3, 4, 5})
+
+    def test_bounded_fallback_cannot_reverse_known_same_lane_order(self):
+        from agent.music.head_recovery import _assign
+        assigned = _assign(self.crowded_proposals(swap=True))
+        self.assertEqual({p.track.track_id for p in assigned}, {3, 4, 5})
+
 
 if __name__ == '__main__':
     unittest.main()
