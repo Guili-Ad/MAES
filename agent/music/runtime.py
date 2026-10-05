@@ -1428,9 +1428,14 @@ class MusicRuntime:
                 giant_terminal = (now >= schedule_started + self.config.terminal_initial_delay_ms / 1000.0
                                   and giant_live_title_present(frame.image))
                 prepared_events = None
-                if self.config.hold_notes_as_taps and not giant_terminal and any(e.physical_id is not None for e in pending):
+                if self.config.hold_notes_as_taps and not giant_terminal and any(
+                        e.physical_id is not None or (e.gesture in FLICK_GESTURES
+                            and e.origin == 'track' and e.contact_policy != 'held_flick')
+                        for e in pending):
                     # Fresh pixels qualify every point family before any old
-                    # prediction can execute. Reuse this update after OCR; no
+                    # prediction can execute. An observed standalone arrow
+                    # has no point ID, but needs this same current-frame order.
+                    # Reuse this update after OCR; no
                     # second warm-up, second fit or cross-frame visual cache.
                     try:
                         prepared_events = self._observe_frame(engine, frame)

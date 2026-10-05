@@ -116,6 +116,36 @@ class PointIntegrationTests(unittest.TestCase):
         seen = [(row['segment'], row['sequence']) for row in result['observations']]
         self.assertEqual(len(seen), len(set(seen)))
 
+    def test_real_loop_updates_observed_standalone_arrow_before_dispatch(self):
+        import json
+        from pathlib import Path
+        from tools.loop_replay import run_loop
+        from tools.tap_replay import candidate_frames
+        from agent.music.models import MusicCalibrationData
+        fixture = Path(__file__).parent/'fixtures/optimization/synthetic.jsonl'
+        header = json.loads(fixture.read_text(encoding='utf-8').splitlines()[0])
+        args = SimpleNamespace(candidates=fixture, video=None, branch_root=fixture.parents[3],
+                               cost_profile=None, action_ms=0.)
+        def arrows():
+            for stamp, image, candidates in candidate_frames(args):
+                yield stamp, image, [dict(c, variant='flick', flick_direction=NoteGesture.FLICK_RIGHT.value,
+                    flick_color='blue', hold=False) for c in candidates]
+        calls = []
+        original = MusicRuntime._qualify_pending
+        def qualify(runtime, pending, engine, now):
+            if engine is not None and any(e.gesture == NoteGesture.FLICK_RIGHT for e in pending):
+                frame = getattr(runtime, '_dispatch_frame', None)
+                if frame is not None:
+                    calls.append((frame.sequence, engine.last_frame_sequence))
+            return original(runtime, pending, engine, now)
+        with patch.object(MusicRuntime, '_qualify_pending', qualify):
+            result = run_loop(arrows(), MusicCalibrationData(**header['calibration']),
+                              MusicConfig(**header['config']), args)
+        self.assertTrue(calls)
+        self.assertTrue(all(captured == observed for captured, observed in calls), calls)
+        seen = [(r['segment'], r['sequence']) for r in result['observations']]
+        self.assertEqual(len(seen), len(set(seen)))
+
     def test_unqueued_point_rejections_have_identity_and_bounded_sampling(self):
         engine, track = self.head_engine()
         frame = make_frame(1., 5)
