@@ -1674,7 +1674,9 @@ class MusicVisionEngine:
             if projection is not None:
                 by_lane[projection.lane].append((candidate, projection))
         recovered = recover_masked_taps(self.tracks, frame, self.calibration,
-                                        lambda c: assign_lane(c, self.calibration))
+                                        lambda c: assign_lane(c, self.calibration),
+                                        entries=[item for lane_entries in by_lane.values() for item in lane_entries],
+                                        trace=self.tap_trace)
         for lane, entries in by_lane.items():
             entries = unique_head_candidates(entries, self.tap_trace, frame)
             self._associate_lane(lane, entries, frame, visual, recovered)

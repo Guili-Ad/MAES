@@ -130,9 +130,21 @@ def associate_lane(
             overlap = max(0, min(x+w, cx+cw)-max(x, cx))*max(0, min(y+h, cy+ch)-max(y, cy))
             if overlap >= .8*cw*ch and math.dist(c.center, candidate.center) < min(w,h)*.4:
                 covered.append(entry)
-        if any(not safe_tap_candidate(*entry) for entry in covered):
+        owner = engine.tracks[tid]
+        point_recovery = owner.point_mode and owner.visual_family in {'ordinary', 'bonus', 'yellow_head'}
+        def same_family(entry):
+            c, _ = entry
+            if c.variant == 'flick':
+                return False
+            if owner.visual_family == 'bonus':
+                return c.variant == 'bonus_star'
+            if c.variant == 'bonus_star':
+                return False
+            return (cached_head_ratio(c) >= engine.config.hold_head_color_ratio
+                    if owner.visual_family == 'yellow_head' else safe_tap_candidate(*entry))
+        if any(not (same_family(entry) if point_recovery else safe_tap_candidate(*entry)) for entry in covered):
             continue
-        if len(covered) == 1 and math.dist(covered[0][0].center, candidate.center) < 4.:
+        if not point_recovery and len(covered) == 1 and math.dist(covered[0][0].center, candidate.center) < 4.:
             # Full healthy contour: neither change its centre nor claim it.
             continue
         entries = [entry for entry in entries if entry not in covered]

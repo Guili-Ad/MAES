@@ -10,12 +10,13 @@ from .tap_identity import ordinary_tap
 from .vision import connected_components
 
 
-def recover_masked_taps(tracks, frame, calibration, project):
-    recovered = {}
+def recover_masked_taps(tracks, frame, calibration, project, *, entries=None, trace=None):
+    from .head_recovery import recover_point_heads
+    recovered = recover_point_heads(tracks, frame, calibration, project, entries=entries, trace=trace)
     if frame.image is None or not calibration.exclusion_rois:
         return recovered
     for track in tracks.values():
-        if (not ordinary_tap(track) or track.tap_input_started is not None
+        if (track.point_mode or not ordinary_tap(track) or track.tap_input_started is not None
                 or track.state not in {TrackState.APPROACHING, TrackState.TAP_PENDING}
                 or len(track.observations) < 3):
             continue
