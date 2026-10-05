@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, replace
 from typing import Iterable
 
@@ -156,6 +157,7 @@ class MusicVisionEngine:
         self.previous_hold_tail_ids: list[int] = []
         self.last_frame = None
         self.tap_physical_aliases = {}
+        self.last_head_recovery_ms = 0.0
 
     def _new_track(self, lane: int, first_seen_time: float | None = None) -> NoteTrack:
         track = NoteTrack(
@@ -1680,10 +1682,12 @@ class MusicVisionEngine:
             projection = assign_lane(candidate, self.calibration)
             if projection is not None:
                 by_lane[projection.lane].append((candidate, projection))
+        recovery_started = time.perf_counter()
         recovered = recover_masked_taps(self.tracks, frame, self.calibration,
                                         lambda c: assign_lane(c, self.calibration),
                                         entries=[item for lane_entries in by_lane.values() for item in lane_entries],
                                         trace=self.tap_trace)
+        self.last_head_recovery_ms = (time.perf_counter()-recovery_started)*1000.
         for lane, entries in by_lane.items():
             entries = unique_head_candidates(entries, self.tap_trace, frame)
             self._associate_lane(lane, entries, frame, visual, recovered)

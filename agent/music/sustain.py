@@ -44,8 +44,12 @@ class SustainMarker:
     terminal_votes: int = 0
     sustain_votes: int = 0
     stable_logged: bool = False
+    # Diagnostics only: bounded observations must not redefine physical birth.
+    first_seen_time: float | None = None
 
     def observe(self, observation: SustainObservation, owner: int | None = None) -> None:
+        if self.first_seen_time is None:
+            self.first_seen_time = observation.timestamp
         self.observations.append(observation)
         self.last_seen_time = observation.timestamp
         self.last_seen_frame = observation.frame_sequence

@@ -614,6 +614,10 @@ class TrackObservation:
     center: tuple[float, float]
     progress: float
     candidate: MusicCandidate
+    # The valid motion sample's own capture, not the event's original source.
+    # Unknown is None; legacy/replay constructors remain compatible.
+    capture_started: float | None = None
+    capture_finished: float | None = None
 
 
 @dataclass(frozen=True)

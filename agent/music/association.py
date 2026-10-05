@@ -183,6 +183,8 @@ def associate_lane(
             center=candidate.center,
             progress=projection.progress,
             candidate=candidate,
+            capture_started=frame.capture_started,
+            capture_finished=frame.capture_finished,
         )
         track.observations.append(observation)
         track.tap_contour_seen_time = None

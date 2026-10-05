@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
@@ -55,7 +56,12 @@ class RuntimeMetrics:
     ocr: MetricSeries = field(default_factory=MetricSeries)
     dispatch_wait: MetricSeries = field(default_factory=MetricSeries)
     identity_refresh: MetricSeries = field(default_factory=MetricSeries)
+    latest_observation_to_action: MetricSeries = field(default_factory=MetricSeries)
+    latest_capture_to_action: MetricSeries = field(default_factory=MetricSeries)
+    head_recovery: MetricSeries = field(default_factory=MetricSeries)
+    pause_prefilter: MetricSeries = field(default_factory=MetricSeries)
     missing_source_times: int = 0
+    missing_latest_source_times: int = 0
     tracks_created: int = 0
     tracks_retained_peak: int = 0
     tracks_expired: int = 0
@@ -87,15 +93,20 @@ class RuntimeMetrics:
             },
         }
         series = {name: getattr(self, name) for name in ('capture', 'provider', 'perception_to_action',
-                  'capture_to_action', 'terminal', 'loop', 'mask', 'tracking', 'ocr', 'dispatch_wait', 'identity_refresh')}
+                  'capture_to_action', 'terminal', 'loop', 'mask', 'tracking', 'ocr', 'dispatch_wait', 'identity_refresh',
+                  'latest_observation_to_action', 'latest_capture_to_action', 'head_recovery', 'pause_prefilter')}
         if isinstance(action, MetricSeries):
             series['action'] = action
-        for name in ('mask', 'ocr', 'dispatch_wait'):
+        for name in ('mask', 'ocr', 'dispatch_wait', 'latest_observation_to_action',
+                     'latest_capture_to_action', 'head_recovery', 'pause_prefilter'):
             result[name] = metric_summary(series[name][-60:])
         result['tracking_time'] = metric_summary(self.tracking[-60:])
         result['whole_run'] = {name: values.summary() for name, values in series.items()}
         result['diagnostics'] = {'missing_source_times': self.missing_source_times, 'recent_window_capacity': 60,
-                                 'pause_ocr_skipped': self.pause_ocr_skipped}
+                                 'pause_ocr_skipped': self.pause_ocr_skipped,
+                                 'missing_latest_source_times': self.missing_latest_source_times,
+                                 'time_semantics': 'host calls, not game judgments; legacy perception_to_action/'
+                                     'capture_to_action use event-source capture; latest_* use latest valid observation'}
         return result
 
 
@@ -214,6 +225,7 @@ class MusicRuntime:
         self.tap_policy = TapTimingPolicy(config, config.lane_count or 7)
         self.hold_policy = HoldTimingPolicy(config)
         self.tap_trace = TapTrace(config)
+        self._dispatch_block_seen = {}  # diagnostic only, bounded to 256 keys
 
     def _failure(self, code: MusicFailureCode, reason: str, task_id: int | None = None) -> MusicRunResult:
         return MusicRunResult(
@@ -284,6 +296,10 @@ class MusicRuntime:
                 marker_id = engine.sustain_tracker.resolve_id(event.marker_id)
                 marker = engine.sustain_tracker.markers.get(marker_id)
             marker_latest = marker.observations[-1] if marker is not None and marker.observations else None
+            observation = marker_latest if marker_latest is not None else latest
+            evidence = self._input_observation_fields(observation,
+                marker.first_seen_time if marker else track.first_seen_time if track else None,
+                receipt.down_call_started, event.deadline)
             self.tap_trace.add('input', event=event.event_id, group=event.tap_group_id,
                                physical_id=event.physical_id, visual_family=event.visual_family,
                                timing_profile=event.timing_profile,
@@ -291,12 +307,9 @@ class MusicRuntime:
                                origin=event.origin, owner=event.owner_id, marker=event.marker_id,
                                raw_hit=(marker.predicted_hit(engine.calibration.trigger_progress) if marker
                                         else track.predicted_hit_time if track else None),
-                               latest_visual_time=(marker_latest.timestamp if marker_latest else
-                                                   latest.timestamp if latest else None),
-                               latest_center=marker_latest.center if marker_latest else None,
                                latest_box=latest.candidate.box if latest else None,
                                source_capture_started=event.source_capture_started,
-                               source_capture_finished=event.source_capture_finished)
+                               source_capture_finished=event.source_capture_finished, **evidence)
             if engine is not None and engine.config.hold_notes_as_taps and event.physical_id is not None:
                 from .point_events import point_registry
                 point_registry(engine).acknowledge(engine, event, receipt)
@@ -312,6 +325,33 @@ class MusicRuntime:
             if receipt.down_call_finished is not None and receipt.down_call_started is not None:
                 self._record_head_action(event, receipt.down_call_started, engine)
                 self._record_source_latency(event, receipt.down_call_started, metrics)
+                self._record_latest_latency(evidence, metrics)
+
+    @staticmethod
+    def _input_observation_fields(observation, first_seen, started, deadline):
+        def finite(value):
+            return value if isinstance(value, (float, int)) and math.isfinite(value) else None
+        latest = finite(observation.timestamp) if observation is not None else None
+        down = finite(started)
+        source_started = finite(getattr(observation, 'capture_started', None))
+        source_finished = finite(getattr(observation, 'capture_finished', None))
+        return {'first_seen_time': finite(first_seen), 'latest_visual_time': latest,
+            'latest_center': observation.center if observation is not None else None,
+            'latest_capture_started': source_started, 'latest_capture_finished': source_finished,
+            'visual_age_ms': (down-latest)*1000. if down is not None and latest is not None else None,
+            'deadline_lateness_ms': (down-deadline)*1000. if down is not None else None}
+
+    @staticmethod
+    def _record_latest_latency(evidence, metrics):
+        age = evidence['visual_age_ms']
+        if age is not None:
+            metrics.latest_observation_to_action.append(age)
+        finished = evidence['latest_capture_finished']
+        latest = evidence['latest_visual_time']
+        if finished is None or latest is None or age is None:
+            metrics.missing_latest_source_times += 1
+            return
+        metrics.latest_capture_to_action.append(age+(latest-finished)*1000.)
 
     def _record_source_latency(self, event, started, metrics):
         if event.source_capture_started is None or event.source_capture_finished is None:
@@ -333,18 +373,24 @@ class MusicRuntime:
                 continue  # reserved, but never attempted: still belongs in queue
             track = engine.tracks.get(event.track_id) if engine else None
             last = track.observations[-1] if track and track.observations else None
+            if track is not None and track.point_mode:
+                from .flick_eligibility import motion_observations
+                moving = motion_observations(track)
+                last = moving[-1] if moving else None
+            evidence = self._input_observation_fields(last, track.first_seen_time if track else None,
+                                                     receipt.down_call_started, event.deadline)
             if track is not None:
                 track.flick_input_started = receipt.down_call_started
                 track.flick_input_completed = receipt.up_call_finished
             self.tap_trace.add('input', event=event.event_id, deadline=event.deadline,
                 origin='flick', track=event.track_id, lane=event.lane,
                 raw_hit=track.predicted_hit_time if track else None,
-                latest_visual_time=last.timestamp if last else None,
                 source_capture_started=event.source_capture_started,
-                source_capture_finished=event.source_capture_finished, receipt=asdict(receipt))
+                source_capture_finished=event.source_capture_finished, receipt=asdict(receipt), **evidence)
             if receipt.down_call_finished is not None:
                 self._record_head_action(event, receipt.down_call_started, engine)
                 self._record_source_latency(event, receipt.down_call_started, metrics)
+                self._record_latest_latency(evidence, metrics)
             if engine and engine.tap_hold_chain:
                 engine.tap_hold_chain.completed_flick(event, receipt, hold_note_registry(engine))
 
@@ -499,9 +545,27 @@ class MusicRuntime:
         now = self.clock()
         self._qualify_pending(pending, engine, now)
         locked = getattr(executor, 'active_flick_lanes', frozenset())
-        tap_batches = ([batch for batch in due_tap_batches(pending, now, engine)
-                       if not any(e.lane in locked for e in batch)]
-                       if self._tap_resources_ready(executor) else [])
+        batches = due_tap_batches(pending, now, engine)
+        ready = self._tap_resources_ready(executor)
+        tap_batches = []
+        for batch in batches:
+            blocked = any(e.lane in locked for e in batch)
+            if ready and not blocked:
+                tap_batches.append(batch)
+                continue
+            reason = ('active-flick-lane' if blocked else 'no-free-contact'
+                      if getattr(executor, 'available_flick_contacts', 1) <= 0
+                      else 'single-touch-busy')
+            for event in batch:
+                key = (self.tap_trace.segment_id, event.event_id, reason)
+                if now-self._dispatch_block_seen.get(key, float('-inf')) < .25:
+                    continue
+                if len(self._dispatch_block_seen) >= 256 and key not in self._dispatch_block_seen:
+                    self._dispatch_block_seen.pop(next(iter(self._dispatch_block_seen)))
+                self._dispatch_block_seen[key] = now
+                self.tap_trace.add('tap_dispatch_blocked', event=event.event_id, lane=event.lane,
+                    time=now, deadline=event.deadline, reason=reason,
+                    occupied_lanes=sorted(locked), group=event.tap_group_id)
         fallback_holds = [
             event
             for event in pending
@@ -1199,7 +1263,10 @@ class MusicRuntime:
         return any(event.deadline <= limit for event in pending)
 
     def pause_dialog_present(self, image: Any) -> bool:
-        if not pause_overlay_possible(image):
+        started = time.perf_counter()
+        possible = pause_overlay_possible(image)
+        self.metrics.pause_prefilter.append((time.perf_counter()-started)*1000.)
+        if not possible:
             self.metrics.pause_ocr_skipped += 1
             return False
         started = self.clock()
@@ -1232,6 +1299,7 @@ class MusicRuntime:
         started = self.clock()
         events = engine.update(frame, candidates, visual)
         self.metrics.tracking.append((self.clock()-started)*1000.)
+        self.metrics.head_recovery.append(getattr(engine, 'last_head_recovery_ms', 0.0))
         return events
 
     @staticmethod
