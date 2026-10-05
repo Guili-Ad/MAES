@@ -91,6 +91,7 @@ class FlickEligibilityTests(unittest.TestCase):
         clock, context, runtime, executor, metrics, track, engine, event = case
         self.assertFalse(valid_flick_pending(event, engine, clock(), runtime.tap_trace))
         self.assertEqual(track.action_event_id, 'same-flick')
+
         # Three later observed moving arrow pixels, not a new physical birth.
         newer = flick_track([(10.05, .80), (10.09, .84), (10.13, .88)])
         track.observations.extend(replace(o, frame_sequence=21+i) for i, o in enumerate(newer.observations))
@@ -103,6 +104,23 @@ class FlickEligibilityTests(unittest.TestCase):
         self.assertTrue(valid_flick_pending(event, engine, 10.13, runtime.tap_trace))
         self.assertIsNone(track.flick_requalification_sequence)
         self.assertEqual(track.action_event_id, 'same-flick')
+
+    def test_prediction_age_alone_cannot_retire_a_queued_unattempted_arrow(self):
+        case = self.setup_case([(9.86, .60), (9.90, .64), (9.94, .68), (9.98, .72)], sequence=4)
+        _, _, _, _, _, track, engine, event = case
+        frame = MusicFrame(5, 10.30, 10.30, 10.30, np.zeros((720, 1280, 3), np.uint8))
+        engine._associate_lane(track.lane, [], frame, VisualMask.from_image(frame.image, engine.calibration))
+        self.assertEqual(track.state, TrackState.FLICK_PENDING)
+        self.assertEqual(track.action_event_id, event.event_id)
+        self.assertIsNone(track.flick_input_started)
+
+    def test_attempted_arrow_keeps_original_post_hit_retirement(self):
+        case = self.setup_case([(9.86, .60), (9.90, .64), (9.94, .68), (9.98, .72)], sequence=4)
+        _, _, _, _, _, track, engine, _ = case
+        track.flick_input_started = 10.
+        frame = MusicFrame(5, 10.30, 10.30, 10.30, np.zeros((720, 1280, 3), np.uint8))
+        engine._associate_lane(track.lane, [], frame, VisualMask.from_image(frame.image, engine.calibration))
+        self.assertEqual(track.state, TrackState.RELEASED)
 
     def test_unknown_pixels_cannot_revive_soft_cancelled_arrow(self):
         from agent.music.flick_eligibility import valid_flick_pending
@@ -151,6 +169,33 @@ class FlickEligibilityTests(unittest.TestCase):
         self.assertEqual([r['kind'] for r in context.calls], ['TouchDown', 'TouchMove', 'TouchMove', 'TouchMove', 'TouchUp'])
         row = next(r for r in runtime.tap_trace.records if r['kind']=='input')
         self.assertEqual(row['deadline'], event.deadline)
+
+    def test_two_observed_healthy_arrows_preserve_native_calls_at_zero_and_twenty_ms_skew(self):
+        for skew in (0., .020):
+            with self.subTest(skew=skew):
+                case = self.setup_case([(9.86, .60), (9.90, .64), (9.94, .68), (9.98, .72)], sequence=4)
+                clock, context, runtime, executor, metrics, track, engine, first = case
+                other = flick_track([(9.86, .60), (9.90, .64), (9.94, .68), (9.98, .72)], tid=2, lane=1)
+                other.gesture = other.flick_direction = NoteGesture.FLICK_LEFT
+                other.observations = type(other.observations)([
+                    replace(o, candidate=replace(o.candidate, flick_direction=NoteGesture.FLICK_LEFT))
+                    for o in other.observations], maxlen=12)
+                other.state, other.action_executed = TrackState.FLICK_PENDING, True
+                second = replace(first, event_id='other-flick', track_id=2, lane=1,
+                    gesture=NoteGesture.FLICK_LEFT, direction=NoteGesture.FLICK_LEFT,
+                    deadline=10.+skew, coordinate=(260, 620))
+                other.action_event_id, other.predicted_hit_time = second.event_id, 10.094+skew
+                engine.tracks[2] = other
+                runtime._execute_due(executor, [first, second], clock(), metrics, engine, wait=False)
+                guarded = context.calls
+                _, plain_context, plain_runtime, plain_executor, plain_metrics = self.setup_case(
+                    [(9.86, .60), (9.90, .64), (9.94, .68), (9.98, .72)], sequence=4)[:5]
+                plain_runtime._execute_due(plain_executor, [first, second], plain_runtime.clock(),
+                    plain_metrics, None, wait=False)
+                self.assertEqual(guarded, plain_context.calls)
+                rows = [r for r in runtime.tap_trace.records if r['kind'] == 'input']
+                self.assertEqual({r['event']: r['deadline'] for r in rows},
+                    {first.event_id: first.deadline, second.event_id: second.deadline})
 
     def test_precise_wait_does_not_outwait_arrow_observation_budget(self):
         case = self.setup_case([(9.80, .60), (9.84, .64), (9.88, .68), (9.92, .72)], now=9.98, sequence=4)

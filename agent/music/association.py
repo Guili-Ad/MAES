@@ -69,6 +69,8 @@ def associate_lane(
                 or (track.gesture != NoteGesture.TAP
                     and not (track.point_mode and track.gesture == NoteGesture.HOLD_START)
                     and track.action_executed
+                    and (not track.point_mode or track.gesture not in FLICK_GESTURES
+                         or track.flick_input_started is not None)
                     and track.predicted_hit_time is not None
                     and frame.midpoint > track.predicted_hit_time + 0.12)
             )
