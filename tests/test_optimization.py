@@ -252,9 +252,84 @@ class ReplayToolTests(unittest.TestCase):
         self.assertEqual(note.flick_color, 'red')
 
     def test_ffmpeg_workspace_is_resolved_from_project_not_drive_root(self):
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
-        from workspace_paths import workspace_root
-        self.assertTrue((workspace_root()/'test-materials').is_dir())
+        from tools import workspace_paths
+        with tempfile.TemporaryDirectory(prefix='maes-workspace-test-') as temporary:
+            workspace = Path(temporary) / 'workspace'
+            (workspace / 'test-materials').mkdir(parents=True)
+            (workspace / '.work').mkdir()
+            for relative in ('app', '.work/source-snapshot/app'):
+                app_root = workspace / relative
+                app_root.mkdir(parents=True)
+                with self.subTest(location=relative), patch.object(
+                    workspace_paths, 'APP_ROOT', app_root
+                ):
+                    self.assertEqual(workspace_paths.workspace_root(), workspace)
+
+    def test_workspace_root_prefers_nearest_complete_workspace(self):
+        from tools import workspace_paths
+        with tempfile.TemporaryDirectory(prefix='maes-workspace-test-') as temporary:
+            outer = Path(temporary) / 'outer'
+            inner = outer / 'inner'
+            for workspace in (outer, inner):
+                (workspace / 'test-materials').mkdir(parents=True)
+                (workspace / '.work').mkdir()
+            app_root = inner / 'app'
+            app_root.mkdir()
+            with patch.object(workspace_paths, 'APP_ROOT', app_root):
+                self.assertEqual(workspace_paths.workspace_root(), inner)
+
+    def test_workspace_root_falls_back_without_both_markers(self):
+        from tools import workspace_paths
+        for markers in ((), ('test-materials',), ('.work',)):
+            with self.subTest(markers=markers), tempfile.TemporaryDirectory(
+                prefix='maes-workspace-test-'
+            ) as temporary:
+                fixture = Path(temporary)
+                workspace = fixture / 'workspace'
+                app_root = workspace / 'snapshots/app'
+                app_root.mkdir(parents=True)
+                for marker in markers:
+                    (workspace / marker).mkdir()
+                original_is_dir = Path.is_dir
+
+                def fixture_is_dir(path):
+                    # Ignore unrelated markers on the host's ancestor directories.
+                    return path.is_relative_to(fixture) and original_is_dir(path)
+
+                with patch.object(workspace_paths, 'APP_ROOT', app_root), patch.object(
+                    Path, 'is_dir', autospec=True, side_effect=fixture_is_dir
+                ):
+                    self.assertEqual(workspace_paths.workspace_root(), app_root.parent)
+
+    def test_ffmpeg_prefers_bundled_tool_to_path(self):
+        from tools import workspace_paths
+        with tempfile.TemporaryDirectory(prefix='maes-ffmpeg-test-') as temporary:
+            workspace = Path(temporary)
+            bundled = workspace / (
+                '.work/ffmpeg-7.1.1-extract/'
+                'ffmpeg-7.1.1-essentials_build/bin/ffmpeg.exe'
+            )
+            bundled.parent.mkdir(parents=True)
+            bundled.touch()
+            with patch.object(workspace_paths, 'workspace_root', return_value=workspace), \
+                    patch.object(workspace_paths.shutil, 'which') as which:
+                self.assertEqual(workspace_paths.ffmpeg_binary('ffmpeg.exe'), bundled)
+                which.assert_not_called()
+
+    def test_ffmpeg_falls_back_to_path_or_command_name(self):
+        from tools import workspace_paths
+        with tempfile.TemporaryDirectory(prefix='maes-ffmpeg-test-') as temporary:
+            workspace = Path(temporary)
+            on_path = str(workspace / 'system-bin/ffmpeg.exe')
+            for located in (on_path, None):
+                with self.subTest(located=located), patch.object(
+                    workspace_paths, 'workspace_root', return_value=workspace
+                ), patch.object(workspace_paths.shutil, 'which', return_value=located) as which:
+                    self.assertEqual(
+                        workspace_paths.ffmpeg_binary('ffmpeg.exe'),
+                        Path(located or 'ffmpeg.exe'),
+                    )
+                    which.assert_called_once_with('ffmpeg.exe')
 
     def test_preflight_metrics_accept_extend(self):
         from agent.music.metrics import MetricSeries
