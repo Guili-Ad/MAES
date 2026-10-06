@@ -20,7 +20,7 @@ from agent.music.hold_topology import marker_evidence
 class IdentityTests(unittest.TestCase):
     def setUp(self):
         self.cal = calibration()
-        self.engine = MusicVisionEngine(self.cal, MusicConfig(lane_count=7, enable_holds=True))
+        self.engine = MusicVisionEngine(self.cal, MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
 
     def frame(self, seq, t, image=None):
         return MusicFrame(seq, t, t, t, np.zeros((720, 1280, 3), np.uint8) if image is None else image)
@@ -93,10 +93,11 @@ class IdentityTests(unittest.TestCase):
         for i, kind in enumerate(['checkpoint', 'checkpoint', 'terminal', 'terminal']):
             tail = HoldTailDetection(.3+i*.03,.8,100,3,(640.,280.+i*12),0.,2,
                                      topology=kind)
-            moving, streaks, flags = self.engine._moving_hold_tails([tail])
+            moving, streaks, flags, ids = self.engine._moving_hold_tails([tail])
             self.engine.previous_hold_tails = [tail]
             self.engine.previous_hold_tail_streaks = streaks
             self.engine.previous_hold_tail_checkpoint_flags = flags
+            self.engine.previous_hold_tail_ids = ids
             self.engine.previous_hold_tail_terminal_streaks = self.engine._current_terminal_streaks
             if i == 2:
                 self.assertTrue(flags[0])  # one ambiguous frame is not enough
@@ -184,7 +185,7 @@ class IdentityTests(unittest.TestCase):
         from agent.music.vision import VisualMask
         from test_longtap_branch import frame_image
         for sent in (False,True):
-            engine=MusicVisionEngine(self.cal,MusicConfig(lane_count=7,enable_holds=True))
+            engine=MusicVisionEngine(self.cal,MusicConfig(hold_sustain_enabled=False, lane_count=7,enable_holds=True))
             track=NoteTrack(1,3,gesture=NoteGesture.TAP,state=TrackState.TAP_PENDING,
                             action_executed=True,action_event_id='same-head',predicted_hit_time=1.)
             track.tap_input_started=.1 if sent else None

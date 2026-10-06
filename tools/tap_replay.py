@@ -6,21 +6,26 @@ Candidate-only frames use black images; use video replay for ribbon/arc pixels.
 Annotations: {heads: [{id, lane, gesture, earliest, latest}]} (seconds).
 Video results use NumPy (also used in the Test2 live logs), but compressed
 video timing/pixels and mock input are not a full live validation. Annotations and
-per-song timestamps belong only under temp/validation, never runtime resources.
+per-song timestamps belong in tests/fixtures or a local validation directory,
+never runtime resources. Reports are written under temp only.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_paths import workspace_root, ffmpeg_binary
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parents[2]
+WORKSPACE = workspace_root()
 
 
 class ReplayClock:
@@ -48,6 +53,8 @@ class RecordingContext:
 
 def video_frames(args):
     import numpy as np
+    if not args.video.is_file():
+        raise FileNotFoundError(f'Video does not exist: {args.video}')
     flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
     probe = subprocess.run([str(args.ffprobe), '-v', 'error', '-select_streams', 'v:0',
                             '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'json', str(args.video)],
@@ -57,7 +64,7 @@ def video_frames(args):
     end = args.start + args.duration
     indices = [i for i, t in enumerate(times) if args.start <= t < end]
     if not indices:
-        return
+        raise ValueError('No video frames inside the selected interval')
     selected = [times[i] for i in indices]
     # ffprobe rounds the decimal PTS; selecting floating-point t in FFmpeg
     # can include a different boundary frame. Decode the same frame indices.
@@ -104,6 +111,54 @@ def candidate_frames(args):
             yield timestamp, blank, item['candidates']
 
 
+def decode_candidate(raw):
+    from agent.music.models import MusicCandidate, NoteGesture
+    return MusicCandidate(tuple(raw['box']), raw['pixel_count'], raw['fill_ratio'],
+                          tuple(raw['center']), raw.get('variant', ''),
+                          flick_direction=NoteGesture(raw.get('flick_direction', 'Unknown')),
+                          flick_color=raw.get('flick_color', ''))
+
+
+def load_replay_config(path):
+    """Read an explicit config object or a tap-trace JSONL header.
+
+    A JSONL header must contain a config object: accidentally treating a trace
+    without live settings as defaults would invalidate a baseline comparison.
+    Plain JSON may contain either the settings themselves or {config: {...}}.
+    Only the first JSONL record is read, not a multi-megabyte diagnostic trace.
+    """
+    path = Path(path)
+    if path.suffix.lower() == '.jsonl':
+        with path.open(encoding='utf-8-sig') as stream:
+            line = next((line for line in stream if line.strip()), None)
+        if line is None:
+            raise ValueError(f'Empty replay config header: {path}')
+        value = json.loads(line)
+        if not isinstance(value, dict) or not isinstance(value.get('config'), dict):
+            raise ValueError(f'Tap-trace header must contain a config object: {path}')
+        return dict(value['config'])
+    value = json.loads(path.read_text(encoding='utf-8-sig'))
+    if isinstance(value, dict) and 'config' in value:
+        value = value['config']
+    if not isinstance(value, dict):
+        raise ValueError(f'Replay config must be a JSON object: {path}')
+    return dict(value)
+
+
+def replay_identity(config, calibration, config_source):
+    """Keep live settings and geometric calibration explicit in every report."""
+    from agent.music.build_identity import digest
+    raw_cal = asdict(calibration)
+    effective_cal = {key: value for key, value in raw_cal.items() if key != 'created_at'}
+    # Match TapTrace's existing hash convention so a live trace and replay can
+    # be paired directly; geometric hashes use the compact build convention.
+    config_hash = hashlib.sha256(json.dumps(asdict(config), sort_keys=True).encode()).hexdigest()[:16]
+    return {'config': asdict(config), 'config_hash': config_hash,
+            'config_source': config_source,
+            'calibration_hash': digest(raw_cal),
+            'effective_calibration_hash': digest(effective_cal)}
+
+
 def annotate(heads, path):
     expected = json.loads(path.read_text(encoding='utf-8'))['heads']
     unused = set(range(len(heads)))
@@ -135,18 +190,22 @@ def main():
     source.add_argument('--report', type=Path, help='Annotate an existing replay without decoding again')
     parser.add_argument('--branch-root', type=Path, default=ROOT)
     parser.add_argument('--calibration', type=Path)
+    parser.add_argument('--config', type=Path,
+                        help='Explicit JSON settings or tap-trace JSONL header; overrides candidate header fields')
     parser.add_argument('--start', type=float, default=0.)
     parser.add_argument('--duration', type=float, default=15.)
     parser.add_argument('--action-ms', type=float, default=0.)
+    parser.add_argument('--loop', action='store_true', help='Run the production play loop with simulated stage costs')
+    parser.add_argument('--cost-profile', type=Path, help='Local JSON default/by_capture costs and failures for --loop')
     parser.add_argument('--trace-observations', action='store_true', help='Developer-only candidate/track history in the output report')
     parser.add_argument('--annotations', type=Path)
     parser.add_argument('--output', type=Path, required=True)
-    binary = WORKSPACE / '.work/ffmpeg-7.1.1-extract/ffmpeg-7.1.1-essentials_build/bin'
-    parser.add_argument('--ffmpeg', type=Path, default=binary / 'ffmpeg.exe')
-    parser.add_argument('--ffprobe', type=Path, default=binary / 'ffprobe.exe')
+    parser.add_argument('--ffmpeg', type=Path, default=ffmpeg_binary('ffmpeg.exe'))
+    parser.add_argument('--ffprobe', type=Path, default=ffmpeg_binary('ffprobe.exe'))
     args = parser.parse_args()
-    if not args.output.resolve().is_relative_to(ROOT / 'temp'):
-        parser.error('Replay output must stay in Double/temp (never runtime resources or the baseline).')
+    args.output = args.output.resolve()
+    if not args.output.is_relative_to(ROOT / 'temp'):
+        parser.error('Replay output must stay in app/temp (never runtime resources or the baseline).')
     if args.duration <= 0 or args.action_ms < 0:
         parser.error('Duration must be positive; action cost cannot be negative.')
     if args.report:
@@ -168,24 +227,45 @@ def main():
     from agent.music.storage import metric_summary
     logging.disable(logging.CRITICAL)
     raw_config = {}
+    config_source = 'defaults (not a live configuration)'
     if args.candidates:
         with args.candidates.open(encoding='utf-8') as stream:
             header = json.loads(next(stream))
         raw_cal, raw_config = header['calibration'], header.get('config', {})
+        config_source = str(args.candidates.resolve()) + ':header'
     else:
         if not args.calibration:
             parser.error('Video replay requires an explicit calibration JSON; no shared settings are created.')
         raw_cal = json.loads(args.calibration.read_text(encoding='utf-8'))
         if 'profiles' in raw_cal:
             raw_cal = raw_cal['profiles']['7@1280x720']
+    if args.config:
+        raw_config = raw_config | load_replay_config(args.config)
+        config_source = str(args.config.resolve())
     cal = MusicCalibrationData(**raw_cal)
     config = MusicConfig(**({'lane_count': 7, 'enable_holds': True} | raw_config))
-    provider = NumpyCandidateProvider(cal, config.candidate_iou_threshold, config.candidate_min_size)
+    identity = replay_identity(config, cal, config_source)
+    provider = NumpyCandidateProvider(cal, config.candidate_iou_threshold, config.candidate_min_size, config.split_stacked_notes)
+    if args.loop:
+        from loop_replay import run_loop
+        stream = video_frames(args) if args.video else candidate_frames(args)
+        report = run_loop(stream, cal, config, args)
+        report.update(identity)
+        report['loop_config_overrides'] = {'max_duration_seconds': 600,
+                                           'startup_gate': 'bypassed for a selected gameplay clip'}
+        if args.annotations:
+            report['annotation_result'] = annotate(report['heads'], args.annotations)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
+        print(json.dumps({'mode': 'production-loop', 'heads': len(report['heads']), 'frames': report['frames']}))
+        return 0
     clock = ReplayClock()
     context = RecordingContext(clock, args.action_ms)
     engine = MusicVisionEngine(cal, config)
     runtime = MusicRuntime(context, config, clock=clock, monotonic=clock, sleeper=clock.sleep)
     executor = MusicActionExecutor(context, 1280, 720, config, advanced=True, multi_touch=True, clock=clock, sleeper=clock.sleep)
+    if hasattr(executor, 'begin_segment'):
+        executor.begin_segment(runtime.tap_trace.run_id, 0)
     pending, samples, frame_count, scheduled = [], [], 0, []
     observation_trace = []
     metrics = RuntimeMetrics()
@@ -211,7 +291,7 @@ def main():
         frame = MusicFrame(sequence, timestamp, timestamp, timestamp, image)
         visual = VisualMask.from_image(image, cal)
         candidates = provider.detect(frame, visual) if raw_candidates is None else [
-            MusicCandidate(tuple(c['box']), c['pixel_count'], c['fill_ratio'], tuple(c['center']), c.get('variant', ''))
+            decode_candidate(c)
             for c in raw_candidates]
         started = time.perf_counter()
         new = engine.update(frame, candidates, visual)
@@ -237,6 +317,7 @@ def main():
         heads.append({'ordinal': int(ordinal), 'track': int(tid), 'lane': int(lane),
                       'gesture': gesture, 'time': float(timestamp), 'late_ms': float(late), 'flags': flags})
     report = {'schema': 1, 'branch': str(args.branch_root.resolve()), 'frames': frame_count,
+              **identity,
               'source': str(args.video or args.candidates), 'provider': 'numpy-video (compressed frames, mock input)' if args.video else 'known-candidates',
               'action_ms': args.action_ms, 'timing_ms': metric_summary(samples),
               'heads': heads, 'actions': context.actions, 'scheduled': scheduled,

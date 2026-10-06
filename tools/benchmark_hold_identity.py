@@ -6,9 +6,10 @@ import time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from tap_replay import video_frames
+from workspace_paths import workspace_root
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parents[2]
+WORKSPACE = workspace_root()
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)

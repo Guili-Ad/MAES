@@ -1,11 +1,14 @@
 param(
-    [switch]$Release
+    [switch]$Release,
+    [string]$OutputName = 'MAES_Optimization_Candidate'
 )
 
 $ErrorActionPreference = "Stop"
 $AppRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $DistRoot = Join-Path $AppRoot "dist"
-$Target = Join-Path $DistRoot "MAES"
+if ($OutputName -notmatch '^MAES[A-Za-z0-9_.-]*$') { throw 'Invalid package output name' }
+$Target = Join-Path $DistRoot $OutputName
+if (Test-Path -LiteralPath $Target) { throw "Refusing to overwrite an existing distribution: $Target" }
 
 function Assert-PathInside {
     param(
@@ -113,8 +116,7 @@ function Remove-PackageRuntimeState {
 Assert-PathInside -Path $Target -Root $DistRoot | Out-Null
 
 $ValidationRoot = Join-Path $AppRoot ".validation"
-Remove-TreeInside -Path $ValidationRoot -Root $AppRoot
-Remove-PythonCaches -Root $AppRoot
+# Never clean caches or state in existing distributions during a candidate build.
 
 $env:PYTHONDONTWRITEBYTECODE = "1"
 
@@ -188,7 +190,6 @@ finally {
     Pop-Location
 }
 
-Remove-TreeInside -Path $Target -Root $DistRoot
 New-Item -ItemType Directory -Path $DistRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $Target | Out-Null
 
@@ -198,7 +199,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $GuiRoot "MFAAvalonia.exe"))) {
 }
 Copy-Item -Path (Join-Path $GuiRoot "*") -Destination $Target -Recurse -Force
 
-$ProjectItems = @("interface.json", "LICENSE.md", "README.md", "THIRD_PARTY_NOTICES.md", "requirements.lock", "agent", "resource", "LICENSES")
+$ProjectItems = @("interface.json", "LICENSE.md", "README.md", "THIRD_PARTY_NOTICES.md", "requirements.lock", "agent", "resource", "LICENSES", "docs")
 foreach ($Item in $ProjectItems) {
     Copy-Item -LiteralPath (Join-Path $AppRoot $Item) -Destination $Target -Recurse
 }
@@ -262,5 +263,18 @@ $PackagedFrameworkHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path
 if ($SourceFrameworkHash -ne $PackagedFrameworkHash) {
     throw "Packaged MaaFramework.dll does not match the validated vendor build"
 }
+
+# A package-local marker isolates defaults even when the user launches the GUI directly.
+New-Item -ItemType File -Path (Join-Path $Target 'candidate-package.marker') | Out-Null
+$CandidateData = Join-Path $Target 'user-data'
+New-Item -ItemType Directory -Path $CandidateData | Out-Null
+$CurrentData = if ($env:MAES_DATA_DIR) { $env:MAES_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'MAES' }
+foreach ($StateItem in @('calibration', 'music_touch.json')) {
+    $StateSource = Join-Path $CurrentData $StateItem
+    if (Test-Path -LiteralPath $StateSource) { Copy-Item -LiteralPath $StateSource -Destination $CandidateData -Recurse }
+}
+Invoke-TestPython -Python $TestPython -Arguments @('-B', (Join-Path $PSScriptRoot 'build_manifest.py'),
+    '--root', $Target, '--source-root', $AppRoot)
+if ($LASTEXITCODE -ne 0) { throw 'Packaged build identity failed verification' }
 
 Write-Host "Package created at $Target"

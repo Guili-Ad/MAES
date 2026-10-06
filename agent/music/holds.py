@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 
 from .models import MusicCalibrationData, MusicCandidate, MusicConfig
 from .vision import build_color_mask, connected_components
 from .hold_topology import marker_evidence
+from .gold_mask import build_gold_mask
 
 try:
     import numpy as np
@@ -28,6 +30,10 @@ class HoldTailDetection:
     ribbon_exit_count: int = 1
     topology: str = ""
     owner_lanes: tuple[int, ...] | None = None
+    box: tuple[int, int, int, int] | None = None
+    ring_coverage: float | None = None
+    owner_scores: tuple[float, ...] | None = None
+    physical_ring: bool | None = None
 
 
 def hold_head_color_ratio(image: object, candidate: MusicCandidate) -> float:
@@ -58,6 +64,8 @@ def bonus_hold_ribbon_present(
     image: object,
     candidate: MusicCandidate,
     tangent: tuple[float, float],
+    *,
+    evidence: dict | None = None,
 ) -> bool:
     """Confirm the bright ribbon immediately upstream of a bonus-star head.
 
@@ -66,6 +74,12 @@ def bonus_hold_ribbon_present(
     star taps expose only the stage.  Comparing the local ribbon strip with two
     side strips rejects pale backgrounds and the white judgement arc.
     """
+    # Optional point-mode metadata is stricter than the historical return.
+    # Callers that classify/tune clicks continue to consume the exact old bool.
+    # Reuse the existing near/far masks below instead of rescanning the image.
+    if evidence is not None:
+        evidence.clear()
+        evidence['strict_bilateral'] = False
     if np is None:
         raise RuntimeError("NumPy is required by the hold tracker")
     array = np.asarray(image)
@@ -89,9 +103,10 @@ def bonus_hold_ribbon_present(
     if x1 <= x0 or y1 <= y0:
         return False
     crop = array[y0:y1, x0:x1, :3].astype(np.int16)
-    minimum = crop.min(axis=2)
-    maximum = crop.max(axis=2)
-    rows, columns = np.indices(crop.shape[:2])
+    b, g, r = (crop[..., channel] for channel in range(3))
+    minimum = np.minimum(np.minimum(b, g), r)
+    maximum = np.maximum(np.maximum(b, g), r)
+    rows, columns = np.ogrid[:crop.shape[0], :crop.shape[1]]
     relative_x = columns + x0 - center_x
     relative_y = rows + y0 - center_y
     tangent_x, tangent_y = tangent
@@ -140,6 +155,22 @@ def bonus_hold_ribbon_present(
             and outer_contrast >= 0.16
             and (inner_contrast >= 0.18 or outer_contrast >= 0.35)
         ):
+            if evidence is not None:
+                signed_across = -relative_x * tangent_y + relative_y * tangent_x
+                bilateral = True
+                # Averaging left/right sides lets a bright stage wall on one
+                # side and blue stage on the other masquerade as a ribbon.
+                # Both edges must separately contrast with the near/far body.
+                for region, body_ratio, contrast in (
+                    (inner_sides, inner_ratio, .18),
+                    (outer_sides, outer_ratio, .16),
+                ):
+                    for sign in (-1, 1):
+                        side = region & (signed_across * sign > 0)
+                        if (int(side.sum()) < 10
+                                or body_ratio - float(strict_neutral[side].mean()) < contrast):
+                            bilateral = False
+                evidence['strict_bilateral'] = bilateral
             return True
 
     # Preserve the original high-confidence straight neutral-ribbon path.  It
@@ -332,6 +363,8 @@ def detect_hold_tails(
     image: object,
     calibration: MusicCalibrationData,
     config: MusicConfig,
+    *,
+    physical_only: bool = False,
 ) -> list[HoldTailDetection]:
     """Return pale-gold hold caps inside calibrated lane corridors.
 
@@ -339,6 +372,10 @@ def detect_hold_tails(
     orange head reaches the judgement line.  Detection is therefore global and
     independent of the compact head track.  Temporal association and release
     prediction are handled by ``MusicVisionEngine``.
+
+    The optional tap-mode fast path discards only candidates already rejected
+    by the physical marker tracker. Default and sustained-touch callers keep
+    the complete historical output, including non-ring diagnostic contours.
     """
     if np is None:
         raise RuntimeError("NumPy is required by the hold tracker")
@@ -356,7 +393,7 @@ def detect_hold_tails(
     # saturation ceiling excludes the orange head fill; an expanded orange-halo
     # check below rejects its pale inner ring too.
     sample = 3
-    mask = build_color_mask(array[y0:y1:sample, x0:x1:sample], [[7, 5, 145]], [[45, 200, 255]])
+    mask = build_gold_mask(array[y0:y1:sample, x0:x1:sample])
     detections: list[HoldTailDetection] = []
     for box, sampled_pixels in connected_components(mask, max(3, config.hold_tail_min_pixels // (sample * sample))):
         sampled_x, sampled_y, sampled_width, sampled_height = box
@@ -369,6 +406,14 @@ def detect_hold_tails(
         score = pixel_count / max(width * height, 1)
         if score < max(0.25, config.hold_tail_min_score) or pixel_count < max(60, config.hold_tail_min_pixels):
             continue
+        marker_box = (x0 + local_x, y0 + local_y, width, height)
+        physical_ring = None
+        if physical_only and config.hold_notes_as_taps:
+            # Pure shape evidence does not depend on projection or the halo.
+            # Reject the same nonphysical contours before either costly pass.
+            physical_ring = gold_ring_shape(array, marker_box)
+            if not physical_ring:
+                continue
         center = (x0 + local_x + width / 2.0, y0 + local_y + height / 2.0)
         projections = [
             (*_project_to_line(center, line), lane)
@@ -401,7 +446,7 @@ def detect_hold_tails(
             )
             if float(lime.mean()) > 0.05:
                 continue
-        topology, owners, _, _ = marker_evidence(array, center, longer / 2.0, target_lane, calibration)
+        topology, owners, _, owner_scores = marker_evidence(array, center, longer / 2.0, target_lane, calibration)
         # Directional/local-contrast evidence replaces the old 24-sector scan.
         # Keep the compatibility field, but do not pay for both classifiers.
         ribbon_exits = {'terminal': 1, 'checkpoint': 2, 'unknown': 0}[topology]
@@ -416,6 +461,69 @@ def detect_hold_tails(
                 ribbon_exits,
                 topology,
                 owners,
+                marker_box,
+                (gold_ring_coverage(array, marker_box)
+                 if config.hold_notes_as_taps else None),
+                owner_scores,
+                ((physical_ring if physical_ring is not None else gold_ring_shape(array, marker_box))
+                 if config.hold_notes_as_taps else None),
             )
         )
     return sorted(detections, key=lambda item: (item.progress, item.center[1], item.center[0]))
+
+
+@lru_cache(maxsize=128)
+def _gold_shape_geometry(w, h):
+    """Immutable pixel-independent geometry; retain the original arithmetic."""
+    rows, cols = np.indices((h, w))
+    nx, ny = (cols-(w-1)/2.)/(w/2.), (rows-(h-1)/2.)/(h/2.)
+    radial = nx*nx+ny*ny
+    rim = (radial >= .55**2) & (radial <= 1.05**2)
+    bins = ((np.arctan2(ny, nx)+math.pi)*12/(2*math.pi)).astype(int).clip(0, 11)
+    counts = np.bincount(bins[rim], minlength=12)
+    for array in (rim, bins, counts):
+        array.flags.writeable = False
+    return rim, bins, counts
+
+
+def gold_ring_shape(image, box):
+    """Positive circular gold rim evidence, not just white HUD coverage."""
+    x, y, w, h = box
+    if min(w, h) < 20 or not .75 <= w/max(h, 1) <= 1.35:
+        return False
+    crop = np.asarray(image)[y:y+h, x:x+w, :3].astype(np.int16)
+    if crop.shape[:2] != (h, w):
+        return False
+    rim, bins, counts = _gold_shape_geometry(w, h)
+    b, g, r = crop[:,:,0], crop[:,:,1], crop[:,:,2]
+    gold = (r >= 170) & (g >= 110) & (r-b >= 35) & (g-b >= 15)
+    filled = np.bincount(bins[rim & gold], minlength=12)
+    return bool(np.count_nonzero(filled >= np.maximum(1, counts*.15)) >= 8)
+
+
+@lru_cache(maxsize=128)
+def _gold_coverage_geometry(w, h):
+    """Coverage and shape have different rims/bins; never combine formulas."""
+    yy, xx = np.ogrid[:h, :w]
+    dx, dy = (xx-(w-1)/2.)/max(1., w/2.), (yy-(h-1)/2.)/max(1., h/2.)
+    radial = dx*dx+dy*dy
+    angle = (np.arctan2(dy, dx)+2*math.pi) % (2*math.pi)
+    rim = (radial >= .45**2) & (radial <= 1.05**2)
+    sectors = np.minimum(11, (angle[rim]*6/math.pi).astype(np.intp))
+    totals = np.bincount(sectors, minlength=12)
+    for array in (rim, sectors, totals):
+        array.flags.writeable = False
+    return rim, sectors, totals
+
+
+def gold_ring_coverage(image, box):
+    """Small local descriptor, not a screen-position mask or a new detector."""
+    x, y, w, h = box
+    patch = image[y:y+h, x:x+w, :3]
+    if patch.size == 0 or min(w, h) < 8:
+        return None
+    rim, sectors, totals = _gold_coverage_geometry(w, h)
+    b, g, r = (patch[..., i].astype(np.int16) for i in range(3))
+    pale = (r >= 145) & (g >= 110) & (r >= b-20) & (r-g <= 100)
+    counts = np.bincount(sectors, weights=pale[rim], minlength=12)
+    return float(((totals > 0) & (counts >= totals*.25)).mean())

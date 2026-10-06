@@ -18,6 +18,8 @@ class TapTimingPolicy:
         self.lane_count = lane_count
 
     def action_advance_ms(self, track: NoteTrack) -> float:
+        if track.point_mode and track.timing_profile == 'yellow_head':
+            return self.config.hold_start_action_advance_ms
         if (
             track.dense_tap
             and not track.bonus_star
@@ -58,6 +60,8 @@ class TapTimingPolicy:
         track: NoteTrack | None,
         pending: list[MusicActionEvent],
     ) -> float:
+        if event.timing_profile == 'yellow_head':
+            return self.config.hold_start_execution_window_ms
         window = self.config.tap_execution_window_ms
         if event.event_id.startswith("center-color-") or (track is not None and track.bonus_star):
             return max(window, self.config.special_tap_execution_window_ms)

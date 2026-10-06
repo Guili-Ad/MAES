@@ -22,6 +22,8 @@ def main():
     sys.path.insert(0, str(args.branch_root))
     sys.path.insert(0, str(args.branch_root / 'tests'))
     import test_longtap_branch as cases
+    import test_hold_note_taps as small_notes
+    import test_sustain_chain as sustain
     from agent.music.tracking import MusicVisionEngine
     logging.disable(logging.CRITICAL)
     records = []
@@ -33,7 +35,7 @@ def main():
             def wrapper(*args, **kwargs):
                 result = method(*args, **kwargs)
                 for event in result:
-                    if event.gesture.value.startswith('Hold'):
+                    if event.gesture.value.startswith(('Hold', 'Sustain')) or event.event_id.startswith('holdnote-'):
                         records.append({'test': active[0], 'method': name, 'track': event.track_id,
                                         'gesture': event.gesture.value, 'lane': event.lane,
                                         'deadline': round(event.deadline, 9), 'coordinate': event.coordinate})
@@ -43,9 +45,14 @@ def main():
     names = [name for name in unittest.defaultTestLoader.getTestCaseNames(cases.LongTapBranchTests)
              if any(word in name for word in ('hold', 'tail', 'ribbon', 'route', 'sustain', 'cap_locked', 'terminal_target'))]
     result = unittest.TestResult()
-    for name in names:
-        active[0] = name
-        cases.LongTapBranchTests(name).run(result)
+    classes = [cases.LongTapBranchTests, small_notes.HoldNoteTapTests, sustain.SustainTrackerTests,
+               sustain.SustainPlannerTests, sustain.SustainRuntimeTests]
+    selected = [(cls, name) for cls in classes for name in unittest.defaultTestLoader.getTestCaseNames(cls)
+                if cls is not cases.LongTapBranchTests or name in names]
+    for cls, name in selected:
+        active[0] = cls.__name__ + '.' + name
+        cls(name).run(result)
+    names = [cls.__name__+'.'+name for cls, name in selected]
     payload = {'branch': str(args.branch_root), 'tests': names, 'records': records,
                'errors': [(str(case), error) for case, error in result.errors + result.failures]}
     args.output.parent.mkdir(parents=True, exist_ok=True)

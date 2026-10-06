@@ -13,12 +13,14 @@ def main():
     p.add_argument('--manifest', type=Path, required=True)
     p.add_argument('--calibration', type=Path, required=True)
     p.add_argument('--baseline', action='store_true')
-    p.add_argument('--baseline-root', type=Path, default=ROOT/'backup/hold-identity-v2')
+    p.add_argument('--baseline-root', type=Path, help='Required explicit immutable baseline source for --baseline')
     p.add_argument('--suffix', default=None)
     args = p.parse_args()
     manifest = args.manifest.resolve()
     if not manifest.is_relative_to(ROOT/'temp'):
         p.error('Song-specific manifests must remain under Double/temp')
+    if args.baseline and (args.baseline_root is None or not (args.baseline_root/'agent/music/tracking.py').is_file()):
+        p.error('--baseline requires an existing --baseline-root')
     root = args.baseline_root.resolve() if args.baseline else ROOT
     suffix = args.suffix or ('old' if args.baseline else 'new')
     if not suffix.replace('-', '').replace('_', '').isalnum():

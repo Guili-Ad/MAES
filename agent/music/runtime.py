@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import time
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 from agent.common import LOGGER, capture_image, is_stopping, recognition_hit, recognition_results
 
 from .calibration import image_size, load_calibration
-from .executor import MusicActionExecutor, MusicTouchError
+from .executor import MusicActionExecutor, MusicTouchError, FlickSubmission
 from .hold_policy import HoldTimingPolicy
 from .models import (
     BASE_HEIGHT,
@@ -35,18 +36,32 @@ from .storage import (
 from .tap_policy import TapTimingPolicy
 from .tap_dispatch import due_tap_batches
 from .tap_trace import TapTrace, VERSION
+from .build_identity import digest
+from .metrics import MetricSeries
+from .pause_gate import pause_overlay_possible
 from .tracking import MusicVisionEngine
 from .vision import MaaCandidateProvider, NumpyCandidateProvider, VisualMask, giant_live_title_present
 
 
 @dataclass
 class RuntimeMetrics:
-    capture: list[float] = field(default_factory=list)
-    provider: list[float] = field(default_factory=list)
-    perception_to_action: list[float] = field(default_factory=list)
-    capture_to_action: list[float] = field(default_factory=list)
-    terminal: list[float] = field(default_factory=list)
-    loop: list[float] = field(default_factory=list)
+    capture: MetricSeries = field(default_factory=MetricSeries)
+    provider: MetricSeries = field(default_factory=MetricSeries)
+    perception_to_action: MetricSeries = field(default_factory=MetricSeries)
+    capture_to_action: MetricSeries = field(default_factory=MetricSeries)
+    terminal: MetricSeries = field(default_factory=MetricSeries)
+    loop: MetricSeries = field(default_factory=MetricSeries)
+    mask: MetricSeries = field(default_factory=MetricSeries)
+    tracking: MetricSeries = field(default_factory=MetricSeries)
+    ocr: MetricSeries = field(default_factory=MetricSeries)
+    dispatch_wait: MetricSeries = field(default_factory=MetricSeries)
+    identity_refresh: MetricSeries = field(default_factory=MetricSeries)
+    latest_observation_to_action: MetricSeries = field(default_factory=MetricSeries)
+    latest_capture_to_action: MetricSeries = field(default_factory=MetricSeries)
+    head_recovery: MetricSeries = field(default_factory=MetricSeries)
+    pause_prefilter: MetricSeries = field(default_factory=MetricSeries)
+    missing_source_times: int = 0
+    missing_latest_source_times: int = 0
     tracks_created: int = 0
     tracks_retained_peak: int = 0
     tracks_expired: int = 0
@@ -55,9 +70,10 @@ class RuntimeMetrics:
     events_scheduled: int = 0
     isolated_same_lane_heads: int = 0
     unscheduled_head_losses: int = 0
+    pause_ocr_skipped: int = 0
 
     def summaries(self, action: list[float]) -> dict[str, dict[str, float | int]]:
-        return {
+        result = {
             "capture": metric_summary(self.capture[-60:]),
             "provider": metric_summary(self.provider[-60:]),
             "perception_to_action": metric_summary(self.perception_to_action[-60:]),
@@ -76,6 +92,22 @@ class RuntimeMetrics:
                 "unscheduled_head_losses": self.unscheduled_head_losses,
             },
         }
+        series = {name: getattr(self, name) for name in ('capture', 'provider', 'perception_to_action',
+                  'capture_to_action', 'terminal', 'loop', 'mask', 'tracking', 'ocr', 'dispatch_wait', 'identity_refresh',
+                  'latest_observation_to_action', 'latest_capture_to_action', 'head_recovery', 'pause_prefilter')}
+        if isinstance(action, MetricSeries):
+            series['action'] = action
+        for name in ('mask', 'ocr', 'dispatch_wait', 'latest_observation_to_action',
+                     'latest_capture_to_action', 'head_recovery', 'pause_prefilter'):
+            result[name] = metric_summary(series[name][-60:])
+        result['tracking_time'] = metric_summary(self.tracking[-60:])
+        result['whole_run'] = {name: values.summary() for name, values in series.items()}
+        result['diagnostics'] = {'missing_source_times': self.missing_source_times, 'recent_window_capacity': 60,
+                                 'pause_ocr_skipped': self.pause_ocr_skipped,
+                                 'missing_latest_source_times': self.missing_latest_source_times,
+                                 'time_semantics': 'host calls, not game judgments; legacy perception_to_action/'
+                                     'capture_to_action use event-source capture; latest_* use latest valid observation'}
+        return result
 
 
 def _task_id(argv: Any) -> int | None:
@@ -139,6 +171,8 @@ def _resolve_calibration(context: Any, config: MusicConfig, image: Any) -> Music
     expected = config.lane_count if config.lane_count in (7, 9) else 0
     if expected and lane_count == expected:
         return load_calibration(expected, image)
+    if expected and lane_count in (7, 9):
+        raise ValueError(f"Configured for {expected} lanes but the current live screen has {lane_count}")
     if expected and lane_count >= 4:
         LOGGER.warning(
             "Lane target recognition found %s targets but configuration expects %s lanes; "
@@ -152,6 +186,14 @@ def _resolve_calibration(context: Any, config: MusicConfig, image: Any) -> Music
     if lane_count in (7, 9):
         raise ValueError(f"Configured for {config.lane_count} lanes but the current live screen has {lane_count}")
     raise ValueError(f"Unable to confirm a 7- or 9-lane screen; recognized {lane_count} targets")
+
+
+class MusicCancelled(RuntimeError):
+    pass
+
+
+class MusicCandidateError(RuntimeError):
+    """Only mask/provider faults; tracking faults retain internal-error handling."""
 
 
 class MusicRuntime:
@@ -183,6 +225,7 @@ class MusicRuntime:
         self.tap_policy = TapTimingPolicy(config, config.lane_count or 7)
         self.hold_policy = HoldTimingPolicy(config)
         self.tap_trace = TapTrace(config)
+        self._dispatch_block_seen = {}  # diagnostic only, bounded to 256 keys
 
     def _failure(self, code: MusicFailureCode, reason: str, task_id: int | None = None) -> MusicRunResult:
         return MusicRunResult(
@@ -194,7 +237,31 @@ class MusicRuntime:
             controller_signature=self.signature,
             profile=self.calibration.profile_key if self.calibration else "",
             task_id=task_id,
+            identity=self.result_identity(),
         )
+
+    def result_identity(self) -> dict:
+        calibration_hash = digest(asdict(self.calibration)) if self.calibration else ''
+        self.tap_trace.calibration_hash = calibration_hash
+        effective = asdict(self.calibration) if self.calibration else None
+        if effective is not None:
+            effective.pop('created_at', None)
+        self.tap_trace.effective_calibration_hash = digest(effective) if effective is not None else ''
+        return {**self.tap_trace.identity, 'run_id': self.tap_trace.run_id,
+                'config_hash': self.tap_trace.config_hash, 'calibration_hash': calibration_hash,
+                'effective_calibration_hash': self.tap_trace.effective_calibration_hash,
+                'segment_id': self.tap_trace.segment_id, 'cleanup_failure': self.cleanup_failure}
+
+    def _check_cancelled(self) -> None:
+        if is_stopping(self.context):
+            raise MusicCancelled('User cancelled music play')
+
+    def _sleep_interruptibly(self, duration: float) -> None:
+        while duration > 0.0:
+            self._check_cancelled()
+            step = min(0.01, duration)
+            self.sleeper(step)
+            duration -= step
 
     def _record_head_action(
         self,
@@ -212,14 +279,44 @@ class MusicRuntime:
         )
 
     def _acknowledge_taps(self, receipts, events, engine, metrics):
+        from .hold_note_events import acknowledge_hold_note_event
         by_id = {event.event_id: event for event in events}
         for receipt in receipts:
+            if receipt.run_id and receipt.segment_id is not None and (receipt.run_id != self.tap_trace.run_id
+                                                   or receipt.segment_id != self.tap_trace.segment_id):
+                self.tap_trace.add('stale_receipt', event=receipt.event_id)
+                continue
             event = by_id.get(receipt.event_id)
             if event is None:
                 continue
-            self.tap_trace.add('input', event=event.event_id, group=event.tap_group_id,
-                               deadline=event.deadline, receipt=asdict(receipt))
             track = engine.tracks.get(event.track_id) if engine else None
+            latest = track.observations[-1] if track is not None and track.observations else None
+            marker = None
+            if engine is not None and event.origin == 'hold_note':
+                marker_id = engine.sustain_tracker.resolve_id(event.marker_id)
+                marker = engine.sustain_tracker.markers.get(marker_id)
+            marker_latest = marker.observations[-1] if marker is not None and marker.observations else None
+            observation = marker_latest if marker_latest is not None else latest
+            evidence = self._input_observation_fields(observation,
+                marker.first_seen_time if marker else track.first_seen_time if track else None,
+                receipt.down_call_started, event.deadline)
+            self.tap_trace.add('input', event=event.event_id, group=event.tap_group_id,
+                               physical_id=event.physical_id, visual_family=event.visual_family,
+                               timing_profile=event.timing_profile,
+                               deadline=event.deadline, receipt=asdict(receipt),
+                               origin=event.origin, owner=event.owner_id, marker=event.marker_id,
+                               raw_hit=(marker.predicted_hit(engine.calibration.trigger_progress) if marker
+                                        else track.predicted_hit_time if track else None),
+                               latest_box=latest.candidate.box if latest else None,
+                               source_capture_started=event.source_capture_started,
+                               source_capture_finished=event.source_capture_finished, **evidence)
+            if engine is not None and engine.config.hold_notes_as_taps and event.physical_id is not None:
+                from .point_events import point_registry
+                point_registry(engine).acknowledge(engine, event, receipt)
+            else:
+                acknowledge_hold_note_event(engine, event, receipt)
+            if engine is not None and engine.tap_hold_chain is not None:
+                engine.tap_hold_chain.acknowledge_head(event, receipt)
             if track is not None and event.gesture == NoteGesture.TAP and receipt.down_call_started is not None:
                 track.tap_input_started = receipt.down_call_started
                 track.tap_input_completed = receipt.up_call_finished
@@ -227,8 +324,207 @@ class MusicRuntime:
                                                else event.deadline + self.tap_policy.action_advance_ms(track) / 1000.)
             if receipt.down_call_finished is not None and receipt.down_call_started is not None:
                 self._record_head_action(event, receipt.down_call_started, engine)
-                metrics.perception_to_action.append(max(0., (receipt.down_call_started - event.source_capture_started) * 1000.))
-                metrics.capture_to_action.append(max(0., (receipt.down_call_started - event.source_capture_finished) * 1000.))
+                self._record_source_latency(event, receipt.down_call_started, metrics)
+                self._record_latest_latency(evidence, metrics)
+
+    @staticmethod
+    def _input_observation_fields(observation, first_seen, started, deadline):
+        def finite(value):
+            return value if isinstance(value, (float, int)) and math.isfinite(value) else None
+        latest = finite(observation.timestamp) if observation is not None else None
+        down = finite(started)
+        source_started = finite(getattr(observation, 'capture_started', None))
+        source_finished = finite(getattr(observation, 'capture_finished', None))
+        return {'first_seen_time': finite(first_seen), 'latest_visual_time': latest,
+            'latest_center': observation.center if observation is not None else None,
+            'latest_capture_started': source_started, 'latest_capture_finished': source_finished,
+            'visual_age_ms': (down-latest)*1000. if down is not None and latest is not None else None,
+            'deadline_lateness_ms': (down-deadline)*1000. if down is not None else None}
+
+    @staticmethod
+    def _record_latest_latency(evidence, metrics):
+        age = evidence['visual_age_ms']
+        if age is not None:
+            metrics.latest_observation_to_action.append(age)
+        finished = evidence['latest_capture_finished']
+        latest = evidence['latest_visual_time']
+        if finished is None or latest is None or age is None:
+            metrics.missing_latest_source_times += 1
+            return
+        metrics.latest_capture_to_action.append(age+(latest-finished)*1000.)
+
+    def _record_source_latency(self, event, started, metrics):
+        if event.source_capture_started is None or event.source_capture_finished is None:
+            metrics.missing_source_times += 1
+            return
+        metrics.perception_to_action.append((started - event.source_capture_started) * 1000.)
+        metrics.capture_to_action.append((started - event.source_capture_finished) * 1000.)
+
+    def _acknowledge_flicks(self, receipts, events, engine, metrics):
+        from .hold_note_events import hold_note_registry
+        by_id = {event.event_id: event for event in events}
+        for receipt in receipts:
+            if receipt.run_id and receipt.segment_id is not None and (
+                    receipt.run_id != self.tap_trace.run_id or receipt.segment_id != self.tap_trace.segment_id):
+                self.tap_trace.add('stale_receipt', event=receipt.event_id)
+                continue
+            event = by_id.get(receipt.event_id)
+            if event is None or receipt.down_call_started is None:
+                continue  # reserved, but never attempted: still belongs in queue
+            track = engine.tracks.get(event.track_id) if engine else None
+            last = track.observations[-1] if track and track.observations else None
+            if track is not None and track.point_mode:
+                from .flick_eligibility import motion_observations
+                moving = motion_observations(track)
+                last = moving[-1] if moving else None
+            evidence = self._input_observation_fields(last, track.first_seen_time if track else None,
+                                                     receipt.down_call_started, event.deadline)
+            if track is not None:
+                track.flick_input_started = receipt.down_call_started
+                track.flick_input_completed = receipt.up_call_finished
+            self.tap_trace.add('input', event=event.event_id, deadline=event.deadline,
+                origin='flick', track=event.track_id, lane=event.lane,
+                raw_hit=track.predicted_hit_time if track else None,
+                source_capture_started=event.source_capture_started,
+                source_capture_finished=event.source_capture_finished, receipt=asdict(receipt), **evidence)
+            if receipt.down_call_finished is not None:
+                self._record_head_action(event, receipt.down_call_started, engine)
+                self._record_source_latency(event, receipt.down_call_started, metrics)
+                self._record_latest_latency(evidence, metrics)
+            if engine and engine.tap_hold_chain:
+                engine.tap_hold_chain.completed_flick(event, receipt, hold_note_registry(engine))
+
+    def _execute_flick_session(self, executor, pending, engine, metrics):
+        attempted, offered = {}, {}
+        def collect(occupied, capacity):
+            del capacity  # executor keeps deferred events without claiming IDs
+            now = self.clock()
+            self._qualify_pending(pending, engine, now)
+            submissions = []
+            for event in pending:
+                if (self._staged_flick(event, executor)
+                        and event.deadline <= now and event.lane not in occupied):
+                    offered[event.event_id] = event
+                    submissions.append(FlickSubmission(FlickRequest(event.lane, *event.coordinate,
+                        event.gesture), event.event_id, event.track_id, event.deadline))
+            return submissions
+        def started(submission, receipt):
+            event = offered[submission.event_id]
+            attempted[event.event_id] = event
+            track = engine.tracks.get(event.track_id) if engine else None
+            if track is not None:
+                track.flick_input_started = receipt.down_call_started
+            pending[:] = [e for e in pending if e.event_id != event.event_id]
+            self.tap_trace.add('flick_started', event=event.event_id, lane=event.lane,
+                deadline=event.deadline, time=receipt.down_call_started)
+        def qualify(submission):
+            from .flick_eligibility import valid_flick_pending
+            event = offered[submission.event_id]
+            if valid_flick_pending(event, engine, self.clock(), self.tap_trace, stage='before-down'):
+                return None
+            pending[:] = [e for e in pending if e.event_id != event.event_id]
+            return 'arrow-authority-revoked'
+        initial = collect(getattr(executor, 'active_flick_lanes', ()), 0)
+        if not initial:
+            return
+        try:
+            receipts = executor.swipe_many(initial, collect_due=collect,
+                on_started=started, check_cancelled=self._check_cancelled,
+                qualify=qualify,
+                tick=lambda: self._flush_due_taps(executor, pending, engine, metrics))
+        except Exception as error:
+            self._acknowledge_flicks(getattr(error, 'receipts', ()), attempted.values(), engine, metrics)
+            raise
+        self._acknowledge_flicks(receipts, attempted.values(), engine, metrics)
+        for submission, reason in executor.last_flick_deferred:
+            self.tap_trace.add('flick_deferred', event=submission.event_id, lane=submission.request.lane,
+                time=self.clock(), reason=reason)
+
+    def _staged_flick(self, event, executor):
+        return (event.gesture in FLICK_GESTURES and hasattr(executor, 'swipe_many')
+                and not getattr(executor, 'async_flicks', False)
+                and (event.contact_policy != 'held_flick'
+                     or (self.config.hold_notes_as_taps
+                         and executor.hold_owner(event.lane) != event.track_id)))
+
+    @staticmethod
+    def _tap_resources_ready(executor):
+        capacity = getattr(executor, 'available_flick_contacts', 1)
+        if capacity <= 0:
+            return False
+        if (not getattr(executor, 'supports_multi_touch', True)
+                and (getattr(executor, 'active_contacts', {}) or getattr(executor, 'active_flick_lanes', ()) )):
+            return False
+        return True
+
+    @classmethod
+    def _persistent_resources_ready(cls, event, executor):
+        # An occupied persistent lane is handled by the existing owner guard
+        # or atomic same-lane handoff. It must not be stalled by its own contact.
+        return (event.lane in getattr(executor, 'active_contacts', {})
+                or cls._tap_resources_ready(executor))
+
+    def _qualify_pending(self, pending, engine, now):
+        if engine is None:
+            return
+        from .hold_note_events import refine_hold_note_events
+        from .pending_eligibility import valid_pending
+        from .flick_eligibility import valid_flick_pending
+        aliases = getattr(engine, 'tap_physical_aliases', {})
+        frame = getattr(self, '_dispatch_frame', None) or engine.last_frame
+        registry = None
+        if engine.config.hold_notes_as_taps:
+            from .point_events import point_registry
+            registry = point_registry(engine)
+        qualified = []
+        for event in refine_hold_note_events(engine, pending, now):
+            if not valid_flick_pending(event, engine, now, self.tap_trace, frame=frame):
+                continue
+            if event.track_id in aliases or not valid_pending(event, engine.tracks, self.config, now, self.tap_trace,
+                    sequence=engine.last_frame_sequence, min_speed=engine.coast_speed_threshold, frame=frame,
+                    coast_eligible=(lambda t: engine._coast_eligible(t, frame)) if frame else None):
+                if registry is not None:
+                    registry.cancel(event.event_id, 'dispatch-qualification')
+                continue
+            if registry is not None and event.physical_id is not None:
+                event = registry.revise(event)
+                if event is None:
+                    continue
+            qualified.append(event)
+        pending[:] = qualified
+
+    def _point_wait_needs_refresh(self, pending, engine, deadline, now):
+        """Do not knowingly outwait a point's existing observation budget."""
+        if engine is None or not engine.config.hold_notes_as_taps or deadline <= now:
+            return False
+        for event in pending:
+            if event.gesture in FLICK_GESTURES:
+                from .flick_eligibility import observation_budget, motion_observations
+                track = engine.tracks.get(event.track_id)
+                if track is not None and event.contact_policy != 'held_flick' and event.deadline <= deadline:
+                    history = motion_observations(track)
+                    latest = history[-1].timestamp if history else None
+                    budget = observation_budget(track)
+                    if latest is not None and deadline > latest+budget:
+                        self.tap_trace.add('flick_refresh_before_wait', time=now, event=event.event_id,
+                            deadline=event.deadline, latest_visual_time=latest, coast_budget=budget)
+                        return True
+            if event.deadline > deadline or event.physical_id is None:
+                continue
+            if event.origin == 'hold_note' and engine.tap_hold_chain is not None:
+                marker = engine.sustain_tracker.markers.get(event.marker_id)
+                latest = marker.last_seen_time if marker is not None else None
+                budget = engine.tap_hold_chain.coast_budget
+            else:
+                track = engine.tracks.get(event.track_id)
+                latest = track.observations[-1].timestamp if track is not None and track.observations else None
+                budget = self.config.coast_max_age_ms / 1000.
+            if latest is not None and deadline > latest + budget:
+                self.tap_trace.add('point_refresh_before_wait', time=now, event=event.event_id,
+                    physical_id=event.physical_id, deadline=event.deadline,
+                    latest_visual_time=latest, coast_budget=budget)
+                return True
+        return False
 
     def _flush_due_taps(
         self,
@@ -243,17 +539,42 @@ class MusicRuntime:
         this hook a tap or hold due in that window would fire tens of
         milliseconds late (recorded as Bad/Miss).  Taps are released with the
         usual chord rules; due hold starts/routes are dispatched through the
-        same owner-guarded path as the main loop.  Flicks intentionally stay
-        in ``pending`` so gestures never nest.
+        same owner-guarded path as the main loop. Other flicks stay in pending
+        here: the existing session collector interleaves them without nesting.
         """
         now = self.clock()
-        tap_batches = due_tap_batches(pending, now, engine)
+        self._qualify_pending(pending, engine, now)
+        locked = getattr(executor, 'active_flick_lanes', frozenset())
+        batches = due_tap_batches(pending, now, engine)
+        ready = self._tap_resources_ready(executor)
+        tap_batches = []
+        for batch in batches:
+            blocked = any(e.lane in locked for e in batch)
+            if ready and not blocked:
+                tap_batches.append(batch)
+                continue
+            reason = ('active-flick-lane' if blocked else 'no-free-contact'
+                      if getattr(executor, 'available_flick_contacts', 1) <= 0
+                      else 'single-touch-busy')
+            for event in batch:
+                key = (self.tap_trace.segment_id, event.event_id, reason)
+                if now-self._dispatch_block_seen.get(key, float('-inf')) < .25:
+                    continue
+                if len(self._dispatch_block_seen) >= 256 and key not in self._dispatch_block_seen:
+                    self._dispatch_block_seen.pop(next(iter(self._dispatch_block_seen)))
+                self._dispatch_block_seen[key] = now
+                self.tap_trace.add('tap_dispatch_blocked', event=event.event_id, lane=event.lane,
+                    time=now, deadline=event.deadline, reason=reason,
+                    occupied_lanes=sorted(locked), group=event.tap_group_id)
         fallback_holds = [
             event
             for event in pending
             if event.deadline <= now
             and event.gesture == NoteGesture.HOLD_START
-            and not executor.supports_holds
+            and event.lane not in locked
+            and (not executor.supports_holds or self.config.hold_notes_as_taps
+                 or self.config.hold_sustain_enabled)
+            and self._tap_resources_ready(executor)
         ]
         if tap_batches or fallback_holds:
             dispatched = [event for batch in tap_batches for event in batch] + fallback_holds
@@ -269,7 +590,7 @@ class MusicRuntime:
                     "Music tap deadlines were missed during a flick: %s",
                     [(event.track_id, round((now - event.deadline) * 1000.0, 1)) for event in late],
                 )
-            for batch in [*tap_batches, ([fallback_holds] if fallback_holds else [])]:
+            for batch in tap_batches + ([fallback_holds] if fallback_holds else []):
                 if not batch:
                     continue
                 try:
@@ -292,6 +613,12 @@ class MusicRuntime:
             event
             for event in pending
             if event.deadline <= now and event.gesture not in FLICK_GESTURES
+            and event.gesture != NoteGesture.TAP
+            and not (event.gesture == NoteGesture.HOLD_START and
+                     (self.config.hold_notes_as_taps or self.config.hold_sustain_enabled))
+            and event.lane not in locked
+            and not (event.gesture in {NoteGesture.SUSTAIN_PRESS, NoteGesture.HOLD_START}
+                     and not self._persistent_resources_ready(event, executor))
         ]
         if not due_holds:
             return
@@ -333,8 +660,8 @@ class MusicRuntime:
         if self.calibration is None:
             raise RuntimeError("Calibration is not loaded")
         if name == "maa":
-            return MaaCandidateProvider(self.context, self.calibration, self.config.candidate_iou_threshold, self.config.candidate_min_size)
-        return NumpyCandidateProvider(self.calibration, self.config.candidate_iou_threshold, self.config.candidate_min_size)
+            return MaaCandidateProvider(self.context, self.calibration, self.config.candidate_iou_threshold, self.config.candidate_min_size, self.config.split_stacked_notes)
+        return NumpyCandidateProvider(self.calibration, self.config.candidate_iou_threshold, self.config.candidate_min_size, self.config.split_stacked_notes)
 
     def provider_gate(self, first_frame: MusicFrame, task_id: int | None = None) -> MusicRunResult | None:
         if self.calibration is None:
@@ -477,7 +804,7 @@ class MusicRuntime:
             controller_signature=self.signature,
             advanced=advanced,
             multi_touch=multi_touch,
-            sleeper=self.sleeper,
+            sleeper=self._sleep_interruptibly,
             clock=self.clock,
         )
 
@@ -493,6 +820,17 @@ class MusicRuntime:
         receipts = executor.poll_inputs()
         if not receipts:
             return
+        current_receipts = []
+        for receipt in receipts:
+            if receipt.run_id and receipt.segment_id is not None and (
+                    receipt.run_id != self.tap_trace.run_id
+                    or receipt.segment_id != self.tap_trace.segment_id):
+                self.tap_trace.add('stale_receipt', event=receipt.event_id, source='async-poll')
+                continue
+            current_receipts.append(receipt)
+        # Event IDs are stable within a segment, not globally unique. Reject
+        # an old receipt BEFORE looking up/removing the current segment's ID.
+        receipts = current_receipts
         events = []
         for receipt in receipts:
             event = self._in_flight_taps.pop(receipt.event_id, None)
@@ -516,6 +854,7 @@ class MusicRuntime:
         LOGGER.info("Music pause detected; contacts released and tracking suspended until resume")
         capture_failures = 0
         live_confirmations = 0
+        terminal_confirmations = 0
         while True:
             if is_stopping(self.context):
                 return (
@@ -543,17 +882,27 @@ class MusicRuntime:
                     )
             else:
                 capture_failures = 0
-                if _recognize(self.context, "MusicPauseDialog", frame.image):
+                if giant_live_title_present(frame.image) or terminal_state(self.context, frame.image) == 'result':
+                    terminal_confirmations += 1
+                    if terminal_confirmations >= 2:
+                        return None, sequence, self.monotonic() - pause_started, MusicRunResult(
+                            status='succeeded', reason='Strict result transition detected while paused',
+                            task_id=task_id, identity=self.result_identity())
+                    live_confirmations = 0
+                elif _recognize(self.context, "MusicPauseDialog", frame.image):
+                    terminal_confirmations = 0
                     live_confirmations = 0
                 elif _live_screen(self.context, frame.image):
+                    terminal_confirmations = 0
                     live_confirmations += 1
                     if live_confirmations >= 2:
                         paused_seconds = self.monotonic() - pause_started
                         LOGGER.info("Music live screen returned after %.2f paused seconds; rebuilding note tracks", paused_seconds)
                         return frame, sequence, paused_seconds, None
                 else:
+                    terminal_confirmations = 0
                     live_confirmations = 0
-            self.sleeper(max(0.05, self.config.pause_check_interval_ms / 1000.0))
+            self._sleep_interruptibly(max(0.05, self.config.pause_check_interval_ms / 1000.0))
 
     def _record_hold_call(self, call, event, engine):
         started = self.clock()
@@ -577,21 +926,47 @@ class MusicRuntime:
         now: float,
         metrics: RuntimeMetrics,
         engine: MusicVisionEngine | None = None,
+        *,
+        wait: bool = True,
+        tap_wait_ms: float | None = None,
     ) -> None:
         # Candidate/hold-route refinement may have consumed tens of milliseconds
         # after the caller sampled ``now``.  Never precision-sleep from that stale
         # timestamp: doing so can turn an otherwise on-time isolated tap into the
         # single late action of a song.
         now = max(now, self.clock())
-        base_window = self.config.deadline_execution_window_ms / 1000.0
+        self._qualify_pending(pending, engine, now)
+        # A hold's larger eligibility window must not lend its blind wait to
+        # a mixed tap queue. Consider the earliest deadline of ALL pending
+        # events; filtering taps then sleeping to a later hold would still
+        # block the tap's next visual correction. Hold-only contracts retain
+        # their existing execution window.
+        if (wait and tap_wait_ms is not None and pending
+                and any(event.gesture == NoteGesture.TAP for event in pending)
+                and min(event.deadline for event in pending) > now + max(0., tap_wait_ms) / 1000.):
+            return
+        base_window = self.config.deadline_execution_window_ms / 1000.0 if wait else 0.0
         lookahead = base_window
         for event in pending:
             event_window = base_window
             track = engine.tracks.get(event.track_id) if engine is not None else None
-            if event.gesture in {NoteGesture.HOLD_START, NoteGesture.HOLD_CONTINUE, NoteGesture.HOLD_END}:
+            if wait and event.gesture in {
+                NoteGesture.HOLD_START,
+                NoteGesture.HOLD_CONTINUE,
+                NoteGesture.HOLD_END,
+                NoteGesture.SUSTAIN_PRESS,
+                NoteGesture.SUSTAIN_MOVE,
+                NoteGesture.SUSTAIN_RELEASE,
+            }:
                 event_window = self.hold_policy.execution_window_ms(event, track) / 1000.0
-            elif event.gesture == NoteGesture.TAP:
+            elif wait and event.gesture == NoteGesture.TAP:
                 event_window = self.tap_policy.execution_window_ms(event, track, pending) / 1000.0
+                if tap_wait_ms is not None:
+                    # Outside the existing capture guard, acquire another
+                    # frame rather than implicitly freezing an ordinary tap
+                    # for the entire 90 ms execution window. This is only a
+                    # wait budget: deadlines/advances/group freezes do not move.
+                    event_window = min(event_window, max(0., tap_wait_ms) / 1000.)
             if event.deadline <= now + event_window:
                 lookahead = max(lookahead, event_window)
         near = [event for event in pending if event.deadline <= now + lookahead]
@@ -599,19 +974,38 @@ class MusicRuntime:
             return
         earliest = min(event.deadline for event in near)
         if earliest > now:
-            delay = earliest - now
-            if delay > 0.008:
-                self.sleeper(delay - 0.006)
+            if self._point_wait_needs_refresh(near, engine, earliest, now):
+                return
+            wait_started = self.clock()
+            while earliest - self.clock() > 0.008:
+                self._check_cancelled()
+                self.sleeper(min(0.010, earliest - self.clock() - 0.006))
             while self.clock() < earliest:
-                pass
+                self._check_cancelled()
             now = self.clock()
-        tap_batches = due_tap_batches(pending, now, engine)
+            metrics.dispatch_wait.append((now - wait_started) * 1000.)
+            self._qualify_pending(pending, engine, now)
+            live = {event.event_id: event for event in pending}
+            near = [live[event.event_id] for event in near if event.event_id in live]
+        locked = getattr(executor, 'active_flick_lanes', frozenset())
+        tap_batches = ([batch for batch in due_tap_batches(pending, now, engine)
+                       if not any(e.lane in locked for e in batch)]
+                       if self._tap_resources_ready(executor) else [])
         allowed_taps = {e.event_id for batch in tap_batches for e in batch}
         due = [event for event in near if event.deadline <= now
+               and event.lane not in locked
+               and not (event.gesture in {NoteGesture.SUSTAIN_PRESS, NoteGesture.HOLD_START}
+                        and not self._persistent_resources_ready(event, executor))
+               and not (event.gesture == NoteGesture.HOLD_START and
+                   (self.config.hold_notes_as_taps or self.config.hold_sustain_enabled or not executor.supports_holds)
+                   and not self._tap_resources_ready(executor))
                and (event.gesture != NoteGesture.TAP or event.event_id in allowed_taps)]
         if not due:
             return
-        due_ids = {event.event_id for event in due}
+        staged_flicks = [event for event in due if self._staged_flick(event, executor)]
+        # A prepared contact or capacity deferral is not an attempted input.
+        # Only on_started consumes these standalone queue entries.
+        due_ids = {event.event_id for event in due if event not in staged_flicks}
         pending[:] = [event for event in pending if event.event_id not in due_ids]
         late = [event for event in due if (now - event.deadline) * 1000.0 > self.config.event_late_tolerance_ms]
         if late:
@@ -622,7 +1016,19 @@ class MusicRuntime:
                     for event in late
                 ],
             )
-        taps = [event for event in due if event.gesture == NoteGesture.TAP or (event.gesture == NoteGesture.HOLD_START and not executor.supports_holds)]
+        taps = [
+            event
+            for event in due
+            if event.gesture == NoteGesture.TAP
+            or (
+                event.gesture == NoteGesture.HOLD_START
+                and (
+                    not executor.supports_holds
+                    or self.config.hold_sustain_enabled
+                    or self.config.hold_notes_as_taps
+                )
+            )
+        ]
         if taps:
             fallback_holds = [e for e in taps if e.gesture == NoteGesture.HOLD_START]
             batches = tap_batches + ([fallback_holds] if fallback_holds else [])
@@ -641,18 +1047,27 @@ class MusicRuntime:
                         self._in_flight_taps[event.event_id] = event
                 else:
                     self._acknowledge_taps(receipts or [], batch, engine, metrics)
-            if engine is not None and not executor.supports_holds:
+            if engine is not None:
                 for event in taps:
                     if event.gesture != NoteGesture.HOLD_START:
                         continue
                     fallback_track = engine.tracks.get(event.track_id)
-                    if fallback_track is not None:
+                    if fallback_track is None:
+                        continue
+                    if not executor.supports_holds:
                         fallback_track.state = TrackState.RELEASED
+                    elif self.config.hold_sustain_enabled or self.config.hold_notes_as_taps:
+                        # The head is judged as a tap; the track stays live so
+                        # the sustained-chain / small-note planner can press or
+                        # tap the following notes.
+                        fallback_track.state = TrackState.HOLDING
         suppressed_tracks: set[int] = set()
         for event in due:
-            if event in taps:
+            if event in taps or event in staged_flicks:
                 continue
             self._dispatch_due_event(event, executor, engine, metrics, pending, suppressed_tracks)
+        if staged_flicks:
+            self._execute_flick_session(executor, pending, engine, metrics)
 
     def _dispatch_due_event(
         self,
@@ -665,6 +1080,46 @@ class MusicRuntime:
     ) -> None:
         """Owner-guarded dispatch of one due non-tap event (flicks included)."""
         if event.track_id in suppressed_tracks:
+            return
+        if event.gesture == NoteGesture.SUSTAIN_PRESS:
+            lane_owner = executor.hold_owner(event.lane)
+            if lane_owner == event.track_id:
+                return
+            if event.lane in executor.active_contacts:
+                LOGGER.warning(
+                    "Music sustain press skipped occupied lane=%s track=%s owner=%s owner_track=%s",
+                    event.lane,
+                    event.track_id,
+                    lane_owner,
+                    event.event_id,
+                )
+                return
+            self._record_hold_call(
+                lambda: executor.touch_down(event.lane, *event.coordinate, track_id=event.track_id),
+                event,
+                engine,
+            )
+            return
+        if event.gesture == NoteGesture.SUSTAIN_MOVE:
+            if executor.hold_owner(event.lane) != event.track_id:
+                return
+            self._record_hold_call(
+                lambda: executor.touch_move(event.lane, *event.coordinate, track_id=event.track_id),
+                event,
+                engine,
+            )
+            return
+        if event.gesture == NoteGesture.SUSTAIN_RELEASE:
+            self._record_hold_call(
+                lambda: executor.release_track(event.track_id),
+                event,
+                engine,
+            )
+            if event.contact_policy == "sustain_final" and engine is not None:
+                track = engine.tracks.get(event.track_id)
+                if track is not None:
+                    track.state = TrackState.RELEASED
+                    engine._retire_hold_end_flick(track)
             return
         owner = executor.hold_owner(event.lane)
         occupied = event.lane in executor.active_contacts
@@ -724,7 +1179,12 @@ class MusicRuntime:
             or (event.gesture in FLICK_GESTURES and event.contact_policy == "held_flick")
         )
         conflict = event.gesture == NoteGesture.HOLD_START and occupied
-        stale_followup = persistent_followup and owner != event.track_id
+        held_flick_event = event.gesture in FLICK_GESTURES and event.contact_policy == "held_flick"
+        stale_followup = (
+            persistent_followup
+            and owner != event.track_id
+            and not (self.config.hold_sustain_enabled and held_flick_event)
+        )
         if conflict or stale_followup:
             reason = "occupied" if conflict else "owner-mismatch"
             LOGGER.warning(
@@ -752,17 +1212,37 @@ class MusicRuntime:
                 event.gesture.value,
                 "held_flick" if event.contact_policy == "held_flick" else "standalone",
             )
+            held_flick = (
+                event.contact_policy == "held_flick"
+                and executor.hold_owner(event.lane) == event.track_id
+            )
+            if event.contact_policy == "held_flick" and not held_flick:
+                LOGGER.warning(
+                    "Music held flick had no owned contact; performing a standalone swipe lane=%s track=%s event=%s",
+                    event.lane,
+                    event.track_id,
+                    event.event_id,
+                )
             executor.swipe(
                 FlickRequest(
                     event.lane,
                     *event.coordinate,
                     event.gesture,
-                    already_down=event.contact_policy == "held_flick",
+                    already_down=held_flick,
                 ),
                 event_id=event.event_id,
-                track_id=event.track_id if event.contact_policy == "held_flick" else None,
+                track_id=event.track_id if held_flick else None,
                 tick=lambda: self._flush_due_taps(executor, pending, engine, metrics),
             )
+            if (
+                engine is not None
+                and self.config.hold_sustain_enabled
+                and event.event_id.startswith("sustain-flick-")
+            ):
+                track = engine.tracks.get(event.track_id)
+                if track is not None:
+                    track.state = TrackState.RELEASED
+                    engine._retire_hold_end_flick(track)
             self._record_head_action(event, action_started, engine)
         elif event.gesture == NoteGesture.HOLD_START:
             self._record_hold_call(lambda: executor.touch_down(event.lane, *event.coordinate, track_id=event.track_id), event, engine)
@@ -775,15 +1255,24 @@ class MusicRuntime:
             self._record_hold_call(lambda: executor.touch_move(event.lane, *event.coordinate, track_id=event.track_id), event, engine)
         elif event.gesture == NoteGesture.HOLD_END:
             self._record_hold_call(lambda: executor.touch_up(event.lane, track_id=event.track_id), event, engine)
-        if event.source_capture_started > 0.0:
-            metrics.perception_to_action.append(max(0.0, (action_started - event.source_capture_started) * 1000.0))
-        if event.source_capture_finished > 0.0:
-            metrics.capture_to_action.append(max(0.0, (action_started - event.source_capture_finished) * 1000.0))
+        self._record_source_latency(event, action_started, metrics)
 
     @staticmethod
     def pending_within(pending: list[MusicActionEvent], now: float, guard_ms: float) -> bool:
         limit = now + guard_ms / 1000.0
         return any(event.deadline <= limit for event in pending)
+
+    def pause_dialog_present(self, image: Any) -> bool:
+        started = time.perf_counter()
+        possible = pause_overlay_possible(image)
+        self.metrics.pause_prefilter.append((time.perf_counter()-started)*1000.)
+        if not possible:
+            self.metrics.pause_ocr_skipped += 1
+            return False
+        started = self.clock()
+        result = _recognize(self.context, "MusicPauseDialog", image)
+        self.metrics.ocr.append((self.clock() - started) * 1000.)
+        return result
 
     def _service_imminent_before_capture(
         self,
@@ -795,6 +1284,23 @@ class MusicRuntime:
         now = self.clock()
         if self.pending_within(pending, now, self.config.pre_capture_deadline_guard_ms):
             self._execute_due(executor, pending, now, metrics, engine)
+
+    def _observe_frame(self, engine, frame):
+        """One image/one update, reusable before OCR for pending point inputs."""
+        try:
+            started = self.clock()
+            visual = VisualMask.from_image(frame.image, self.calibration)
+            self.metrics.mask.append((self.clock()-started)*1000.)
+            started = self.clock()
+            candidates = self.provider.detect(frame, visual)
+            self.metrics.provider.append((self.clock()-started)*1000.)
+        except Exception as error:
+            raise MusicCandidateError(str(error)) from error
+        started = self.clock()
+        events = engine.update(frame, candidates, visual)
+        self.metrics.tracking.append((self.clock()-started)*1000.)
+        self.metrics.head_recovery.append(getattr(engine, 'last_head_recovery_ms', 0.0))
+        return events
 
     @staticmethod
     def chart_activity_present(
@@ -815,6 +1321,11 @@ class MusicRuntime:
             return True
         for track in engine.tracks.values():
             if track.state in {TrackState.HOLD_PENDING, TrackState.HOLDING}:
+                if engine.tap_hold_chain is not None and track.state == TrackState.HOLDING:
+                    from .tap_hold_chain import AnchorState
+                    anchor = engine.tap_hold_chain.anchors.get(track.track_id)
+                    if anchor is None or anchor.state != AnchorState.ACTIVE:
+                        continue  # dormant metadata cannot block strict end OCR
                 return True
             if track.state != TrackState.APPROACHING or not track.observations:
                 continue
@@ -873,6 +1384,8 @@ class MusicRuntime:
         pending: list[MusicActionEvent] = []
         try:
             executor = self._create_executor()
+            executor.begin_segment(self.tap_trace.run_id, 0)
+            self.result_identity()
             self.action_durations = executor.action_durations
             self._in_flight_taps: dict[str, MusicActionEvent] = {}
             engine = MusicVisionEngine(self.calibration, self.config, tap_trace=self.tap_trace)
@@ -887,6 +1400,7 @@ class MusicRuntime:
             capture_failures = 0
             provider_failures = 0
             performance_warned = False
+            resumed_frame = None
             while self.monotonic() - started < self.config.max_duration_seconds:
                 loop_started = self.clock()
                 if is_stopping(self.context):
@@ -894,16 +1408,14 @@ class MusicRuntime:
                 # A controller screencap now costs about 25--35 ms while the
                 # independent preview is active.  Do not start it when a known
                 # tap/head/tail is already closer than that capture boundary.
-                self._service_imminent_before_capture(executor, pending, self.metrics, engine)
-                self._poll_async_inputs(executor, engine, self.metrics)
-                frame, capture_ms = _capture_frame(
-                    self.context,
-                    sequence,
-                    self.clock,
-                    self.config.capture_timeout_ms,
-                )
-                sequence += 1
-                self.metrics.capture.append(capture_ms)
+                if resumed_frame is None:
+                    self._service_imminent_before_capture(executor, pending, self.metrics, engine)
+                    self._poll_async_inputs(executor, engine, self.metrics)
+                    frame, capture_ms = _capture_frame(self.context, sequence, self.clock, self.config.capture_timeout_ms)
+                    sequence += 1
+                    self.metrics.capture.append(capture_ms)
+                else:
+                    frame, resumed_frame = resumed_frame, None
                 if frame is None:
                     capture_failures += 1
                     if capture_failures >= self.config.max_capture_failures:
@@ -911,12 +1423,44 @@ class MusicRuntime:
                     continue
                 capture_failures = 0
                 now = self.clock()
-                executor.enforce_contact_limits()
+                executor.enforce_contact_limits(self.clock())
+                self._dispatch_frame = frame
+                giant_terminal = (now >= schedule_started + self.config.terminal_initial_delay_ms / 1000.0
+                                  and giant_live_title_present(frame.image))
+                prepared_events = None
+                if self.config.hold_notes_as_taps and not giant_terminal and any(
+                        e.physical_id is not None or (e.gesture in FLICK_GESTURES
+                            and e.origin == 'track' and e.contact_policy != 'held_flick')
+                        for e in pending):
+                    # Fresh pixels qualify every point family before any old
+                    # prediction can execute. An observed standalone arrow
+                    # has no point ID, but needs this same current-frame order.
+                    # Reuse this update after OCR; no
+                    # second warm-up, second fit or cross-frame visual cache.
+                    try:
+                        prepared_events = self._observe_frame(engine, frame)
+                        provider_failures = 0
+                    except MusicCandidateError as error:
+                        provider_failures += 1
+                        if provider_failures >= self.config.max_provider_failures:
+                            return self._failure(MusicFailureCode.CANDIDATE_FAILURE, f"Candidate Provider failed three times: {error}", task_id)
+                        continue
+                    pending.extend(prepared_events)
+                    pending.extend(engine.release_events(self.clock()))
+                    pending[:] = engine.refine_pending(pending, self.clock())
+                elif engine.tap_hold_chain is not None and any(e.origin == 'hold_note' for e in pending):
+                    # A newly acquired image must qualify physical rings before
+                    # frozen deadlines execute. Refresh once; engine.update
+                    # reuses the same frame watermark rather than warming twice.
+                    identity_started = self.clock()
+                    engine.tap_hold_chain.refresh(frame)
+                    self.metrics.identity_refresh.append((self.clock()-identity_started)*1000.)
                 # Service deadlines already predicted by prior frames before any
                 # relatively expensive UI recognition can block the action loop.
-                self._execute_due(executor, pending, now, self.metrics, engine)
+                if not (self.config.hold_notes_as_taps and giant_terminal):
+                    self._execute_due(executor, pending, self.clock(), self.metrics, engine, wait=False)
                 now = self.clock()
-                if now >= schedule_started + self.config.terminal_initial_delay_ms / 1000.0 and giant_live_title_present(frame.image):
+                if giant_terminal:
                     LOGGER.info("Music terminal detected by strict giant LIVE visual confirmation")
                     return MusicRunResult(
                         status="succeeded",
@@ -929,7 +1473,8 @@ class MusicRuntime:
                     )
                 if now >= next_pause_check:
                     next_pause_check = now + self.config.pause_check_interval_ms / 1000.0
-                    if _recognize(self.context, "MusicPauseDialog", frame.image):
+                    paused = self.pause_dialog_present(frame.image)
+                    if paused:
                         _resume_frame, sequence, paused_seconds, resume_failure = self._wait_until_resumed(executor, sequence, task_id)
                         if resume_failure is not None:
                             return resume_failure
@@ -938,6 +1483,10 @@ class MusicRuntime:
                         # soon as the countdown disappears, so resume from a clean
                         # tracker while preserving every ordinary tap parameter.
                         pending.clear()
+                        self._in_flight_taps.clear()
+                        self.tap_trace.segment_id += 1
+                        executor.begin_segment(self.tap_trace.run_id, self.tap_trace.segment_id)
+                        resumed_frame = _resume_frame
                         self.tap_trace.add('pause_reset', time=self.clock())
                         engine = MusicVisionEngine(self.calibration, self.config, tap_trace=self.tap_trace)
                         started += paused_seconds
@@ -949,17 +1498,13 @@ class MusicRuntime:
                         provider_failures = 0
                         continue
                 try:
-                    visual = VisualMask.from_image(frame.image, self.calibration)
-                    provider_started = self.clock()
-                    candidates = self.provider.detect(frame, visual)
-                    self.metrics.provider.append((self.clock() - provider_started) * 1000.0)
+                    new_events = self._observe_frame(engine, frame) if prepared_events is None else prepared_events
                     provider_failures = 0
-                except Exception as error:
+                except MusicCandidateError as error:
                     provider_failures += 1
                     if provider_failures >= self.config.max_provider_failures:
                         return self._failure(MusicFailureCode.CANDIDATE_FAILURE, f"Candidate Provider failed three times: {error}", task_id)
                     continue
-                new_events = engine.update(frame, candidates, visual)
                 self.metrics.tracks_created = max(self.metrics.tracks_created, engine.next_track_id - 1)
                 self.metrics.tracks_retained_peak = max(self.metrics.tracks_retained_peak, len(engine.tracks))
                 self.metrics.tracks_expired = engine.expired_track_count
@@ -968,7 +1513,8 @@ class MusicRuntime:
                 self.metrics.isolated_same_lane_heads = engine.isolated_same_lane_head_count
                 self.metrics.unscheduled_head_losses = engine.unscheduled_head_loss_count
                 self.metrics.events_scheduled += len(new_events)
-                pending.extend(new_events)
+                if prepared_events is None:
+                    pending.extend(new_events)
                 # Candidate, hold-tail and route analysis can consume 10--40 ms.
                 # Reusing the pre-analysis timestamp makes a near event appear
                 # outside its precision window, permits one more screenshot,
@@ -977,7 +1523,8 @@ class MusicRuntime:
                 dispatch_now = self.clock()
                 pending.extend(engine.release_events(dispatch_now))
                 pending = engine.refine_pending(pending, dispatch_now)
-                self._execute_due(executor, pending, dispatch_now, self.metrics, engine)
+                self._execute_due(executor, pending, dispatch_now, self.metrics, engine,
+                                  tap_wait_ms=self.config.pre_capture_deadline_guard_ms)
                 terminal_now = self.clock()
                 chart_active = self.chart_activity_present(engine, executor, pending, frame.sequence)
                 if chart_active:
@@ -1022,8 +1569,10 @@ class MusicRuntime:
                 if self.config.sample_interval_ms:
                     remaining = self.config.sample_interval_ms / 1000.0 - (self.clock() - loop_started)
                     if remaining > 0:
-                        self.sleeper(remaining)
+                        self._sleep_interruptibly(remaining)
             return self._failure(MusicFailureCode.SONG_TIMEOUT, "Maximum song duration exceeded", task_id)
+        except MusicCancelled as error:
+            return self._failure(MusicFailureCode.CANCELLED, str(error), task_id)
         except MusicTouchError as error:
             return self._failure(MusicFailureCode.TOUCH_BACKEND_FUSED, str(error), task_id)
         except Exception as error:
@@ -1038,6 +1587,9 @@ class MusicRuntime:
                     LOGGER.exception("Music contact cleanup failed")
                 self.tap_trace.add('input_fallbacks', reasons=executor.tap_fallbacks)
             try:
+                self.tap_trace.summary = {'metrics_ms': self.metrics.summaries(self.action_durations),
+                                          'cleanup_failure': self.cleanup_failure,
+                                          'provider': getattr(self.provider, 'name', '')}
                 path = self.tap_trace.write()
                 LOGGER.info('Music tap diagnostics run_id=%s path=%s dropped=%s', self.tap_trace.run_id, path, self.tap_trace.dropped)
             except Exception:
@@ -1058,6 +1610,7 @@ def run_preflight_action(context: Any, config: MusicConfig, argv: Any) -> MusicR
     else:
         runtime.metrics.capture.append(capture_ms)
         result = runtime.preflight(frame, _task_id(argv))
+    result.identity = runtime.result_identity()
     write_result(result)
     return result
 
@@ -1077,5 +1630,6 @@ def run_play_action(context: Any, config: MusicConfig, argv: Any) -> MusicRunRes
             _task_id(argv),
         )
     result.metrics_ms = runtime.metrics.summaries(runtime.action_durations)
+    result.identity = runtime.result_identity()
     write_result(result)
     return result

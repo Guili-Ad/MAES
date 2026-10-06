@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, replace
 from typing import Iterable
 
@@ -30,9 +31,11 @@ from .models import (
 from .tap_policy import TapTimingPolicy
 from .head_identity import unique_head_candidates
 from .hold_topology import ribbon_at_judgement
+from .sustain import SustainMarker, SustainMarkerTracker
+from .hold_marker_identity import HoldMarkerMotion, MarkerAssociationRequest
 from .tap_tracking import associate_taps, retire_converged_shadows
 from .tap_chords import TapChordManager, valid_tap_pair, coherent_tap_predictions
-from .tap_identity import retire_bonus_fragments, late_birth_ready, coastable_tap
+from .tap_identity import ordinary_tap, retire_bonus_fragments, late_birth_ready, coastable_tap
 from .tap_recovery import recover_masked_taps
 from .tap_trace import TapTrace
 from .vision import (
@@ -50,6 +53,17 @@ class LaneProjection:
     progress: float
     distance: float
     tangent: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class SustainTarget:
+    key: object
+    press_time: float
+    hit_time: float
+    end_time: float
+    lane: int
+    terminal: bool
+    flick: bool = False
 
 
 def project_to_polyline(point: tuple[float, float], line: list[list[float]]) -> tuple[float, float, tuple[float, float]]:
@@ -101,28 +115,8 @@ def regression_slope(observations: Iterable[TrackObservation], *, recency: bool 
     recent observations must dominate the estimate or the terminal speed is
     underestimated and taps land late.
     """
-    values = list(observations)
-    count = len(values)
-    if count < 2:
-        return 0.0
-    w_sum = 0.0
-    wx_sum = 0.0
-    wy_sum = 0.0
-    wxx_sum = 0.0
-    wxy_sum = 0.0
-    for index, observation in enumerate(values):
-        weight = float(index + 1) if recency else 1.0
-        x = observation.timestamp
-        y = observation.progress
-        w_sum += weight
-        wx_sum += weight * x
-        wy_sum += weight * y
-        wxx_sum += weight * x * x
-        wxy_sum += weight * x * y
-    denominator = w_sum * wxx_sum - wx_sum * wx_sum
-    if denominator <= 1e-9:
-        return 0.0
-    return (w_sum * wxy_sum - wx_sum * wy_sum) / denominator
+    from .motion import weighted_slope
+    return weighted_slope(observations, recency=recency)
 
 
 class MusicVisionEngine:
@@ -139,6 +133,9 @@ class MusicVisionEngine:
         # this occlusion cannot turn it into a terminal cap near TouchUp.
         self.previous_hold_tail_checkpoint_flags: list[bool] = []
         self.previous_hold_tail_terminal_streaks: list[int] = []
+        self.text_zones: list[tuple[float, float, float]] = []
+        self.frozen_sites: dict[tuple[int, int], set[int]] = {}
+        self.coast_speed_threshold = config.coast_min_speed
         self.center_color_track: NoteTrack | None = None
         self.center_color_serial = 0
         self.expired_track_count = 0
@@ -151,12 +148,23 @@ class MusicVisionEngine:
         self.tap_chords = TapChordManager(self.tap_policy, self.tap_trace)
         self.last_frame_sequence = 0
         self.hold_policy = HoldTimingPolicy(config)
+        self.sustain_tracker = SustainMarkerTracker(trigger_progress=calibration.trigger_progress)
+        self.tap_hold_chain = None
+        if config.hold_notes_as_taps:
+            from .tap_hold_chain import TapHoldChain
+            self.tap_hold_chain = TapHoldChain(self)
+            self.sustain_tracker = self.tap_hold_chain.tracker
+        self.previous_hold_tail_ids: list[int] = []
+        self.last_frame = None
+        self.tap_physical_aliases = {}
+        self.last_head_recovery_ms = 0.0
 
     def _new_track(self, lane: int, first_seen_time: float | None = None) -> NoteTrack:
         track = NoteTrack(
             track_id=self.next_track_id,
             lane=lane,
             first_seen_time=first_seen_time,
+            point_mode=self.config.hold_notes_as_taps,
         )
         self.tracks[track.track_id] = track
         self.next_track_id += 1
@@ -389,6 +397,8 @@ class MusicVisionEngine:
         only when it is not later than the hold's own (possibly over-extended)
         release estimate, which keeps later standalone flicks standalone.
         """
+        if self.config.hold_notes_as_taps:
+            return
         for hold in self.tracks.values():
             if hold.gesture != NoteGesture.HOLD_START:
                 continue
@@ -401,13 +411,50 @@ class MusicVisionEngine:
                     direction = bound.flick_direction
                     if direction in FLICK_GESTURES:
                         hold.hold_end_flick_direction = direction
+                    tolerance = self.config.hold_end_flick_bind_tolerance_ms / 1000.0
+                    if (
+                        self.config.hold_sustain_enabled
+                        and hold.hold_release_time is not None
+                        and bound.predicted_hit_time > hold.hold_release_time + tolerance
+                    ):
+                        LOGGER.info(
+                            "Music hold end flick unbound hold=%s lane=%s flick_track=%s hit=%.3f release=%.3f",
+                            hold.track_id,
+                            hold.lane,
+                            bound.track_id,
+                            bound.predicted_hit_time,
+                            hold.hold_release_time,
+                        )
+                        self.tap_trace.add(
+                            'hold_end_flick', time=frame.midpoint, frame=frame.sequence, track=hold.track_id,
+                            lane=hold.lane, direction=bound.flick_direction.value, color=bound.flick_color,
+                            source="unbound", flick_track=bound.track_id, hit=round(bound.predicted_hit_time, 3),
+                        )
+                        bound.hold_end_owner = None
+                        hold.hold_end_flick_track = None
+                        hold.hold_end_flick_arrival = None
+                        hold.hold_end_flick_direction = NoteGesture.UNKNOWN
                 continue
+            allowed_lanes = {hold.lane}
+            if self.config.hold_sustain_enabled:
+                allowed_lanes.update(hold.hold_route_lanes)
+                if hold.hold_target_lane is not None:
+                    allowed_lanes.add(hold.hold_target_lane)
+                if hold.hold_sustain_chain_lane is not None:
+                    allowed_lanes.add(hold.hold_sustain_chain_lane)
+                if hold.hold_tail_observations:
+                    allowed_lanes.add(hold.hold_tail_observations[-1].lane)
+            tolerance = (
+                self.config.hold_end_flick_bind_tolerance_ms / 1000.0
+                if self.config.hold_sustain_enabled
+                else 0.15
+            )
             candidates = [
                 track
                 for track in self.tracks.values()
                 if track.flick
                 and track.hold_end_owner is None
-                and track.lane == hold.lane
+                and track.lane in allowed_lanes
                 and track.state not in {TrackState.RELEASED, TrackState.LOST}
                 and not track.action_event_id
                 and track.predicted_hit_time is not None
@@ -421,7 +468,14 @@ class MusicVisionEngine:
                 )
                 and (
                     hold.hold_release_time is None
-                    or track.predicted_hit_time <= hold.hold_release_time + 0.15
+                    or track.predicted_hit_time <= hold.hold_release_time + tolerance
+                )
+                and (
+                    not self.config.hold_sustain_enabled
+                    or (
+                        hold.hold_release_time is not None
+                        and track.speed > self.config.static_speed_threshold
+                    )
                 )
                 and track.flick_direction in FLICK_GESTURES
             ]
@@ -669,10 +723,11 @@ class MusicVisionEngine:
     def _moving_hold_tails(
         self,
         tails: list[HoldTailDetection],
-    ) -> tuple[dict[int, tuple[float, float, int]], list[int], list[bool]]:
-        moving: dict[int, tuple[float, float, int]] = {}
+    ) -> tuple[dict[int, HoldMarkerMotion], list[int], list[bool], list[int]]:
+        moving: dict[int, HoldMarkerMotion] = {}
         current_streaks = [0] * len(tails)
         current_checkpoint_flags = [False] * len(tails)
+        current_ids = [0] * len(tails)
         terminal_streaks = [0] * len(tails)
         used_previous: set[int] = set()
         for index, tail in enumerate(tails):
@@ -689,8 +744,12 @@ class MusicVisionEngine:
                 best = min(matches, key=lambda item: (item[0], -item[2]))
                 previous_index = best[3]
                 used_previous.add(previous_index)
-                moving[index] = best[:3]
+                moving[index] = HoldMarkerMotion(best[0], best[1], best[2])
                 current_streaks[index] = best[2]
+                if previous_index < len(self.previous_hold_tail_ids) and self.previous_hold_tail_ids[previous_index]:
+                    current_ids[index] = self.previous_hold_tail_ids[previous_index]
+                else:
+                    current_ids[index] = self.sustain_tracker.allocate_id()
                 previous_checkpoint = (
                     self.previous_hold_tail_checkpoint_flags[previous_index]
                     if previous_index < len(self.previous_hold_tail_checkpoint_flags)
@@ -707,10 +766,88 @@ class MusicVisionEngine:
                 # before establishing checkpoint identity.  Once established,
                 # retain it through one-sided judgement-line occlusion.
                 current_checkpoint_flags[index] = (previous_checkpoint and terminal_streaks[index] < 2) or (multi_exit and previous_multi_exit)
+            else:
+                current_ids[index] = self.sustain_tracker.allocate_id()
         self._current_terminal_streaks = terminal_streaks
-        return moving, current_streaks, current_checkpoint_flags
+        self.previous_hold_tail_ids = current_ids
+        return moving, current_streaks, current_checkpoint_flags, current_ids
+
+    def _sustain_route_lanes(self, track: NoteTrack) -> set[int]:
+        lanes = {track.lane, self._hold_segment_source_lane(track)}
+        lanes.update(track.hold_route_lanes)
+        if track.hold_target_lane is not None:
+            lanes.add(track.hold_target_lane)
+        if track.hold_sustain_chain_lane is not None:
+            lanes.add(track.hold_sustain_chain_lane)
+        if track.hold_tail_observations:
+            lanes.add(track.hold_tail_observations[-1].lane)
+        return lanes
+
+    def _track_sustain_markers(
+        self,
+        frame: MusicFrame,
+        tails: list[HoldTailDetection],
+        moving: dict[int, HoldMarkerMotion],
+        current_ids: list[int],
+        active: list[NoteTrack],
+        belongs,
+    ) -> None:
+        minimum_frames = max(2, self.config.hold_tail_min_frames)
+        route_lanes = {track.track_id: self._sustain_route_lanes(track) for track in active}
+        requests: list[MarkerAssociationRequest] = []
+        for index, evidence in moving.items():
+            if evidence.consecutive_frames < minimum_frames:
+                continue
+            tail = tails[index]
+            marker_id = current_ids[index]
+            if not marker_id:
+                continue
+            prior_state = self.sustain_tracker.markers.get(self.sustain_tracker.resolve_id(marker_id))
+            best_track: NoteTrack | None = None
+            best_score: tuple[float, float] | None = None
+            for track in active:
+                if track.predicted_hit_time is None or frame.midpoint < track.predicted_hit_time - 0.25:
+                    continue
+                if not belongs(track, tail):
+                    continue
+                lanes = route_lanes[track.track_id]
+                gap = min(abs(tail.lane - lane) for lane in lanes) if lanes else 99
+                if gap > 1:
+                    continue
+                if (prior_state is not None and prior_state.owner == track.track_id
+                        and prior_state.fresh(frame.midpoint, .6)):
+                    # Established ribbon ownership outranks an equal-distance
+                    # neighbouring hold. It still requires a live HOLDING owner
+                    # and current ribbon/lane evidence, never a stale owner id.
+                    best_track = track
+                    break
+                score = (float(gap), float(tail.distance))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_track = track
+            owner = best_track.track_id if best_track is not None else None
+            requests.append(MarkerAssociationRequest(index, marker_id, tail, owner))
+        assignments = self.sustain_tracker.associate_frame(
+            requests, frame, eligible_owners={track.track_id for track in active})
+        for request in requests:
+            marker_id = assignments[request.index]
+            current_ids[request.index] = marker_id
+            tail, owner = request.detection, request.owner
+            state = self.sustain_tracker.observe(marker_id, tail, frame, owner=owner)
+            if not state.stable_logged and state.stable(self.config, frame.midpoint, self.calibration.trigger_progress):
+                state.stable_logged = True
+                self.tap_trace.add(
+                    'sustain_marker', time=frame.midpoint, frame=frame.sequence,
+                    marker=state.marker_id, owner=state.owner, lane=state.lane(),
+                    progress=round(state.observations[-1].progress, 3),
+                    hit=round(state.predicted_hit(self.calibration.trigger_progress) or 0.0, 3),
+                )
+        self.sustain_tracker.prune(frame.midpoint)
 
     def _update_active_hold_tails(self, frame: MusicFrame) -> None:
+        if self.tap_hold_chain is not None:
+            self.tap_hold_chain.refresh(frame)
+            return
         active = [
             track
             for track in self.tracks.values()
@@ -722,6 +859,7 @@ class MusicVisionEngine:
             self.previous_hold_tail_streaks = []
             self.previous_hold_tail_checkpoint_flags = []
             self.previous_hold_tail_terminal_streaks = []
+            self.previous_hold_tail_ids = []
             return
         # Gold rings are only visual *markers*.  Their surrounding ribbon
         # topology decides whether they are terminal caps (one exit) or sustain
@@ -732,7 +870,7 @@ class MusicVisionEngine:
                            markers=[(t.center, t.lane, t.topology, t.owner_lanes) for t in tails],
                            holds=[(t.track_id, t.lane, t.hold_target_lane, t.hold_release_time,
                                    t.hold_release_locked) for t in active])
-        moving, current_streaks, current_checkpoint_flags = self._moving_hold_tails(tails)
+        moving, current_streaks, current_checkpoint_flags, current_ids = self._moving_hold_tails(tails)
         used: set[int] = set()
 
         def belongs(track, tail):
@@ -747,6 +885,9 @@ class MusicVisionEngine:
                 lanes.add(track.hold_target_lane)
             return any(lane in tail.owner_lanes for lane in lanes)
 
+        if self.config.hold_sustain_enabled or self.config.hold_notes_as_taps:
+            self._track_sustain_markers(frame, tails, moving, current_ids, active, belongs)
+
         def usable_cap(tail):
             return tail.topology == 'terminal' or (not tail.topology and tail.ribbon_exit_count == 1)
 
@@ -758,7 +899,7 @@ class MusicVisionEngine:
             for index, tail in enumerate(tails)
             if current_checkpoint_flags[index]
             and index in moving
-            and moving[index][2] >= self.config.hold_tail_min_frames
+            and moving[index].consecutive_frames >= self.config.hold_tail_min_frames
         ]
         checkpoint_used: set[int] = set()
         for track in sorted(active, key=lambda item: item.predicted_hit_time or 0.0):
@@ -886,7 +1027,7 @@ class MusicVisionEngine:
                 if (
                     index in used
                     or index not in moving
-                    or moving[index][2] < self.config.hold_tail_min_frames
+                    or moving[index].consecutive_frames < self.config.hold_tail_min_frames
                     or current_checkpoint_flags[index]
                     or not usable_cap(tail)
                     or not belongs(track, tail)
@@ -896,7 +1037,7 @@ class MusicVisionEngine:
                 ):
                     continue
                 lane_gap = abs(tail.lane - target_lane)
-                choices.append((lane_gap * 0.30 + (1.0 - tail.progress) - moving[index][1] / 500.0, index, tail))
+                choices.append((lane_gap * 0.30 + (1.0 - tail.progress) - moving[index].delta_y_px / 500.0, index, tail))
             if not choices:
                 continue
             _score, index, tail = min(choices)
@@ -954,7 +1095,7 @@ class MusicVisionEngine:
                 for index, tail in enumerate(tails)
                 if index not in used
                 and index in moving
-                and moving[index][2] >= self.config.hold_tail_min_frames
+                and moving[index].consecutive_frames >= self.config.hold_tail_min_frames
                 and not current_checkpoint_flags[index]
                 and usable_cap(tail)
                 and tail.progress >= self.config.hold_tail_min_gap_progress
@@ -971,7 +1112,7 @@ class MusicVisionEngine:
                 tail = tails[tail_index]
                 hit_time = item.predicted_hit_time or frame.midpoint
                 expected_progress = min(0.75, max(0.0, (frame.midpoint - hit_time) / 1.4))
-                _motion_distance, motion_y, _motion_streak = moving[tail_index]
+                motion_y = moving[tail_index].delta_y_px
                 return (
                     abs(tail.progress - expected_progress)
                     + tail.distance / 250.0
@@ -1033,7 +1174,7 @@ class MusicVisionEngine:
                 if (
                     index in used
                     or index not in moving
-                    or moving[index][2] < 2
+                    or moving[index].consecutive_frames < 2
                     or current_checkpoint_flags[index]
                     or not usable_cap(tail)
                     or not belongs(track, tail)
@@ -1043,7 +1184,8 @@ class MusicVisionEngine:
                     or tail.progress > 0.88
                 ):
                     continue
-                motion_distance, motion_y, _motion_streak = moving[index]
+                motion_distance = moving[index].distance_px
+                motion_y = moving[index].delta_y_px
                 # Simultaneous symmetric holds expose two visually identical
                 # caps.  Prefer the cap whose provisional lane remains closest
                 # to this head; continuity takes over after the first match and
@@ -1140,6 +1282,37 @@ class MusicVisionEngine:
         self.previous_hold_tail_checkpoint_flags = current_checkpoint_flags
         self.previous_hold_tail_terminal_streaks = self._current_terminal_streaks
 
+    def _in_text_zone(self, center: tuple[float, float]) -> bool:
+        for zone_x, zone_y, radius in self.text_zones:
+            if math.hypot(center[0] - zone_x, center[1] - zone_y) <= radius:
+                return True
+        return False
+
+    def _update_text_zones(self, frame: MusicFrame) -> None:
+        from .stationary import update_stationary_evidence
+        return update_stationary_evidence(self, frame)
+
+    def _update_coast_threshold(self) -> None:
+        config = self.config
+        if not config.coast_adaptive_speed:
+            self.coast_speed_threshold = config.coast_min_speed
+            return
+        speeds = sorted(
+            track.speed
+            for track in self.tracks.values()
+            if track.gesture == NoteGesture.TAP
+            and len(track.observations) >= 3
+            and track.speed > 0.0
+        )
+        if len(speeds) < 4:
+            self.coast_speed_threshold = config.coast_speed_floor
+            return
+        median = speeds[len(speeds) // 2]
+        self.coast_speed_threshold = max(
+            config.coast_speed_floor,
+            min(config.coast_min_speed, config.coast_speed_ratio * median),
+        )
+
     def _associate_lane(
         self,
         lane: int,
@@ -1148,175 +1321,8 @@ class MusicVisionEngine:
         visual: VisualMask,
         recovered=None,
     ) -> None:
-        for track in self.tracks.values():
-            if (
-                track.lane == lane
-                and track.state in {TrackState.TAP_PENDING, TrackState.FLICK_PENDING}
-                and (
-                    (track.gesture == NoteGesture.TAP
-                     and track.tap_input_started is not None
-                     and track.tap_executed_hit_time is not None
-                     and frame.midpoint > track.tap_executed_hit_time + 0.12)
-                    or (track.gesture != NoteGesture.TAP and track.action_executed
-                        and track.predicted_hit_time is not None
-                        and frame.midpoint > track.predicted_hit_time + 0.12)
-                )
-            ):
-                track.state = TrackState.RELEASED
-        active_holds_outside_head_window = [
-            track
-            for track in self.tracks.values()
-            if track.lane == lane
-            and track.state in {TrackState.HOLD_PENDING, TrackState.HOLDING}
-            and not self.hold_policy.head_association_open(track, frame.midpoint)
-        ]
-        tracks = [
-            track
-            for track in self.tracks.values()
-            if track.lane == lane
-            and track.state not in {TrackState.RELEASED, TrackState.LOST}
-            and self.hold_policy.head_association_open(track, frame.midpoint)
-        ]
-        unmatched_tracks = set(track.track_id for track in tracks)
-        classification_cache = {}
-
-        def cached_flick(candidate):
-            # Directions are colour-classified at detection time.  Ordinary
-            # candidates never carry flick evidence, which restores the v0.1
-            # tap identity semantics exactly.
-            return candidate.flick_direction if candidate.variant == "flick" else NoteGesture.UNKNOWN
-
-        def cached_head_ratio(candidate):
-            key = ("head", candidate.box)
-            value = classification_cache.get(key)
-            if value is None:
-                value = hold_head_color_ratio(frame.image, candidate)
-                classification_cache[key] = value
-            return value
-
-        def safe_tap_candidate(candidate, projection):
-            return (candidate.variant != "bonus_star"
-                    and (not self.config.enable_holds or cached_head_ratio(candidate) < self.config.hold_head_color_ratio)
-                    and cached_flick(candidate) not in FLICK_GESTURES)
-
-        recovery_owners = {}
-        for tid, (candidate, projection) in (recovered or {}).items():
-            if projection.lane != lane or tid not in unmatched_tracks:
-                continue
-            x, y, w, h = candidate.box
-            covered = []
-            for entry in entries:
-                c, p = entry
-                cx, cy, cw, ch = c.box
-                overlap = max(0, min(x+w, cx+cw)-max(x, cx))*max(0, min(y+h, cy+ch)-max(y, cy))
-                if overlap >= .8*cw*ch and math.dist(c.center, candidate.center) < min(w,h)*.4:
-                    covered.append(entry)
-            if any(not safe_tap_candidate(*entry) for entry in covered):
-                continue
-            if len(covered) == 1 and math.dist(covered[0][0].center, candidate.center) < 4.:
-                # Full healthy contour: neither change its centre nor claim it.
-                continue
-            entries = [entry for entry in entries if entry not in covered]
-            entries.append((candidate, projection))
-            recovery_owners[id(candidate)] = tid
-        entries.sort(key=lambda item: (item[1].progress, item[0].center[0]), reverse=True)
-        owned = {i: recovery_owners[id(c)] for i, (c, _) in enumerate(entries) if id(c) in recovery_owners}
-        matches = associate_taps(tracks, entries, frame, self.config, safe_tap_candidate, self.tap_trace, owned)
-        for index, (candidate, projection) in enumerate(entries):
-            if index in matches:
-                track = matches[index]
-                unmatched_tracks.discard(track.track_id)
-            else:
-                track = self._new_track(lane, frame.midpoint)
-                if active_holds_outside_head_window:
-                    self.isolated_same_lane_head_count += 1
-                    LOGGER.info(
-                        "Music isolated incoming head from active hold lane=%s new_track=%s hold_tracks=%s progress=%.3f",
-                        lane,
-                        track.track_id,
-                        [item.track_id for item in active_holds_outside_head_window],
-                        projection.progress,
-                    )
-            observation = TrackObservation(
-                frame_sequence=frame.sequence,
-                timestamp=frame.midpoint,
-                center=candidate.center,
-                progress=projection.progress,
-                candidate=candidate,
-            )
-            track.observations.append(observation)
-            if track.first_seen_time is None:
-                track.first_seen_time = frame.midpoint
-            if candidate.variant == "bonus_star":
-                track.bonus_star = True
-            if candidate.variant == "flick":
-                track.flick = True
-                track.flick_direction = candidate.flick_direction
-                track.flick_color = candidate.flick_color
-            track.missed_frames = 0
-            track.tail_missing_frames = 0
-            self._update_motion(track)
-            if index in owned:
-                self.tap_trace.add('tap_mask_recovered', time=frame.midpoint, frame=frame.sequence,
-                                   track=track.track_id, box=candidate.box, progress=projection.progress,
-                                   raw_hit=track.predicted_hit_time)
-            flick = NoteGesture.UNKNOWN if track.bonus_star else cached_flick(candidate)
-            track.direction_evidence.append(flick)
-            if self.config.enable_holds and track.state not in {TrackState.RELEASED, TrackState.LOST}:
-                if track.bonus_star:
-                    hold_evidence = bonus_hold_ribbon_present(frame.image, candidate, projection.tangent)
-                else:
-                    head_ratio = cached_head_ratio(candidate)
-                    hold_evidence = head_ratio >= self.config.hold_head_color_ratio
-                if hold_evidence:
-                    track.hold_evidence_frames += 1
-                elif track.bonus_star:
-                    # The star head is shared by bonus taps and holds: a single
-                    # confirmed ribbon frame must not be erased by a later
-                    # occluded frame, or real bonus holds stay classified as
-                    # taps and lose their tails.
-                    pass
-                else:
-                    track.hold_evidence_frames = max(0, track.hold_evidence_frames - 1)
-            if (track.state == TrackState.TAP_PENDING and track.tap_input_started is None
-                    and self._hold_committed(track)):
-                # A queued event is not a physical press. Late structural
-                # evidence may promote this same head without a second input.
-                track.gesture = NoteGesture.HOLD_START
-                track.state = TrackState.HOLD_PENDING
-                self.tap_trace.add('head_promoted_to_hold', time=frame.midpoint,
-                                   track=track.track_id, event=track.action_event_id)
-            if not track.action_executed:
-                if self._hold_committed(track):
-                    # Two head observations are sufficient to press.  Tail tracking
-                    # refines release and route, but may no longer turn a real hold
-                    # into a 6-ms ordinary tap merely because its ribbon is diagonal
-                    # or its cap is still close to the spawn point.
-                    track.gesture = NoteGesture.HOLD_START
-                elif (len(track.direction_evidence) >= 2
-                        and len(set(track.direction_evidence)) == 1
-                        and flick in FLICK_GESTURES
-                        and track.speed > self.config.min_downward_progress):
-                    # A colour-tagged blob that never moved is a stage
-                    # decoration, not a flick note.
-                    track.gesture = flick
-                else:
-                    track.gesture = NoteGesture.TAP
-
-        for track_id in unmatched_tracks:
-            track = self.tracks[track_id]
-            track.missed_frames += 1
-            if track.state == TrackState.HOLDING:
-                track.tail_missing_frames += 1
-            elif track.state in {TrackState.TAP_PENDING, TrackState.HOLD_PENDING, TrackState.FLICK_PENDING}:
-                continue
-            elif self._coast_eligible(track, frame):
-                # The judgement text may hide the head for many frames; keep the
-                # track so its bounded prediction can still schedule the tap.
-                continue
-            elif track.missed_frames > self.config.track_lost_frames:
-                self._record_unscheduled_head_loss(track, frame, "visual-loss")
-                track.state = TrackState.LOST
+        from .association import associate_lane
+        return associate_lane(self, lane, entries, frame, visual, recovered)
 
     def _stabilize_dense_tap_timing(self, frame: MusicFrame) -> None:
         self.tap_policy.stabilize_dense_timing(self.tracks, frame)
@@ -1344,6 +1350,9 @@ class MusicVisionEngine:
                 not track.action_executed
                 or (track.gesture == NoteGesture.TAP
                     and track.state == TrackState.TAP_PENDING
+                    and track.tap_input_started is None)
+                or (track.point_mode and track.state == TrackState.TAP_PENDING
+                    and track.gesture == NoteGesture.HOLD_START
                     and track.tap_input_started is None)
                 # A bonus-star head becomes structurally recognisable a few
                 # frames after its ordinary partner.  Keep the still-visible
@@ -1502,8 +1511,13 @@ class MusicVisionEngine:
         schedule an input.  The strongest live sibling (already dispatched,
         then most observations, then lowest id) is the only one allowed.
         """
-        if not coastable_tap(track, self.config, now=frame.midpoint):
+        if not coastable_tap(track, self.config, now=frame.midpoint, min_speed=self.coast_speed_threshold):
             return False
+        if track.point_mode:
+            # Occlusion is evidence about an object, not about the lane index.
+            # Real dense siblings retain independent identities; proven aliases
+            # are resolved by the physical registry, not proximity/track age.
+            return True
         center = self.calibration.lane_count // 2
         if abs(track.lane - center) > 1:
             return False
@@ -1539,6 +1553,28 @@ class MusicVisionEngine:
         threshold = self.config.bonus_hold_min_evidence if track.bonus_star else 2
         return track.hold_evidence_frames >= threshold
 
+    def _point_rejected(self, track: NoteTrack, frame: MusicFrame, reason: str) -> bool:
+        """Explain unqueued points without a full-rate per-candidate log."""
+        if track.point_mode and track.gesture in {NoteGesture.TAP, NoteGesture.HOLD_START}:
+            from .point_events import point_registry
+            registry = point_registry(self)
+            track.physical_id = registry._identity('track', track.track_id)
+            seen = getattr(self, '_point_qualification_seen', None)
+            if seen is None:
+                seen = self._point_qualification_seen = {}
+            key = (track.track_id, reason)
+            previous = seen.get(key)
+            if previous is None or frame.midpoint - previous >= .25:
+                self.tap_trace.add('point_qualification', time=frame.midpoint, frame=frame.sequence,
+                    source='track', source_id=track.track_id, physical_id=track.physical_id,
+                    family=track.visual_family, timing_profile=track.timing_profile,
+                    reason=reason, latest_visual_time=(track.observations[-1].timestamp
+                        if track.observations else None), raw_hit=track.predicted_hit_time)
+                seen[key] = frame.midpoint
+                if len(seen) > 256:
+                    seen.pop(next(iter(seen)))
+        return False
+
     def _ready_to_schedule(self, track: NoteTrack, frame: MusicFrame) -> bool:
         if (
             track.action_executed
@@ -1548,6 +1584,16 @@ class MusicVisionEngine:
             return False
         observations = list(track.observations)
         last = observations[-1] if observations else None
+        if self.config.hold_notes_as_taps and track.gesture in FLICK_GESTURES:
+            from .flick_eligibility import failure_reason, record_rejection
+            reason = failure_reason(track, frame.midpoint, sequence=frame.sequence, frame=frame)
+            if reason is not None:
+                record_rejection(track, reason, frame.midpoint, self.tap_trace,
+                                 stage='birth', sequence=frame.sequence, event=track.action_event_id)
+                return False
+        from .tap_identity import tap_structure_ready
+        if not tap_structure_ready(track, frame):
+            return self._point_rejected(track, frame, 'head-physical-evidence-unqualified')
         coast_ready = last is not None and self._coast_eligible(track, frame)
         # A prediction is useful for a short visual dropout, but never after a
         # track has been absent for the full lost-frame window.  This is the
@@ -1555,9 +1601,9 @@ class MusicVisionEngine:
         # Coast-eligible tracks keep their bounded prediction while the
         # judgement text tints/fragments the centre-lane pixels.
         if last is None or (frame.sequence - last.frame_sequence > 2 and not coast_ready):
-            return False
-        if not coast_ready and not late_birth_ready(track, lambda c: assign_lane(c, self.calibration)):
-            return False
+            return self._point_rejected(track, frame, 'head-observation-frame-budget-exceeded')
+        if (track.point_mode or not coast_ready) and not late_birth_ready(track, lambda c: assign_lane(c, self.calibration)):
+            return self._point_rejected(track, frame, 'head-birth-motion-unqualified')
         standard_ready = len(observations) >= 4 or coast_ready
         scheduled_hit_time = (
             self.tap_policy.hit_time(track)
@@ -1574,9 +1620,9 @@ class MusicVisionEngine:
         else:
             urgent_ready = False
         if not standard_ready and not urgent_ready:
-            return False
+            return self._point_rejected(track, frame, 'head-sample-budget-unqualified')
         if track.speed < self.config.min_downward_progress:
-            return False
+            return self._point_rejected(track, frame, 'head-motion-speed-unqualified')
         if scheduled_hit_time - frame.midpoint > self.config.max_schedule_horizon_ms / 1000.0:
             return False
         if not 0.35 <= last.progress < 0.99:
@@ -1589,6 +1635,7 @@ class MusicVisionEngine:
 
     def update(self, frame: MusicFrame, candidates: Iterable[MusicCandidate], visual: VisualMask) -> list[MusicActionEvent]:
         self.last_frame_sequence = frame.sequence
+        self.last_frame = frame
         self._expire_approaching_tracks(frame)
         ordinary_candidates = list(candidates)
         bonus_candidates = detect_bonus_star_notes(frame.image, self.calibration) if self.config.enable_holds else []
@@ -1624,6 +1671,8 @@ class MusicVisionEngine:
         special_events: list[MusicActionEvent] = []
         if self.config.enable_holds:
             special_candidate, special_events = self._update_center_color_note(frame, bonus_candidates)
+        self._update_text_zones(frame)
+        self._update_coast_threshold()
         by_lane: dict[int, list[tuple[MusicCandidate, LaneProjection]]] = {lane: [] for lane in range(self.calibration.lane_count)}
         for candidate in [*ordinary_candidates, *bonus_candidates]:
             if special_candidate is not None:
@@ -1633,17 +1682,41 @@ class MusicVisionEngine:
             projection = assign_lane(candidate, self.calibration)
             if projection is not None:
                 by_lane[projection.lane].append((candidate, projection))
+        recovery_started = time.perf_counter()
         recovered = recover_masked_taps(self.tracks, frame, self.calibration,
-                                        lambda c: assign_lane(c, self.calibration))
+                                        lambda c: assign_lane(c, self.calibration),
+                                        entries=[item for lane_entries in by_lane.values() for item in lane_entries],
+                                        trace=self.tap_trace)
+        self.last_head_recovery_ms = (time.perf_counter()-recovery_started)*1000.
         for lane, entries in by_lane.items():
             entries = unique_head_candidates(entries, self.tap_trace, frame)
             self._associate_lane(lane, entries, frame, visual, recovered)
+        from .tap_physical_identity import reconcile_tap_identities
+        aliases = reconcile_tap_identities(self.tracks, frame, self.config, self.tap_trace)
+        self.tap_physical_aliases.update(aliases)
+        if self.config.hold_notes_as_taps:
+            from .point_events import point_registry
+            registry = point_registry(self)
+            for shadow, canonical in aliases.items():
+                registry.bind_track_source(shadow, canonical, frame.midpoint)
+        for owner_id in set(aliases.values()):
+            self._update_motion(self.tracks[owner_id])
         self._update_linked_tap_pairs(frame)
         retire_converged_shadows(self.tracks, frame, self.tap_trace)
         self._stabilize_dense_tap_timing(frame)
         self._bind_hold_end_flicks(frame)
+        point_shadows = set()
+        if self.tap_hold_chain is not None:
+            # Both visual adapters must see this screenshot before either can
+            # register a click. refresh() is frame-watermarked; the legacy
+            # compatibility path and the end-of-frame binding remain intact.
+            self.tap_hold_chain.refresh(frame)
+            from .point_sources import reconcile_point_sources
+            point_shadows = reconcile_point_sources(self, frame)
         events: list[MusicActionEvent] = list(special_events)
         for track in sorted(self.tracks.values(), key=lambda item: item.track_id):
+            if track.track_id in point_shadows:
+                continue
             if track.hold_end_owner is not None:
                 # A ribbon-tip flick bound to a hold never swipes on its own;
                 # its prediction drives the hold's held-flick release instead.
@@ -1674,8 +1747,13 @@ class MusicVisionEngine:
                     continue
                 event_hit_time = (track.predicted_hit_time + partner.predicted_hit_time) / 2.0
             event_id = f"track-{track.track_id}@{int(event_hit_time * 1000)}"
+            if self.config.hold_notes_as_taps and track.gesture in FLICK_GESTURES and track.action_event_id:
+                event_id = track.action_event_id  # dormant reappearance is not another arrow
             track.action_event_id = event_id
-            if track.gesture == NoteGesture.HOLD_START:
+            point_head = self.config.hold_notes_as_taps and track.gesture in {NoteGesture.TAP, NoteGesture.HOLD_START}
+            if point_head:
+                track.state = TrackState.TAP_PENDING
+            elif track.gesture == NoteGesture.HOLD_START:
                 start_deadline = track.predicted_hit_time - self.hold_policy.action_advance_ms(track) / 1000.0
                 duplicate = next(
                     (
@@ -1727,15 +1805,23 @@ class MusicVisionEngine:
                 event_id=event_id,
                 track_id=track.track_id,
                 lane=track.lane,
-                gesture=track.gesture,
+                gesture=NoteGesture.TAP if point_head else track.gesture,
                 deadline=event_hit_time - advance_ms / 1000.0,
                 coordinate=(int(point[0]), int(point[1])),
                 direction=track.gesture if track.gesture in FLICK_GESTURES else NoteGesture.UNKNOWN,
-                contact_policy="persistent" if track.gesture == NoteGesture.HOLD_START else "auto",
+                contact_policy="persistent" if track.gesture == NoteGesture.HOLD_START and not point_head else "auto",
                 source_capture_started=frame.capture_started,
                 source_capture_finished=frame.capture_finished,
-                tap_reference_hit_time=event_hit_time if track.gesture == NoteGesture.TAP else None,
+                tap_reference_hit_time=event_hit_time if track.gesture == NoteGesture.TAP or point_head else None,
             ))
+            if point_head:
+                adopted = registry.adopt_track(events.pop(), track)
+                if adopted is None:
+                    track.action_executed = True
+                    continue
+                track.action_event_id = adopted.event_id
+                event_id = adopted.event_id
+                events.append(adopted)
             if linked_note and partner is not None and track.track_id < partner.track_id:
                 LOGGER.info(
                     "Music linked %s pair scheduled tracks=%s/%s shared_deadline=%.3f raw_skew_ms=%.1f",
@@ -1779,18 +1865,59 @@ class MusicVisionEngine:
                                    event=event_id, track=track.track_id, lane=track.lane,
                                    raw_hit=track.predicted_hit_time, deadline=events[-1].deadline,
                                    observations=[(o.timestamp, o.progress) for o in track.observations][-6:])
+            else:
+                self.tap_trace.add('head_scheduled', frame=frame.sequence, time=frame.midpoint,
+                                   event=event_id, track=track.track_id, lane=track.lane,
+                                   gesture=track.gesture.value, raw_hit=track.predicted_hit_time,
+                                   deadline=events[-1].deadline,
+                                   observations=[(o.timestamp,o.progress) for o in track.observations][-6:])
         if self.config.enable_holds:
             self._update_active_hold_tails(frame)
-            self._synchronize_linked_hold_releases(frame)
+            if self.tap_hold_chain is not None:
+                # Pending-gold qualification may already have consumed this
+                # screenshot before head association. Bind newly found flicks
+                # after association without recording a second gold sample.
+                self.tap_hold_chain.bind_flicks(frame)
+            if self.tap_hold_chain is None:
+                self._synchronize_linked_hold_releases(frame)
         self._prune_terminal_tracks(frame)
         return events
 
     def refine_pending(self, pending: list[MusicActionEvent], now: float) -> list[MusicActionEvent]:
         """Refresh every not-yet-due deadline from the latest per-track predictions."""
+        from .hold_note_events import refine_hold_note_events
+        from .pending_eligibility import valid_pending
+        pending = refine_hold_note_events(self, pending, now)
+        registry = None
+        if self.config.hold_notes_as_taps:
+            from .point_events import point_registry
+            registry = point_registry(self)
         maximum_age = self.config.max_schedule_horizon_ms / 1000.0 + 0.5
         refined: list[MusicActionEvent] = []
         for event in pending:
-            if event.source_capture_finished > 0.0 and now - event.source_capture_finished > maximum_age:
+            if event.track_id in self.tap_physical_aliases:
+                self.tap_trace.add('cancelled', time=now, event=event.event_id,
+                    track=event.track_id, reason='physical-alias-unstarted-shadow',
+                    owner=self.tap_physical_aliases[event.track_id])
+                if registry is not None:
+                    registry.cancel(event.event_id, 'physical-alias-unstarted-shadow')
+                continue
+            if event.origin == 'hold_note':
+                refined.append(event)
+                continue
+            from .flick_eligibility import valid_flick_pending
+            if not valid_flick_pending(event, self, now, self.tap_trace, stage='planning'):
+                continue
+            if not valid_pending(event, self.tracks, self.config, now, self.tap_trace,
+                                 sequence=self.last_frame_sequence, min_speed=self.coast_speed_threshold,
+                                 frame=self.last_frame,
+                                 coast_eligible=(lambda t: self._coast_eligible(t, self.last_frame))
+                                     if self.last_frame else None):
+                if registry is not None:
+                    registry.cancel(event.event_id, 'pending-qualification')
+                continue
+            original_event = event
+            if event.source_capture_finished is not None and now - event.source_capture_finished > maximum_age:
                 track = self.tracks.get(event.track_id)
                 if track is not None and track.state in {TrackState.TAP_PENDING, TrackState.FLICK_PENDING}:
                     track.state = TrackState.RELEASED
@@ -1811,7 +1938,7 @@ class MusicVisionEngine:
                 continue
             track = self.tracks.get(event.track_id)
             if track is not None:
-                if (event.gesture == NoteGesture.TAP and track.gesture == NoteGesture.HOLD_START
+                if (not self.config.hold_notes_as_taps and event.gesture == NoteGesture.TAP and track.gesture == NoteGesture.HOLD_START
                         and track.state == TrackState.HOLD_PENDING and track.tap_input_started is None):
                     event = replace(event, gesture=NoteGesture.HOLD_START, contact_policy='persistent',
                                     tap_group_id=None, tap_frozen=False)
@@ -1854,6 +1981,13 @@ class MusicVisionEngine:
                         coordinate=(int(target[0]), int(target[1])),
                     )
                 elif (
+                    event.gesture == NoteGesture.SUSTAIN_RELEASE
+                    and event.event_id
+                    and event.event_id == track.hold_sustain_release_event_id
+                    and track.hold_sustain_release_time is not None
+                ):
+                    event = replace(event, deadline=track.hold_sustain_release_time)
+                elif (
                     event.deadline > now + 0.02
                     and event.gesture in {NoteGesture.HOLD_START, *FLICK_GESTURES}
                     and track.predicted_hit_time is not None
@@ -1872,10 +2006,304 @@ class MusicVisionEngine:
                         ):
                             hit_time = (hit_time + partner.predicted_hit_time) / 2.0
                     event = replace(event, deadline=hit_time - advance)
+            if event.gesture != NoteGesture.TAP and event.deadline != original_event.deadline:
+                latest = track.observations[-1] if track is not None and track.observations else None
+                self.tap_trace.add('head_refine', time=now, event=event.event_id,
+                                   gesture=event.gesture.value, before=original_event.deadline,
+                                   deadline=event.deadline, raw_hit=track.predicted_hit_time if track else None,
+                                   latest_visual_time=latest.timestamp if latest else None,
+                                   latest_box=latest.candidate.box if latest else None)
             refined.append(event)
-        return self.tap_chords.refine(refined, self.tracks, now, self.last_frame_sequence)
+        # Gold rings have their own owner, shared deadlines and freeze state;
+        # the ordinary TAP manager must never reinterpret their negative ids.
+        ordinary = self.tap_chords.refine([e for e in refined if e.origin != 'hold_note'],
+                                         self.tracks, now, self.last_frame_sequence)
+        by_id = {e.event_id: e for e in ordinary}
+        result = [e if e.origin == 'hold_note' else by_id[e.event_id] for e in refined
+                  if e.origin == 'hold_note' or e.event_id in by_id]
+        if registry is not None:
+            result = [updated for event in result
+                      if (updated := registry.revise(event) if event.physical_id is not None else event) is not None]
+        return result
+
+    def _lane_point(self, lane: int) -> tuple[int, int]:
+        point = self.calibration.points[lane]
+        return (int(point[0]), int(point[1]))
+
+    def _sustain_press_event(self, track: NoteTrack, target: SustainTarget, now: float) -> MusicActionEvent:
+        deadline = target.press_time
+        if deadline < now:
+            deadline = now
+        return MusicActionEvent(
+            event_id=f"sustain-press-{track.track_id}-{target.key}",
+            track_id=track.track_id,
+            lane=target.lane,
+            gesture=NoteGesture.SUSTAIN_PRESS,
+            deadline=deadline,
+            coordinate=self._lane_point(target.lane),
+            contact_policy="sustain",
+        )
+
+    def _sustain_move_event(self, track: NoteTrack, target: SustainTarget, now: float) -> MusicActionEvent:
+        deadline = target.hit_time - self.config.hold_sustain_move_advance_ms / 1000.0
+        if deadline < now:
+            deadline = now
+        return MusicActionEvent(
+            event_id=f"sustain-move-{track.track_id}-{target.key}",
+            track_id=track.track_id,
+            lane=target.lane,
+            gesture=NoteGesture.SUSTAIN_MOVE,
+            deadline=deadline,
+            coordinate=self._lane_point(target.lane),
+            contact_policy="sustain",
+        )
+
+    def _sustain_flick_target(self, track: NoteTrack, now: float) -> SustainTarget | None:
+        if track.hold_end_flick_track is None or track.hold_end_flick_arrival is None:
+            return None
+        flick = self.tracks.get(track.hold_end_flick_track)
+        if flick is None:
+            return None
+        arrival = track.hold_end_flick_arrival
+        if arrival < now - 0.25:
+            return None
+        lead = max(
+            self.config.hold_sustain_press_advance_ms,
+            self.config.hold_sustain_move_advance_ms,
+        ) / 1000.0
+        return SustainTarget(
+            key="flick",
+            press_time=arrival - lead,
+            hit_time=arrival,
+            end_time=arrival,
+            lane=flick.lane,
+            terminal=True,
+            flick=True,
+        )
+
+    def _sustain_flick_event(self, track: NoteTrack, target: SustainTarget) -> MusicActionEvent:
+        direction = track.hold_end_flick_direction
+        if direction not in FLICK_GESTURES:
+            direction = self._hold_release_direction(track, target.hit_time, log=False)
+        if direction in FLICK_GESTURES:
+            return MusicActionEvent(
+                event_id=f"sustain-flick-{track.track_id}",
+                track_id=track.track_id,
+                lane=target.lane,
+                gesture=direction,
+                deadline=target.hit_time,
+                coordinate=self._lane_point(target.lane),
+                direction=direction,
+                contact_policy="held_flick",
+            )
+        return MusicActionEvent(
+            event_id=f"sustain-release-{track.track_id}",
+            track_id=track.track_id,
+            lane=target.lane,
+            gesture=NoteGesture.SUSTAIN_RELEASE,
+            deadline=target.hit_time,
+            coordinate=self._lane_point(target.lane),
+            contact_policy="sustain_final",
+        )
+
+    def _sustain_finalize_if_due(self, track: NoteTrack, now: float, events: list[MusicActionEvent]) -> None:
+        if track.hold_sustain_final_emitted or track.hold_sustain_chain_active:
+            return
+        deadline = track.hold_release_time
+        if deadline is None:
+            if track.predicted_hit_time is None:
+                return
+            fallback_ms = min(self.config.hold_fallback_duration_ms, self.config.hold_max_tail_ms)
+            deadline = track.predicted_hit_time + fallback_ms / 1000.0
+        last_activity = 0.0
+        if track.hold_tail_observations:
+            last_activity = max(last_activity, track.hold_tail_observations[-1].timestamp)
+        for marker in self.sustain_tracker.markers.values():
+            if marker.owner == track.track_id:
+                last_activity = max(last_activity, marker.last_seen_time)
+        if track.hold_sustain_release_time is not None:
+            last_activity = max(last_activity, track.hold_sustain_release_time)
+        grace = self.config.hold_sustain_release_delay_ms / 1000.0
+        if now < deadline - 0.02 or now < last_activity + grace:
+            return
+        lane = track.hold_sustain_chain_lane if track.hold_sustain_chain_lane is not None else track.lane
+        events.append(MusicActionEvent(
+            event_id=f"sustain-release-{track.track_id}",
+            track_id=track.track_id,
+            lane=lane,
+            gesture=NoteGesture.SUSTAIN_RELEASE,
+            deadline=max(now, deadline),
+            coordinate=self._lane_point(lane),
+            contact_policy="sustain_final",
+        ))
+        track.hold_sustain_final_emitted = True
+        self.tap_trace.add(
+            'sustain_finalize', time=now, track=track.track_id, lane=lane,
+            deadline=round(deadline, 3), last_activity=round(last_activity, 3),
+        )
+
+    def _plan_sustain_track(self, track: NoteTrack, now: float, events: list[MusicActionEvent]) -> None:
+        if track.hold_sustain_final_emitted:
+            return
+        config = self.config
+        advance = config.hold_sustain_press_advance_ms / 1000.0
+        window = config.hold_sustain_press_hold_ms / 1000.0
+        merge_gap = config.hold_sustain_merge_gap_ms / 1000.0
+        release_delay = config.hold_sustain_release_delay_ms / 1000.0
+        if track.hold_release_time is None and track.predicted_hit_time is not None:
+            fallback_ms = min(config.hold_fallback_duration_ms, config.hold_max_tail_ms)
+            track.hold_release_time = track.predicted_hit_time + fallback_ms / 1000.0
+
+        targets: list[SustainTarget] = []
+        for marker in self.sustain_tracker.targets(track.track_id, config, now):
+            if marker.marker_id in track.hold_sustain_planned_ids:
+                continue
+            hit = marker.predicted_hit(self.calibration.trigger_progress)
+            lane = marker.lane()
+            if hit is None or lane is None:
+                continue
+            targets.append(SustainTarget(
+                key=marker.marker_id,
+                press_time=hit - advance,
+                hit_time=hit,
+                end_time=hit + window,
+                lane=lane,
+                terminal=marker.is_terminal(),
+            ))
+        flick = self._sustain_flick_target(track, now)
+        if flick is not None and flick.key not in track.hold_sustain_planned_ids:
+            targets.append(flick)
+        if (
+            (track.hold_release_locked or track.hold_tail_observations)
+            and track.hold_release_time is not None
+            and track.hold_end_flick_track is None
+            and "tail" not in track.hold_sustain_planned_ids
+        ):
+            tail_hit = track.hold_release_time
+            if track.hold_tail_observations:
+                tail_lane = track.hold_tail_observations[-1].lane
+            elif track.hold_target_lane is not None:
+                tail_lane = track.hold_target_lane
+            else:
+                tail_lane = track.lane
+            targets.append(SustainTarget(
+                key="tail",
+                press_time=tail_hit - advance,
+                hit_time=tail_hit,
+                end_time=tail_hit + window + release_delay,
+                lane=tail_lane,
+                terminal=False,
+            ))
+        targets.sort(key=lambda item: item.press_time)
+
+        if track.hold_sustain_chain_active and track.hold_sustain_release_time is not None:
+            if now >= track.hold_sustain_release_time:
+                track.hold_sustain_chain_active = False
+                track.hold_sustain_release_time = None
+                track.hold_sustain_release_event_id = ""
+            else:
+                for target in targets:
+                    if target.press_time > track.hold_sustain_release_time + merge_gap:
+                        break
+                    if target.lane != track.hold_sustain_chain_lane:
+                        events.append(self._sustain_move_event(track, target, now))
+                        track.hold_sustain_chain_lane = target.lane
+                    track.hold_sustain_release_time = max(track.hold_sustain_release_time, target.end_time)
+                    track.hold_sustain_planned_ids.add(target.key)
+                return
+
+        if not targets:
+            self._sustain_finalize_if_due(track, now, events)
+            return
+        chain = [targets[0]]
+        release = targets[0].end_time
+        index = 1
+        while index < len(targets) and targets[index].press_time - release <= merge_gap:
+            chain.append(targets[index])
+            release = max(release, targets[index].end_time)
+            index += 1
+        horizon = advance + config.max_schedule_horizon_ms / 1000.0
+        if chain[0].press_time > now + horizon:
+            self._sustain_finalize_if_due(track, now, events)
+            return
+        events.append(self._sustain_press_event(track, chain[0], now))
+        previous_lane = chain[0].lane
+        for target in chain[1:]:
+            if target.lane != previous_lane:
+                events.append(self._sustain_move_event(track, target, now))
+                previous_lane = target.lane
+        track.hold_sustain_planned_ids.update(target.key for target in chain)
+        track.hold_sustain_chain_lane = previous_lane
+        track.hold_sustain_chain_active = True
+        last = chain[-1]
+        if last.flick:
+            events.append(self._sustain_flick_event(track, last))
+            track.hold_sustain_release_time = release
+            track.hold_sustain_final_emitted = True
+            return
+        deadline = release
+        track.hold_sustain_release_time = deadline
+        event_id = f"sustain-release-{track.track_id}"
+        track.hold_sustain_release_event_id = event_id
+        events.append(MusicActionEvent(
+            event_id=event_id,
+            track_id=track.track_id,
+            lane=previous_lane,
+            gesture=NoteGesture.SUSTAIN_RELEASE,
+            deadline=deadline,
+            coordinate=self._lane_point(previous_lane),
+            contact_policy="sustain",
+        ))
+
+    def _hold_note_tap_events(self, now: float) -> list[MusicActionEvent]:
+        from .hold_notes import plan_hold_note_taps
+        return plan_hold_note_taps(self, now)
+
+    def _finalize_hold_note_anchor(self, track: NoteTrack, now: float) -> None:
+        from .hold_note_events import hold_note_registry
+        if self.tap_hold_chain is not None:
+            self.tap_hold_chain.finalize(now, hold_note_registry(self))
+            return
+        if hold_note_registry(self).has_pending(track.track_id):
+            return
+        if track.hold_sustain_final_emitted:
+            return
+        deadline = track.hold_release_time
+        if deadline is None:
+            if track.predicted_hit_time is None:
+                return
+            fallback_ms = min(self.config.hold_fallback_duration_ms, self.config.hold_max_tail_ms)
+            deadline = track.predicted_hit_time + fallback_ms / 1000.0
+        last_activity = 0.0
+        if track.hold_tail_observations:
+            last_activity = max(last_activity, track.hold_tail_observations[-1].timestamp)
+        for marker in self.sustain_tracker.markers.values():
+            if marker.owner == track.track_id:
+                last_activity = max(last_activity, marker.last_seen_time)
+        grace = self.config.hold_note_tap_horizon_ms / 1000.0
+        if now < deadline - 0.02 or now < last_activity + grace:
+            return
+        track.hold_sustain_final_emitted = True
+        track.state = TrackState.RELEASED
+        self._retire_hold_end_flick(track)
+        self.tap_trace.add(
+            'hold_note_anchor_done', time=now, track=track.track_id,
+            deadline=round(deadline, 3), last_activity=round(last_activity, 3),
+        )
+
+    def _sustain_release_events(self, now: float) -> list[MusicActionEvent]:
+        events: list[MusicActionEvent] = []
+        for track in self.tracks.values():
+            if track.state != TrackState.HOLDING:
+                continue
+            self._plan_sustain_track(track, now, events)
+        return events
 
     def release_events(self, now: float) -> list[MusicActionEvent]:
+        if self.config.hold_notes_as_taps:
+            return self._hold_note_tap_events(now)
+        if self.config.hold_sustain_enabled:
+            return self._sustain_release_events(now)
         events: list[MusicActionEvent] = []
         for track in self.tracks.values():
             if track.state != TrackState.HOLDING:

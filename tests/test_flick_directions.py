@@ -120,7 +120,7 @@ class HoldEndFlickTests(unittest.TestCase):
         return MusicFrame(1, moment, moment, moment, np.zeros((720, 1280, 3), dtype=np.uint8))
 
     def test_flick_track_binds_to_active_hold(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         hold = self._hold()
         flick = self._flick(20, 3, 0.72, 10.4, NoteGesture.FLICK_UP)
         engine.tracks[hold.track_id] = hold
@@ -132,7 +132,7 @@ class HoldEndFlickTests(unittest.TestCase):
         self.assertEqual(flick.hold_end_owner, 1)
 
     def test_binding_picks_earliest_upcoming_flick(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         hold = self._hold(release=12.0)
         late = self._flick(21, 3, 0.70, 11.2, NoteGesture.FLICK_UP)
         early = self._flick(22, 3, 0.70, 10.4, NoteGesture.FLICK_DOWN)
@@ -144,7 +144,7 @@ class HoldEndFlickTests(unittest.TestCase):
         self.assertIsNone(late.hold_end_owner)
 
     def test_binding_rejects_flick_later_than_release_estimate(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         hold = self._hold(release=10.6)
         flick = self._flick(23, 3, 0.70, 11.4, NoteGesture.FLICK_UP)
         engine.tracks[hold.track_id] = hold
@@ -154,7 +154,7 @@ class HoldEndFlickTests(unittest.TestCase):
         self.assertIsNone(flick.hold_end_owner)
 
     def test_binding_ignores_other_lane_and_existing_owner(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         hold = self._hold()
         other_lane = self._flick(24, 5, 0.72, 10.4, NoteGesture.FLICK_UP)
         owned = self._flick(25, 3, 0.72, 10.3, NoteGesture.FLICK_DOWN)
@@ -166,7 +166,7 @@ class HoldEndFlickTests(unittest.TestCase):
         self.assertIsNone(hold.hold_end_flick_track)
 
     def test_binding_skips_already_scheduled_flick(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         hold = self._hold()
         flick = self._flick(28, 3, 0.72, 10.4, NoteGesture.FLICK_UP)
         flick.action_event_id = "track-28@10400"
@@ -177,7 +177,7 @@ class HoldEndFlickTests(unittest.TestCase):
         self.assertIsNone(flick.hold_end_owner)
 
     def test_binding_refreshes_arrival_from_bound_track(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         hold = self._hold()
         flick = self._flick(26, 3, 0.72, 10.4, NoteGesture.FLICK_UP)
         engine.tracks[hold.track_id] = hold
@@ -189,7 +189,7 @@ class HoldEndFlickTests(unittest.TestCase):
         self.assertAlmostEqual(engine._hold_release_deadline(hold, hold.hold_release_time), 10.55)
 
     def test_retire_releases_bound_track(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         hold = self._hold()
         flick = self._flick(27, 3, 0.72, 10.4, NoteGesture.FLICK_UP)
         engine.tracks[hold.track_id] = hold
@@ -199,20 +199,20 @@ class HoldEndFlickTests(unittest.TestCase):
         self.assertEqual(flick.state, TrackState.RELEASED)
 
     def test_release_direction_prefers_bound_direction(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7))
         track = NoteTrack(track_id=8, lane=2)
         track.hold_end_flick_direction = NoteGesture.FLICK_DOWN
         self.assertEqual(engine._hold_release_direction(track, 10.0), NoteGesture.FLICK_DOWN)
 
     def test_release_direction_unknown_without_binding(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7))
         track = NoteTrack(track_id=9, lane=2)
         self.assertEqual(engine._hold_release_direction(track, 10.0), NoteGesture.UNKNOWN)
 
 
 class FlickReleaseRefineTests(unittest.TestCase):
     def test_refine_pending_upgrades_hold_release_to_held_flick(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = NoteTrack(track_id=7, lane=3)
         track.gesture = NoteGesture.HOLD_START
         track.state = TrackState.HOLDING
@@ -238,7 +238,7 @@ class FlickReleaseRefineTests(unittest.TestCase):
 
 class FlickTrackingTests(unittest.TestCase):
     def test_flick_candidate_direction_reaches_track_gesture(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7))
         image = np.zeros((720, 1280, 3), dtype=np.uint8)
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), hsv=None, roi_origin=(0, 0))
         for sequence, progress in ((1, 0.30), (2, 0.33), (3, 0.36)):
@@ -260,7 +260,7 @@ class FlickTrackingTests(unittest.TestCase):
         self.assertIn(NoteGesture.FLICK_UP, gestures)
 
     def test_ordinary_candidate_never_gets_flick_gesture(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7))
         image = np.zeros((720, 1280, 3), dtype=np.uint8)
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), hsv=None, roi_origin=(0, 0))
         for sequence, progress in ((1, 0.30), (2, 0.33), (3, 0.36), (4, 0.40)):
@@ -275,7 +275,7 @@ class FlickTrackingTests(unittest.TestCase):
         self.assertNotIn(NoteGesture.FLICK_UP, gestures)
 
     def test_stationary_flick_candidate_never_becomes_flick(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7))
         image = np.zeros((720, 1280, 3), dtype=np.uint8)
         visual = VisualMask(mask=np.zeros((720, 1280), dtype=bool), hsv=None, roi_origin=(0, 0))
         for sequence in (1, 2, 3, 4):
@@ -303,7 +303,7 @@ class FlickExecutorTests(unittest.TestCase):
             SimpleNamespace(),
             1280,
             720,
-            MusicConfig(lane_count=7, flick_distance_px=56, flick_duration_ms=60, flick_steps=3, flick_end_hold_ms=16.0),
+            MusicConfig(hold_sustain_enabled=False, lane_count=7, flick_distance_px=56, flick_duration_ms=60, flick_steps=3, flick_end_hold_ms=16.0),
             sleeper=sleeps.append,
         )
 
@@ -406,7 +406,7 @@ class FlickAsyncInputTests(unittest.TestCase):
             SimpleNamespace(tasker=tasker),
             1280,
             720,
-            MusicConfig(lane_count=7, flick_distance_px=56, flick_duration_ms=60),
+            MusicConfig(hold_sustain_enabled=False, lane_count=7, flick_distance_px=56, flick_duration_ms=60),
             advanced=True,
             multi_touch=True,
             async_input=async_input,
@@ -501,7 +501,7 @@ class HoldRouteHopTests(unittest.TestCase):
         return track
 
     def test_second_hop_requires_fold_confirmation(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         track = self._track()
         engine._register_hold_target(track, 2)
         self.assertEqual(track.hold_route_lanes, [4, 3])
@@ -514,20 +514,20 @@ class HoldRouteHopTests(unittest.TestCase):
         self.assertFalse(track.hold_fold_route_confirmed)
 
     def test_hop_limit_and_return_hop(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True, hold_max_route_hops=2))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True, hold_max_route_hops=2))
         track = self._track(hold_fold_route_confirmed=True)
         engine._register_hold_target(track, 2)
         self.assertEqual(track.hold_route_lanes, [4, 3, 2])
         track.hold_fold_route_confirmed = True
         engine._register_hold_target(track, 0)
         self.assertEqual(track.hold_route_lanes, [4, 3, 2])
-        engine2 = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True, hold_max_route_hops=3))
+        engine2 = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True, hold_max_route_hops=3))
         track2 = self._track(hold_fold_route_confirmed=True)
         engine2._register_hold_target(track2, 4)
         self.assertEqual(track2.hold_route_lanes, [4, 3, 4])
 
     def test_route_steps_use_segment_source_lane(self) -> None:
-        engine = MusicVisionEngine(calibration(), MusicConfig(lane_count=7, enable_holds=True))
+        engine = MusicVisionEngine(calibration(), MusicConfig(hold_sustain_enabled=False, lane_count=7, enable_holds=True))
         cal = calibration()
         track = NoteTrack(track_id=6, lane=4, gesture=NoteGesture.HOLD_START, state=TrackState.HOLDING)
         track.predicted_hit_time = 10.0

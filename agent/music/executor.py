@@ -8,6 +8,8 @@ from agent.common import LOGGER
 
 from .models import FlickRequest, LaneInputState, MusicConfig, NoteGesture
 from .storage import fuse_touch_backend
+from .metrics import MetricSeries
+from .flick_session import FlickInputReceipt, FlickSubmission, SyncFlickSession
 
 try:
     from maa.pipeline import JActionType, JClick, JSwipe, JTouch, JTouchUp
@@ -30,6 +32,8 @@ class TapInputReceipt:
     down_call_finished: float | None = None
     up_call_finished: float | None = None
     error: str = ''
+    run_id: str = ''
+    segment_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -83,16 +87,42 @@ class MusicActionExecutor:
         self.clock = clock
         self.healthy = True
         self.fuse_reason = ""
-        self.action_durations: list[float] = []
+        self.action_durations = MetricSeries()
         self.lanes: dict[int, LaneInputState] = {}
-        self._used_event_ids: set[str] = set()
+        self._used_event_ids: set[tuple[str, int, str]] = set()
+        self.run_id = ''
+        self.segment_id = 0
+        self.release_unconfirmed: set[int] = set()
         self._temporary_contacts: set[int] = set()
         self.tap_fallbacks: list[str] = []
         self._pending_inputs: list[PendingInput] = []
+        self._flick_lane_contacts: dict[int, int] = {}
+        self._flick_session: SyncFlickSession | None = None
+        self.last_flick_deferred: list[tuple[FlickSubmission, str]] = []
+
+    def begin_segment(self, run_id: str, segment_id: int) -> None:
+        if self.active_contacts or self._temporary_contacts or self._pending_inputs or self.release_unconfirmed:
+            raise MusicTouchError('Cannot resume with unconfirmed input cleanup')
+        if not self.healthy:
+            raise MusicTouchError('Cannot resume a fused input backend')
+        self.run_id, self.segment_id = run_id, segment_id
+
+    def _event_key(self, event_id: str) -> tuple[str, int, str]:
+        return self.run_id, self.segment_id, event_id
 
     @property
     def active_contacts(self) -> dict[int, int]:
         return {lane: state.contact for lane, state in self.lanes.items() if state.contact is not None}
+
+    @property
+    def active_flick_lanes(self) -> frozenset[int]:
+        return frozenset(self._flick_lane_contacts)
+
+    @property
+    def available_flick_contacts(self) -> int:
+        used = (set(self.active_contacts.values()) | self._temporary_contacts
+                | self.release_unconfirmed)
+        return max(0, self.config.max_contacts - len(used))
 
     def hold_owner(self, lane: int) -> int | None:
         state = self.lanes.get(lane)
@@ -112,10 +142,13 @@ class MusicActionExecutor:
         )
 
     def _allocate_contact(self, lane: int) -> int:
+        if lane in self.active_flick_lanes:
+            raise MusicTouchError(f'Lane {lane} has an active flick')
         state = self._lane_state(lane)
         if state.contact is not None:
             raise MusicTouchError(f"Lane {lane} already owns contact {state.contact}")
-        used = {item.contact for item in self.lanes.values() if item.contact is not None} | self._temporary_contacts
+        used = ({item.contact for item in self.lanes.values() if item.contact is not None}
+                | self._temporary_contacts | self.release_unconfirmed)
         for contact in range(self.config.max_contacts):
             if contact not in used:
                 state.contact = contact
@@ -123,7 +156,8 @@ class MusicActionExecutor:
         raise MusicTouchError("No free touch contacts")
 
     def _allocate_temporary_contact(self) -> int:
-        used = {item.contact for item in self.lanes.values() if item.contact is not None} | self._temporary_contacts
+        used = ({item.contact for item in self.lanes.values() if item.contact is not None}
+                | self._temporary_contacts | self.release_unconfirmed)
         for contact in range(self.config.max_contacts):
             if contact not in used:
                 self._temporary_contacts.add(contact)
@@ -226,7 +260,8 @@ class MusicActionExecutor:
         """
         controller = self._controller()
         duplicate_lane = len({request[0] for request, _ in fresh}) < len(fresh)
-        available = self.config.max_contacts - len(self.active_contacts) - len(self._temporary_contacts)
+        available = self.config.max_contacts - len(set(self.active_contacts.values())
+                    | self._temporary_contacts | self.release_unconfirmed)
         serial = len(fresh) > 1 and (duplicate_lane or not self.supports_multi_touch or len(fresh) > available)
         batches = [[item] for item in fresh] if serial else [fresh]
         if serial:
@@ -238,11 +273,12 @@ class MusicActionExecutor:
             contacts: list[tuple[TapInputReceipt, int, int, int]] = []
             for (lane, x, y), event_id in batch:
                 contact = self._allocate_temporary_contact()
-                receipt = TapInputReceipt(event_id, lane, contact, down_call_started=self.clock())
+                receipt = TapInputReceipt(event_id, lane, contact, down_call_started=self.clock(),
+                                          run_id=self.run_id, segment_id=self.segment_id)
                 contacts.append((receipt, contact, x, y))
                 receipts.append(receipt)
                 if event_id:
-                    self._used_event_ids.add(event_id)
+                    self._used_event_ids.add(self._event_key(event_id))
             posted: list[tuple[TapInputReceipt, int, Any]] = []
             for receipt, contact, x, y in contacts:
                 try:
@@ -254,7 +290,7 @@ class MusicActionExecutor:
                     reason = f"async tap post lane {receipt.lane} failed: {error}"
                     self._mark_fused(reason)
                     receipt.error = reason
-                    self._temporary_contacts.discard(contact)
+                    self.release_unconfirmed.add(contact)
                     raise MusicTouchError(reason, receipts=receipts) from error
                 posted.append((receipt, contact, job_down))
             for receipt, contact, job_down in posted:
@@ -267,7 +303,7 @@ class MusicActionExecutor:
                     reason = f"async tap post lane {receipt.lane} failed: {error}"
                     self._mark_fused(reason)
                     receipt.error = reason
-                    self._temporary_contacts.discard(contact)
+                    self.release_unconfirmed.add(contact)
                     raise MusicTouchError(reason, receipts=receipts) from error
                 self._pending_inputs.append(
                     PendingInput("tap", receipt.lane, contact, receipt.event_id, job_down, job_up, receipt)
@@ -298,7 +334,12 @@ class MusicActionExecutor:
                 if receipt is not None:
                     receipt.error = "framework gesture job failed"
                 self._mark_fused(f"async {pending.kind} job failed on lane {pending.lane}")
-                self._finish_input(pending)
+                try:
+                    self._run(JActionType.TouchUp, JTouchUp(contact=pending.contact),
+                              'failed async input cleanup', self.config.max_click_touch_ms, force=True)
+                    self._finish_input(pending)
+                except Exception:
+                    self.release_unconfirmed.add(pending.contact)
                 self._pending_inputs.remove(pending)
                 if receipt is not None:
                     completed.append(receipt)
@@ -334,20 +375,24 @@ class MusicActionExecutor:
         fresh = []
         seen = set(self._used_event_ids)
         for request, event_id in zip(requests, ids):
-            if event_id and event_id in seen:
+            key = self._event_key(event_id)
+            if event_id and key in seen:
                 continue
             fresh.append((request, event_id))
             if event_id:
-                seen.add(event_id)
+                seen.add(key)
         if not fresh:
             return []
+        if any(request[0] in self.active_flick_lanes for request, _ in fresh):
+            raise MusicTouchError('Tap cannot overlap an active flick lane')
         self._bindings()
         if self.async_input:
             return self._tap_many_async(fresh)
         # Defense in depth: never overlap contacts on one lane, even when a
         # caller bypasses the scheduler. Valid chords have distinct lanes.
         duplicate_lane = len({request[0] for request, _ in fresh}) < len(fresh)
-        available = self.config.max_contacts - len(self.active_contacts) - len(self._temporary_contacts)
+        available = self.config.max_contacts - len(set(self.active_contacts.values())
+                    | self._temporary_contacts | self.release_unconfirmed)
         serial = len(fresh) > 1 and (duplicate_lane or not self.supports_multi_touch or len(fresh) > available)
         batches = [[item] for item in fresh] if serial else [fresh]
         if serial:
@@ -361,14 +406,15 @@ class MusicActionExecutor:
                 # Allocate all chord contacts and targets before the first down.
                 for (lane, x, y), event_id in batch:
                     contact = self._allocate_temporary_contact()
-                    receipt = TapInputReceipt(event_id, lane, contact)
+                    receipt = TapInputReceipt(event_id, lane, contact, run_id=self.run_id,
+                                              segment_id=self.segment_id)
                     contacts.append((receipt, JTouch(contact=contact, target=self._target(x, y), pressure=1)))
                     receipts.append(receipt)
                 for receipt, target in contacts:
                     receipt.down_call_started = self.clock()
                     # A failed/ambiguous down must not be retried automatically.
                     if receipt.event_id:
-                        self._used_event_ids.add(receipt.event_id)
+                        self._used_event_ids.add(self._event_key(receipt.event_id))
                     self._run(JActionType.TouchDown, target, f"tap down lane {receipt.lane}", self.config.max_click_touch_ms)
                     receipt.down_call_finished = self.clock()
                 for receipt, _ in reversed(contacts):
@@ -386,10 +432,49 @@ class MusicActionExecutor:
                             receipt.up_call_finished = self.clock()
                         except Exception:
                             # Keep the contact reserved for release_all to retry.
+                            self.release_unconfirmed.add(receipt.contact)
                             continue
                     self._temporary_contacts.discard(receipt.contact)
+                    self.release_unconfirmed.discard(receipt.contact)
                 raise MusicTouchError(str(error), receipts=receipts) from error
         return receipts
+
+    def _send_flick_touch(self, kind, contact, coordinate, lane, *, force=False, cleanup=False):
+        description = f'flick {"cleanup" if cleanup else kind} lane {lane}'
+        if kind == 'up':
+            action_type, parameter = JActionType.TouchUp, JTouchUp(contact=contact)
+        else:
+            action_type = JActionType.TouchDown if kind == 'down' else JActionType.TouchMove
+            parameter = JTouch(contact=contact, target=self._target(*coordinate), pressure=1)
+        return self._run(action_type, parameter, description, self.config.max_click_touch_ms, force=force)
+
+    @staticmethod
+    def _raise_flick_error(message, receipts, *, cause=None):
+        raise MusicTouchError(message, receipts=receipts) from cause
+
+    def swipe_many(self, submissions: Iterable[FlickSubmission], *, collect_due=None,
+                   tick=None, check_cancelled=None, on_started=None, qualify=None) -> list[FlickInputReceipt]:
+        """Interleave due standalone flicks using serial direct touch calls.
+
+        No deadline is changed and no future member is waited for. Callers
+        consume queue entries in on_started, not when merely offering them.
+        Held/async flicks retain the legacy swipe entry point.
+        """
+        self._bindings()
+        if self.async_flicks:
+            raise MusicTouchError('Staged flicks require synchronous input')
+        if self._flick_session is not None:
+            raise MusicTouchError('Flick sessions must not nest')
+        if not self.healthy:
+            raise MusicTouchError('Touch backend is fused')
+        self.last_flick_deferred = []
+        session = SyncFlickSession(self, collect_due=collect_due, tick=tick,
+            check_cancelled=check_cancelled, on_started=on_started, qualify=qualify)
+        self._flick_session = session
+        try:
+            return session.run(list(submissions))
+        finally:
+            self._flick_session = None
 
     def swipe(
         self,
@@ -399,18 +484,18 @@ class MusicActionExecutor:
         track_id: int | None = None,
         tick: Callable[[], None] | None = None,
     ) -> None:
-        if event_id and event_id in self._used_event_ids:
+        if event_id and self._event_key(event_id) in self._used_event_ids:
             return
         self._bindings()
         if self.async_flicks:
             self._swipe_async(request, event_id)
             if event_id:
-                self._used_event_ids.add(event_id)
+                self._used_event_ids.add(self._event_key(event_id))
             return
         if request.already_down:
             self.hold_flick(request.lane, request.x, request.y, request.direction, track_id=track_id, tick=tick)
             if event_id:
-                self._used_event_ids.add(event_id)
+                self._used_event_ids.add(self._event_key(event_id))
             return
         contact = self._allocate_temporary_contact()
         end_x, end_y = self._flick_target(request.x, request.y, request.direction)
@@ -418,6 +503,8 @@ class MusicActionExecutor:
         step_sleep = self._flick_step_sleep(len(waypoints))
         aborted = False
         try:
+            if event_id:
+                self._used_event_ids.add(self._event_key(event_id))
             self._run(
                 JActionType.TouchDown,
                 JTouch(contact=contact, target=self._target(request.x, request.y), pressure=1),
@@ -447,7 +534,6 @@ class MusicActionExecutor:
             aborted = True
             raise
         finally:
-            self._temporary_contacts.discard(contact)
             if aborted:
                 try:
                     self._run(
@@ -457,10 +543,15 @@ class MusicActionExecutor:
                         self.config.max_click_touch_ms,
                         force=True,
                     )
+                    self._temporary_contacts.discard(contact)
+                    self.release_unconfirmed.discard(contact)
                 except Exception:
+                    self.release_unconfirmed.add(contact)
                     LOGGER.exception("Failed to clean up an aborted flick on lane %s", request.lane)
+            else:
+                self._temporary_contacts.discard(contact)
         if event_id:
-            self._used_event_ids.add(event_id)
+            self._used_event_ids.add(self._event_key(event_id))
 
     def _flick_pause(self, duration: float, tick: Callable[[], None] | None) -> None:
         """Pause between flick steps, first giving the caller a chance to
@@ -516,9 +607,10 @@ class MusicActionExecutor:
                     self.config.max_click_touch_ms,
                     force=True,
                 )
+                state.contact = None
             except Exception:
+                self.release_unconfirmed.add(contact)
                 LOGGER.exception("Failed to clean up a partially started contact on lane %s", lane)
-            state.contact = None
             raise
         state.hold_track_id = track_id
         state.contact_started = time.monotonic()
@@ -557,10 +649,14 @@ class MusicActionExecutor:
                 self.config.max_click_touch_ms,
                 force=force,
             )
-        finally:
+        except Exception:
+            self.release_unconfirmed.add(contact)
+            raise
+        else:
             state.contact = None
             state.hold_track_id = None
             state.contact_started = 0.0
+            self.release_unconfirmed.discard(contact)
 
     def touch_up(self, lane: int, *, track_id: int | None = None) -> None:
         state = self._lane_state(lane)
@@ -573,6 +669,11 @@ class MusicActionExecutor:
             )
             return
         self._touch_up(lane)
+
+    def release_track(self, track_id: int) -> None:
+        for lane, state in list(self.lanes.items()):
+            if state.contact is not None and state.hold_track_id == track_id:
+                self._touch_up(lane)
 
     def hold_flick(
         self,
@@ -672,7 +773,7 @@ class MusicActionExecutor:
                 f"flick post lane {request.lane}",
             )
         except Exception as error:
-            self._temporary_contacts.discard(contact)
+            self.release_unconfirmed.add(contact)
             reason = f"flick post lane {request.lane} failed: {error}"
             self._mark_fused(reason)
             raise MusicTouchError(reason) from error
@@ -687,16 +788,21 @@ class MusicActionExecutor:
         """
         if self.supports_multi_touch:
             return True
-        return not self._temporary_contacts and not self.active_contacts
+        return not self._temporary_contacts and not self.active_contacts and not self.release_unconfirmed
 
     def enforce_contact_limits(self, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
+        limit_ms = (
+            self.config.hold_note_contact_max_ms
+            if self.config.hold_notes_as_taps
+            else self.config.max_contact_ms
+        )
         expired = [
             lane
             for lane, state in self.lanes.items()
             if state.contact is not None
             and state.contact_started > 0
-            and (current - state.contact_started) * 1000.0 > self.config.max_contact_ms
+            and (current - state.contact_started) * 1000.0 > limit_ms
         ]
         if not expired:
             return
@@ -705,24 +811,40 @@ class MusicActionExecutor:
         LOGGER.warning("Released contacts that exceeded the maximum duration on lanes %s", expired)
 
     def release_all(self) -> None:
-        cleanup_failed = False
+        errors = {}
+        contacts = set(self.active_contacts.values()) | self._temporary_contacts | self.release_unconfirmed
+        for contact in sorted(contacts, reverse=True):
+            for attempt in range(2):
+                if self._flick_session is not None:
+                    self._flick_session.external_up_started(contact, self.clock())
+                try:
+                    self._run(JActionType.TouchUp, JTouchUp(contact=contact), 'input cleanup',
+                              self.config.max_click_touch_ms, force=True)
+                    if self._flick_session is not None:
+                        self._flick_session.external_up_finished(contact, self.clock())
+                    for state in self.lanes.values():
+                        if state.contact == contact:
+                            state.contact = state.hold_track_id = None
+                            state.contact_started = 0.0
+                    self._temporary_contacts.discard(contact)
+                    self.release_unconfirmed.discard(contact)
+                    self._flick_lane_contacts = {lane: owned for lane, owned in self._flick_lane_contacts.items()
+                                                 if owned != contact}
+                    break
+                except Exception as error:
+                    if self._flick_session is not None:
+                        self._flick_session.external_up_finished(contact, self.clock(), error)
+                    self.release_unconfirmed.add(contact)
+                    if attempt == 1:
+                        errors[contact] = str(error)
+        if errors:
+            reason = f'Touch cleanup unconfirmed: {errors}; original={self.fuse_reason}'
+            self._mark_fused(reason)
+            raise MusicTouchError(reason)
         self._pending_inputs.clear()
-        for contact in sorted(self._temporary_contacts, reverse=True):
-            try:
-                self._run(JActionType.TouchUp, JTouchUp(contact=contact), 'temporary tap cleanup',
-                          self.config.max_click_touch_ms, force=True)
-                self._temporary_contacts.discard(contact)
-            except Exception:
-                cleanup_failed = True
-        for lane in sorted(list(self.active_contacts), reverse=True):
-            try:
-                self._touch_up(lane, force=not self.healthy)
-            except Exception:
-                cleanup_failed = True
-                LOGGER.exception("Failed to clean up music contact on lane %s", lane)
-        if cleanup_failed and self.healthy:
-            self._mark_fused("Touch cleanup failed")
-            raise MusicTouchError("Touch cleanup failed")
+        self._flick_lane_contacts.clear()
+        if self._flick_session is not None:
+            self._flick_session.released_externally()
 
     def close(self) -> None:
         self.release_all()

@@ -159,6 +159,73 @@ def note_like_candidate(candidate: MusicCandidate, calibration: MusicCalibration
     return candidate.fill_ratio >= 0.45
 
 
+def split_stacked_notes(
+    candidates: Iterable[MusicCandidate],
+    visual: VisualMask,
+    calibration: MusicCalibrationData,
+    min_size: int = 0,
+) -> list[MusicCandidate]:
+    """Recover two vertically touching notes merged into one tall component.
+
+    Only ordinary candidates with a clearly bipartite mask profile are split:
+    both halves must independently pass the ordinary note filter and a deep
+    valley must separate two dense halves.  Flick/bonus/variant candidates are
+    never touched.
+    """
+    mask = getattr(visual, "mask", None)
+    if mask is None:
+        return list(candidates)
+    origin_x, origin_y = getattr(visual, "roi_origin", (0, 0))
+    result: list[MusicCandidate] = []
+    for candidate in candidates:
+        if candidate.variant:
+            result.append(candidate)
+            continue
+        x, y, width, height = candidate.box
+        if width < 8 or height < 1.65 * width or height > 2.45 * width:
+            result.append(candidate)
+            continue
+        local_x, local_y = x - origin_x, y - origin_y
+        if local_x < 0 or local_y < 0 or local_y + height > mask.shape[0] or local_x + width > mask.shape[1]:
+            result.append(candidate)
+            continue
+        crop = mask[local_y : local_y + height, local_x : local_x + width]
+        profile = crop.sum(axis=1)
+        if profile.shape[0] != height:
+            result.append(candidate)
+            continue
+        lower, upper = int(height * 0.35), int(height * 0.65)
+        top, band, bottom = profile[:lower], profile[lower:upper], profile[upper:]
+        if top.size == 0 or band.size == 0 or bottom.size == 0:
+            result.append(candidate)
+            continue
+        top_peak, bottom_peak = float(top.max()), float(bottom.max())
+        split = lower + int(band.argmin())
+        valley = float(profile[split])
+        if valley > 0.55 * min(top_peak, bottom_peak) or min(top_peak, bottom_peak) < 0.6 * width:
+            result.append(candidate)
+            continue
+        upper_box = (x, y, width, split)
+        lower_box = (x, y + split, width, height - split)
+        upper_half = MusicCandidate(
+            upper_box,
+            int(profile[:split].sum()),
+            float(crop[:split].mean()),
+            (upper_box[0] + width / 2.0, upper_box[1] + split / 2.0),
+        )
+        lower_half = MusicCandidate(
+            lower_box,
+            int(profile[split:].sum()),
+            float(crop[split:].mean()),
+            (lower_box[0] + width / 2.0, lower_box[1] + (height - split) / 2.0),
+        )
+        if note_like_candidate(upper_half, calibration, min_size) and note_like_candidate(lower_half, calibration, min_size):
+            result.extend((upper_half, lower_half))
+        else:
+            result.append(candidate)
+    return result
+
+
 def detect_bonus_star_notes(image: Any, calibration: MusicCalibrationData) -> list[MusicCandidate]:
     """Return green score-bonus note heads without relaxing ordinary filters.
 
@@ -477,62 +544,8 @@ def giant_live_title_present(image: Any) -> bool:
 
 
 def connected_components(mask: Any, min_pixels: int) -> list[tuple[tuple[int, int, int, int], int]]:
-    """RLE connected components: Python iterates runs, never individual pixels."""
-    if np is None:
-        raise RuntimeError("NumPy is required by the music vision engine")
-    boolean = np.asarray(mask, dtype=bool)
-    parent: list[int] = []
-    runs: list[tuple[int, int, int, int]] = []  # row, start, end-exclusive, label
-    previous: list[tuple[int, int, int]] = []
-
-    def find(label: int) -> int:
-        while parent[label] != label:
-            parent[label] = parent[parent[label]]
-            label = parent[label]
-        return label
-
-    def union(left: int, right: int) -> None:
-        left_root, right_root = find(left), find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-
-    for row in range(boolean.shape[0]):
-        columns = np.flatnonzero(boolean[row])
-        if not columns.size:
-            previous = []
-            continue
-        split_at = np.flatnonzero(np.diff(columns) > 1) + 1
-        groups = np.split(columns, split_at)
-        current: list[tuple[int, int, int]] = []
-        for group in groups:
-            start, end = int(group[0]), int(group[-1]) + 1
-            label = len(parent)
-            parent.append(label)
-            for previous_start, previous_end, previous_label in previous:
-                if previous_end < start or previous_start > end:
-                    continue
-                union(label, previous_label)
-            runs.append((row, start, end, label))
-            current.append((start, end, label))
-        previous = current
-
-    aggregates: dict[int, list[int]] = {}
-    for row, start, end, label in runs:
-        root = find(label)
-        if root not in aggregates:
-            aggregates[root] = [start, row, end, row + 1, end - start]
-        else:
-            item = aggregates[root]
-            item[0] = min(item[0], start)
-            item[1] = min(item[1], row)
-            item[2] = max(item[2], end)
-            item[3] = max(item[3], row + 1)
-            item[4] += end - start
-    result: list[tuple[tuple[int, int, int, int], int]] = []
-    for x0, y0, x1, y1, count in aggregates.values():
-        if count >= min_pixels:
-            result.append(((x0, y0, x1 - x0, y1 - y0), count))
-    return result
+    from .components import connected_components as label
+    return label(mask, min_pixels)
 
 
 def linked_tap_pair_present(image: Any, left: MusicCandidate, right: MusicCandidate, *, fast_channels: bool = False) -> bool:
@@ -600,11 +613,12 @@ def linked_tap_pair_present(image: Any, left: MusicCandidate, right: MusicCandid
 class MaaCandidateProvider:
     name = "maa"
 
-    def __init__(self, context: Any, calibration: MusicCalibrationData, iou_threshold: float = 0.55, min_size: int = 0) -> None:
+    def __init__(self, context: Any, calibration: MusicCalibrationData, iou_threshold: float = 0.55, min_size: int = 0, split_stacked: bool = False) -> None:
         self.context = context
         self.calibration = calibration
         self.iou_threshold = iou_threshold
         self.min_size = min_size
+        self.split_stacked = split_stacked
         self.failures = 0
         self._configured = False
 
@@ -671,16 +685,19 @@ class MaaCandidateProvider:
             for candidate in candidates
             if note_like_candidate(candidate, self.calibration, self.min_size)
         ]
+        if self.split_stacked:
+            candidates = split_stacked_notes(candidates, visual, self.calibration, self.min_size)
         return deduplicate_candidates(candidates, self.iou_threshold)
 
 
 class NumpyCandidateProvider:
     name = "numpy"
 
-    def __init__(self, calibration: MusicCalibrationData, iou_threshold: float = 0.55, min_size: int = 0) -> None:
+    def __init__(self, calibration: MusicCalibrationData, iou_threshold: float = 0.55, min_size: int = 0, split_stacked: bool = False) -> None:
         self.calibration = calibration
         self.iou_threshold = iou_threshold
         self.min_size = min_size
+        self.split_stacked = split_stacked
         self.failures = 0
 
     def detect(self, frame: MusicFrame, visual: VisualMask) -> list[MusicCandidate]:
@@ -704,4 +721,6 @@ class NumpyCandidateProvider:
             for candidate in candidates
             if note_like_candidate(candidate, self.calibration, self.min_size)
         ]
+        if self.split_stacked:
+            candidates = split_stacked_notes(candidates, visual, self.calibration, self.min_size)
         return deduplicate_candidates(candidates, self.iou_threshold)

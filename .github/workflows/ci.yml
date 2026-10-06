@@ -35,7 +35,7 @@ jobs:
         run: ./tools/bootstrap.ps1
       - name: Build package
         shell: pwsh
-        run: ./tools/package.ps1
+        run: ./tools/package.ps1 -Release -OutputName MAES
       - name: Create release archive
         shell: pwsh
         run: |

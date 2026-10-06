@@ -5,38 +5,95 @@ flanks along several samples. No song timing, screen-text ROI, or fixed route.
 """
 from __future__ import annotations
 import math
+from functools import lru_cache
 import numpy as np
+
+
+@lru_cache(maxsize=16)
+def _fractions(begin, stop):
+    fraction = np.linspace(begin, stop, 12)[:, None]
+    fraction.flags.writeable = False
+    return fraction
+
+
+@lru_cache(maxsize=8)
+def _offsets(flank):
+    offsets = np.array([-flank, -flank*.8, -.35, 0., .35, flank*.8, flank])
+    offsets.flags.writeable = False
+    return offsets
+
+
+def _coordinates(image_shape, start, end, *, width=5., begin=.12, stop=.85,
+                 flank=2.5, control=None):
+    """Same ordered sample arithmetic for one route or a batch of routes."""
+    start, end = np.asarray(start, float), np.asarray(end, float)
+    vector = end - start
+    batch = vector.ndim == 2
+    length = np.linalg.norm(vector, axis=-1) if batch else float(np.linalg.norm(vector))
+    fraction = _fractions(begin, stop)
+    if batch:
+        fraction = fraction[None, :, :]
+        start, end, vector = start[:, None, :], end[:, None, :], vector[:, None, :]
+    if control is None:
+        if batch:
+            normal = np.concatenate((-vector[..., 1:], vector[..., :1]), axis=-1) / length[:, None, None]
+            normal = np.broadcast_to(normal, (len(start), 12, 2))
+        else:
+            normal = np.broadcast_to(np.array([-vector[1], vector[0]]) / length, (12,2))
+        samples = start + fraction * vector
+    else:
+        control = np.asarray(control,float)
+        if batch:
+            control = control[:, None, :]
+        samples = (1-fraction)**2*start + 2*fraction*(1-fraction)*control + fraction**2*end
+        tangent = (1-fraction)*(control-start) + fraction*(end-control)
+        normal = np.stack((-tangent[...,1],tangent[...,0]),axis=-1)
+        normal /= np.maximum(1.,np.linalg.norm(normal,axis=-1))[...,None]
+    # Vectorized core/flank samples; no per-pixel Python loop or full HSV pass.
+    offsets = _offsets(flank)
+    widths = np.broadcast_to(np.asarray(width), (12,))
+    xy = np.rint(samples[..., None, :] + (widths[:, None]*offsets)[..., None] * normal[...,None,:]).astype(int)
+    xy[..., 0] = np.clip(xy[..., 0], 0, image_shape[1]-1)
+    xy[..., 1] = np.clip(xy[..., 1], 0, image_shape[0]-1)
+    return xy
+
+
+def _score_samples(image, xy, brightness):
+    # Only geometry can be cached. Every call samples the current frame.
+    pixels = image[xy[..., 1], xy[..., 0], :3].astype(np.int16)
+    low = pixels.min(axis=-1)
+    high = pixels.max(axis=-1)
+    core = low[..., 2:5].mean(axis=-1)
+    flanks = (low[..., :2].mean(axis=-1) + low[..., 5:].mean(axis=-1)) / 2
+    neutral = (high[..., 2:5] - low[..., 2:5]).mean(axis=-1) <= 70
+    return ((core >= brightness) & neutral & (core - flanks >= 12)).mean(axis=-1)
 
 
 def ribbon_score(image, start, end, *, width=5., begin=.12, stop=.85, flank=2.5, brightness=165, control=None):
     start, end = np.asarray(start, float), np.asarray(end, float)
-    vector = end - start
-    length = float(np.linalg.norm(vector))
-    if length < 4:
+    if float(np.linalg.norm(end-start)) < 4:
         return 0.
-    fraction = np.linspace(begin, stop, 12)[:, None]
-    if control is None:
-        normal = np.broadcast_to(np.array([-vector[1], vector[0]]) / length, (12,2))
-        samples = start + fraction * vector
-    else:
-        control = np.asarray(control,float)
-        samples = (1-fraction)**2*start + 2*fraction*(1-fraction)*control + fraction**2*end
-        tangent = (1-fraction)*(control-start) + fraction*(end-control)
-        normal = np.stack((-tangent[:,1],tangent[:,0]),axis=1)
-        normal /= np.maximum(1.,np.linalg.norm(normal,axis=1))[:,None]
-    # Vectorized core/flank samples; no per-pixel Python loop or full HSV pass.
-    offsets = np.array([-flank, -flank*.8, -.35, 0., .35, flank*.8, flank])
-    widths = np.broadcast_to(np.asarray(width), (12,))
-    xy = np.rint(samples[:, None, :] + (widths[:, None]*offsets)[..., None] * normal[:,None,:]).astype(int)
-    xy[..., 0] = np.clip(xy[..., 0], 0, image.shape[1]-1)
-    xy[..., 1] = np.clip(xy[..., 1], 0, image.shape[0]-1)
-    pixels = image[xy[..., 1], xy[..., 0], :3].astype(np.int16)
-    low = pixels.min(axis=2)
-    high = pixels.max(axis=2)
-    core = low[:, 2:5].mean(axis=1)
-    flanks = (low[:, :2].mean(axis=1) + low[:, 5:].mean(axis=1)) / 2
-    neutral = (high[:, 2:5] - low[:, 2:5]).mean(axis=1) <= 70
-    return float(((core >= brightness) & neutral & (core - flanks >= 12)).mean())
+    xy = _coordinates(image.shape, start, end, width=width, begin=begin,
+                      stop=stop, flank=flank, control=control)
+    return float(_score_samples(image, xy, brightness))
+
+
+def _owner_scores(image, center, unit, owner_width, points):
+    if len(points) == 0:
+        return ()
+    ends = np.asarray(points, float)
+    starts = np.broadcast_to(np.asarray(center, float), ends.shape)
+    valid = np.linalg.norm(ends-starts, axis=1) >= 4
+    scores = np.zeros(len(points), float)
+    if valid.any():
+        controls = np.asarray([
+            (center[0]+unit[0]*math.dist(center,point)*.5,
+             center[1]+unit[1]*math.dist(center,point)*.5)
+            for point in points], float)
+        xy = _coordinates(image.shape, starts[valid], ends[valid],
+                          width=owner_width, control=controls[valid])
+        scores[valid] = _score_samples(image, xy, 165)
+    return tuple(float(score) for score in scores)
 
 
 def marker_evidence(image, center, radius, lane, calibration):
@@ -55,10 +112,7 @@ def marker_evidence(image, center, radius, lane, calibration):
     # Ribbon tangent leaves the marker along its destination ray, then bends
     # to the held judgement point. A straight chord misses genuine curved
     # ribbons by tens of pixels. This quadratic uses observed geometry only.
-    owner_scores = tuple(ribbon_score(image, center, point, width=owner_width,
-                         control=(center[0]+unit[0]*math.dist(center,point)*.5,
-                                  center[1]+unit[1]*math.dist(center,point)*.5))
-                         for point in calibration.points)
+    owner_scores = _owner_scores(image, center, unit, owner_width, calibration.points)
     best = max(owner_scores, default=0.)
     owners = tuple(i for i, score in enumerate(owner_scores) if score >= .58 and score >= best-.12)
     # A short local downstream test also supports isolated caps in developer
@@ -78,8 +132,20 @@ def marker_evidence(image, center, radius, lane, calibration):
     return topology, owners if convergent else None, upstream, owner_scores
 
 
-def ribbon_at_judgement(image, calibration, lane):
-    origin = np.asarray(calibration.lane_centerlines[lane][0], float)
-    point = np.asarray(calibration.points[lane], float)
+@lru_cache(maxsize=128)
+def _judgement_geometry(height, width, origin, point):
+    origin = np.asarray(origin, float)
+    point = np.asarray(point, float)
     start = point + (origin-point)*.10
-    return ribbon_score(image, start, point, width=18., begin=.1, stop=.85) >= .58
+    if float(np.linalg.norm(point-start)) < 4:
+        return None
+    xy = _coordinates((height, width), start, point, width=18., begin=.1, stop=.85)
+    xy.flags.writeable = False
+    return xy
+
+
+def ribbon_at_judgement(image, calibration, lane):
+    xy = _judgement_geometry(image.shape[0], image.shape[1],
+                            tuple(calibration.lane_centerlines[lane][0]),
+                            tuple(calibration.points[lane]))
+    return False if xy is None else bool(_score_samples(image, xy, 165) >= .58)

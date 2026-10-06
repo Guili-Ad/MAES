@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -208,6 +209,22 @@ def _validate(data: MusicCalibrationData) -> None:
         raise ValueError("Music visual baseline is outdated; V4 recalibration is required")
     if not 0.7 <= data.trigger_progress <= 1.2:
         raise ValueError("Music trigger progress is invalid")
+    points = set()
+    for point in data.points:
+        if len(point) != 2 or not all(math.isfinite(v) for v in point):
+            raise ValueError('Music target coordinates must be finite pairs')
+        if not 0 <= point[0] < data.width or not 0 <= point[1] < data.height:
+            raise ValueError('Music target is outside screenshot bounds')
+        points.add(tuple(point))
+    if len(points) != data.lane_count:
+        raise ValueError('Music targets must be distinct')
+    for line in data.lane_centerlines:
+        if len(line) < 2 or any(len(p) != 2 or not all(math.isfinite(v) for v in p) for p in line):
+            raise ValueError('Music centerline coordinates are invalid')
+        if sum(math.dist(a, b) for a, b in zip(line, line[1:])) <= 1e-6:
+            raise ValueError('Music centerline has no length')
+    if any(not math.isfinite(w) or not 0 < w <= max(data.width, data.height) for w in data.corridor_widths):
+        raise ValueError('Music corridor width is invalid')
 
 
 def load_calibration(expected_lane_count: int, image: Any) -> MusicCalibrationData:

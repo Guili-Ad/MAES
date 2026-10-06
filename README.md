@@ -1,7 +1,7 @@
 # MAES
 
 基于 MaaFramework 5.12.2 与 ProjectInterface V2 ，依托Deepseek和Codex实现的《偶像梦幻祭2》打歌自动化项目。
-当前版本 **v1.0.0-Stable**，聚焦「临时打歌」与「打歌点位校准」。
+当前源码 **v1.0.6-residual-candidate**，在统一物理点按上补充复合轮廓局部恢复及独立划动资格保护，保留各类视觉、时序和成功尾划，不代表稳定FC版本。独立包为`MAES_PointIdentity_Refined_Candidate`，旧发行目录保持不变，修复与下一轮说明见`docs/residual-fix-handoff.md`；旧交接说明保留为历史资料。
 
 ## 功能范围
 
@@ -14,8 +14,6 @@
 
 ## 使用（普通用户）
 
-0. 在一切开始前，确保您的偶像梦幻祭2演唱会设置为：延迟校准0.0，音符延迟调整固定4.0，音符样式TypeA，环境设置为2D模式，简易背景，音符大小100%，判定线样式TypeA，Combo显示于右上角，判定显示位置居中，判定线位置常规。Mumu模拟器关闭后台降帧
-1. 从本仓库 Releases 下载最新版本压缩包并解压到任意目录。
 2. 系统要求：Windows 10/11 x64；.NET Desktop Runtime 10；VC++ 2015-2022 Redistributable；安卓模拟器（支持 ADB）或实机设备。
    缺少运行库时，以管理员身份运行包内 `DependencySetup_依赖库安装_win.bat` 可自动安装。
 3. 打开 `MFAAvalonia.exe`，添加你的模拟器设备；确认设备“输入模式”为 Default（打歌必需）。
@@ -24,7 +22,16 @@
 6. 之后的运行，理论上只需要运行「临时打歌」，整首歌将自动进行；结束时以 LIVE 结算检测为准。
 7. 若打歌出现触控异常：暂停歌曲后运行「打歌触控能力检测」定位问题。
 
+**游戏内设置（重要）**：
+- **判定显示固定当前测试设置**。判定文字可能与中轨音符形成复合轮廓，本轮针对它修复局部恢复；为可信对照，不要同时更改显示与调度设置。若另测关闭判定显示，请明确记录为不同测试条件。
+- 音符样式 TypeA、音符大小 100%、判定线样式 TypeA、判定线位置常规、Combo 显示于右上角、2D 模式、简易背景。
+- 延迟校准 0.0、音符延迟调整固定 4.0。
+- 模拟器请关闭后台降帧/后台挂起渲染，并保持窗口可见；画面冻结期间音符仍会继续下落。
+
 **日志与数据**：任务日志位于 `logs/`（含 `tap-traces`）；错误截图位于 `debug/on_error`；用户数据（校准、触控状态、最近结果）保存在本机 `%LOCALAPPDATA%\MAES`，可用环境变量 `MAES_DATA_DIR` 指定其他目录。
+
+优化候选包含 `candidate-package.marker`，默认使用包内 `user-data/` 隔离保存状态，构建时复制必要校准及触控探针状态，不覆盖旧版本数据。显式设置 `MAES_DATA_DIR` 时该设置优先。
+当前7轨入口将长按头部及白色条带上的小音符独立点按，不切换到旧持续按压模式；尾端划动仍使用既有语义。
 
 ## 已知限制
 
@@ -44,18 +51,18 @@ powershell -ExecutionPolicy Bypass -File tools/bootstrap.ps1
 # 2. 项目检查（含离线运行时与原生库校验）
 runtime\python\python.exe -B tools\check_project.py --require-runtime
 
-# 3. 单元测试（178 项）
-runtime\python\python.exe -B -m unittest discover -s tests -p "test_*.py" -q
+# 3. 单元测试（本轮基线591项；最终候选结果见当前交接说明）
+runtime\python\python.exe -B tools\run_tests.py
 
-# 4. 构建发行包（输出 dist\MAES）
-powershell -ExecutionPolicy Bypass -File tools/package.ps1
+# 4. 构建独立候选包；目标已存在时拒绝覆盖
+powershell -ExecutionPolicy Bypass -File tools/package.ps1 -OutputName MAES_PointIdentity_Refined_Candidate
 ```
 
 目录说明：
 
 - `agent/`：Python 动作服务与打歌引擎（`agent/music/` 为视觉跟踪、输入执行与运行时）。
 - `resource/base/`：Pipeline、判定点模板与 OCR 模型；`resource/bside/` 为 B 服覆盖层（当前未启用）。
-- `tests/`：178 项单元与契约测试。
+- `tests/`：单元与契约测试；开发候选序列位于 fixtures，不进入运行资源。
 - `tools/`：bootstrap、项目检查、测试与打包脚本。
 - `provenance/`：资源来源与许可记录。
 - `docs/`：架构、使用与诊断说明。

@@ -26,6 +26,9 @@ def data_root() -> Path:
     configured = os.environ.get("MAES_DATA_DIR")
     if configured:
         root = Path(configured).expanduser()
+    elif (project_root() / 'candidate-package.marker').is_file():
+        # Candidate packages never mutate the production calibration/fuse store.
+        root = project_root() / 'user-data'
     elif os.environ.get("LOCALAPPDATA"):
         root = Path(os.environ["LOCALAPPDATA"]) / "MAES"
     else:

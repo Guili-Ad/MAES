@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 from functools import lru_cache
-import math
 from .models import FLICK_GESTURES, NoteGesture, TrackState
-from .head_identity import identity_continuity_allowed
-from .tap_identity import discontinuity
+from .head_identity import identity_continuity_allowed, duplicate_head_evidence
+from .tap_identity import discontinuity, ordinary_tap
 
 
 def confirmed_tap_motion(track):
@@ -15,6 +14,20 @@ def confirmed_tap_motion(track):
     recent = list(track.observations)[-3:]
     return all(b.progress - a.progress > .002 and 0 < b.frame_sequence - a.frame_sequence <= 3
                for a, b in zip(recent, recent[1:]))
+
+
+def repeated_head_pixels(track, candidate, frame):
+    """Short exact contour repeat is absent motion evidence, not a new head.
+
+    Requires an already healthy ordinary trajectory. Static HUD tracks and
+    all hold/bonus/flick identities retain the existing association path.
+    No spatial exclusion or minimum interval between different notes is used.
+    """
+    if frame.image is None or not ordinary_tap(track) or not confirmed_tap_motion(track):
+        return False
+    last = track.observations[-1]
+    return (0 < frame.midpoint-last.timestamp <= .12
+            and candidate.box == last.candidate.box and candidate.center == last.center)
 
 
 def physical_order(tracks):
@@ -49,11 +62,6 @@ def retire_converged_shadows(tracks, frame, trace):
                and t.observations[-1].progress >= .78
                and not any(g in FLICK_GESTURES for g in t.direction_evidence)]
 
-    def collapsed(track):
-        obs = list(track.observations)
-        return any(b.progress >= .35 and b.candidate.box[2] * b.candidate.box[3]
-                   < .35 * a.candidate.box[2] * a.candidate.box[3] for a, b in zip(obs, obs[1:]))
-
     by_lane: dict[int, list] = {}
     for track in current:
         by_lane.setdefault(track.lane, []).append(track)
@@ -63,26 +71,16 @@ def retire_converged_shadows(tracks, frame, trace):
             for right in lane_tracks[index + 1:]:
                 if left.state == TrackState.LOST or right.state == TrackState.LOST:
                     continue
-                a, b = left.observations[-1], right.observations[-1]
-                if abs(a.progress - b.progress) > .025:
-                    continue
-                ax, ay, aw, ah = a.candidate.box
-                bx, by, bw, bh = b.candidate.box
-                overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
-                if overlap < .9 * min(aw * ah, bw * bh) or math.dist(a.center, b.center) > .2 * min(aw, ah, bw, bh):
-                    continue
                 for shadow, real in ((left, right), (right, left)):
-                    # A scheduled or physically started input may never be
-                    # cancelled as a "shadow": its event is already in (or has
-                    # left) the dispatch queue and cancelling the track would
-                    # silently drop a real note.
-                    if shadow.tap_input_started is not None or shadow.action_event_id:
-                        continue
-                    if collapsed(shadow) and not collapsed(real) and confirmed_tap_motion(real):
+                    # Queueing is not input acknowledgement. A contained,
+                    # corrupted shadow may be revoked until TouchDown starts;
+                    # every dispatch entry consults the same qualification.
+                    reason = duplicate_head_evidence(shadow, real, frame)
+                    if reason is not None and confirmed_tap_motion(real):
                         shadow.state = TrackState.LOST
                         trace.add('duplicate_shadow', frame=frame.sequence, time=frame.midpoint,
                                   cancelled=shadow.track_id, kept=real.track_id, lane=real.lane,
-                                  reason='contained-contour-with-prior-size-collapse')
+                                  reason=reason)
                         break
 
 
@@ -97,7 +95,11 @@ def associate_taps(tracks, entries, frame, config, safe_candidate, trace, owned=
     by_candidate = {}
     by_track = {}
     lookup = {t.track_id: t for t in tracks}
-    owned = owned or {}
+    # A recovery hint is not a zero-cost exemption from physical continuity.
+    # Reject the stale identity only; its moving candidate remains a legal birth.
+    owned = {index: tid for index, tid in (owned or {}).items()
+             if tid in lookup and (not lookup[tid].point_mode
+                 or identity_continuity_allowed(lookup[tid], *entries[index], frame))}
     reserved = set(owned.values())
     safe = {i: safe_candidate(*entry) for i, entry in enumerate(entries)}
     rejected = set()
@@ -113,15 +115,37 @@ def associate_taps(tracks, entries, frame, config, safe_candidate, trace, owned=
             # colour-classified sprite can never hijack an ordinary tap track.
             if (candidate.variant == 'flick') != track.flick:
                 continue
+            if (candidate.variant == 'flick' and track.flick_direction in FLICK_GESTURES
+                    and candidate.flick_direction in FLICK_GESTURES
+                    and candidate.flick_direction != track.flick_direction):
+                # Colour encodes direction and is stable throughout this
+                # sprite's flight. In particular a red left-flick cannot
+                # inherit the nearby stationary blue right-flick decoration.
+                continue
+            if safe[index] and repeated_head_pixels(track, candidate, frame):
+                costs[index, track.track_id] = 0.
+                by_candidate.setdefault(index, set()).add(track.track_id)
+                by_track.setdefault(track.track_id, set()).add(index)
+                continue
             if not identity_continuity_allowed(track, candidate, projection, frame):
                 continue
             previous = track.observations[-1]
-            expected = previous.progress + max(0., track.speed) * max(0., frame.midpoint - previous.timestamp)
+            association_time = max(previous.timestamp, track.tap_contour_seen_time or previous.timestamp)
+            expected = previous.progress + max(0., track.speed) * max(0., frame.midpoint - association_time)
             residual = projection.progress - expected
             if not (-0.04 <= residual <= max(0.04, config.association_progress_delta)
                     and projection.progress - previous.progress >= -0.03):
                 continue
             reason = discontinuity(track, projection.progress, frame.midpoint) if safe[index] else None
+            if reason is None and config.stationary_impostor_guard and track.speed > .10:
+                interval = frame.midpoint - previous.timestamp
+                if (interval > .05
+                        and projection.progress - previous.progress
+                        <= max(.004, track.speed * interval * .25)):
+                    # The candidate did not advance with a healthy moving
+                    # track: a stationary glyph/decor must not replace the
+                    # track's moving identity.
+                    reason = 'stationary-impostor'
             if reason:
                 if track.track_id not in rejected:
                     trace.add('tap_association_rejected', time=frame.midpoint, frame=frame.sequence,

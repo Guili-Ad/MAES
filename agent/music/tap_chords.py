@@ -16,7 +16,9 @@ class TapChord:
 
 def valid_tap_pair(left, right, sequence: int) -> bool:
     return bool(left is not None and right is not None
-                and left.gesture == right.gesture == NoteGesture.TAP
+                and (left.gesture == right.gesture == NoteGesture.TAP
+                     or (left.point_mode and right.point_mode
+                         and left.gesture == right.gesture == NoteGesture.HOLD_START))
                 and left.lane != right.lane
                 and left.linked_partner_id == right.track_id
                 and right.linked_partner_id == left.track_id
@@ -61,6 +63,16 @@ class TapChordManager:
                                    reason='incoherent-predictions',
                                    raw_hits=[left.predicted_hit_time, right.predicted_hit_time])
                 continue
+            advance = self.policy.action_advance_ms(left) / 1000.0
+            max_skew = self.policy.config.tap_chord_max_skew_ms / 1000.0
+            if max_skew > 0 and abs(left.predicted_hit_time - right.predicted_hit_time) > max_skew:
+                # Sharing one deadline would fire one side tens of ms off its
+                # own window; let both sides keep their independent timing.
+                if tid == members[0]:
+                    self.trace.add('chord_rejected', time=now, group=gid,
+                                   reason='skew-too-large',
+                                   raw_hits=[left.predicted_hit_time, right.predicted_hit_time])
+                continue
             live_groups.add(gid)
             member_events = [taps[m] for m in members]
             group = self.groups.get(gid)
@@ -72,12 +84,12 @@ class TapChordManager:
             if group.deadline <= now + 0.02:
                 group.frozen = True
             if not group.frozen:
-                group.deadline = (left.predicted_hit_time + right.predicted_hit_time) / 2. - self.policy.config.tap_action_advance_ms / 1000.
+                group.deadline = (left.predicted_hit_time + right.predicted_hit_time) / 2. - advance
                 group.frozen = group.deadline <= now + 0.02
             for member in member_events:
                 grouped[member.event_id] = replace(member, deadline=group.deadline,
                                                    tap_group_id=gid, tap_frozen=group.frozen,
-                                                   tap_reference_hit_time=group.deadline + self.policy.config.tap_action_advance_ms / 1000.)
+                                                   tap_reference_hit_time=group.deadline + advance)
             if old != (group.deadline, group.frozen) or any(e.tap_group_id != gid for e in member_events):
                 self.trace.add('chord', time=now, group=gid, members=members,
                                deadline=group.deadline, frozen=group.frozen)
@@ -98,7 +110,10 @@ class TapChordManager:
             updated = grouped.get(event.event_id)
             if updated is None:
                 frozen = event.tap_frozen or event.deadline <= now + 0.02
-                updated = replace(event, tap_group_id=None, tap_frozen=frozen)
+                # Track-less events (hold small notes) carry an explicit chord
+                # group; only track-backed taps are regrouped by linked pairs.
+                keep_group = event.tap_group_id if track is None else None
+                updated = replace(event, tap_group_id=keep_group, tap_frozen=frozen)
                 if not frozen and track is not None and track.predicted_hit_time is not None:
                     hit = self.policy.hit_time(track)
                     updated = replace(updated, deadline=hit - self.policy.action_advance_ms(track) / 1000.,

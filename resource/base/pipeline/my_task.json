@@ -122,7 +122,13 @@
                 "custom_action": "MusicPlay",
                 "custom_action_param": {
                     "lane_count": 7,
-                    "enable_holds": true
+                    "enable_holds": true,
+                    "hold_sustain_enabled": false,
+                    "hold_notes_as_taps": true,
+                    "coast_adaptive_speed": true,
+                    "stationary_zone_enabled": true,
+                    "stationary_impostor_guard": true,
+                    "split_stacked_notes": true
                 }
             }
         },

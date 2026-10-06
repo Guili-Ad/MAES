@@ -18,11 +18,14 @@ import argparse
 import json
 import subprocess
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from compare_optimization import equivalent
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / "runtime" / "python" / "python.exe"
-SYNTHETIC = ROOT / "temp" / "validation" / "tap-chord-v1" / "synthetic.jsonl"
-SYNTHETIC_ANNOTATIONS = ROOT / "temp" / "validation" / "tap-chord-v1" / "synthetic.annotations.json"
+SYNTHETIC = ROOT / "tests/fixtures/optimization/synthetic.jsonl"
+SYNTHETIC_ANNOTATIONS = ROOT / "tests/fixtures/optimization/synthetic.annotations.json"
 
 BEHAVIOR_KEYS = {
     "hold_contract": ["tests", "records", "errors"],
@@ -108,7 +111,7 @@ def main() -> int:
         for name, kind in (("hold-contract.json", "hold_contract"), ("replay-synthetic.json", "replay")):
             before = behavior_view(kind, load_json(base / name))
             after = behavior_view(kind, load_json(out / name))
-            if before != after:
+            if not equivalent(before, after):
                 ok = False
                 print(f"BEHAVIOR DIFF: {name}")
                 print("  before:", json.dumps(before, sort_keys=True, ensure_ascii=False)[:400])
