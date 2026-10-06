@@ -14,7 +14,6 @@
 
 ## 使用（普通用户）
 
-1. 本轮候选使用本地 `dist/MAES_PointIdentity_Refined_Candidate`，不上传或发布Release；历史发行包仍可从仓库Releases取得。
 2. 系统要求：Windows 10/11 x64；.NET Desktop Runtime 10；VC++ 2015-2022 Redistributable；安卓模拟器（支持 ADB）或实机设备。
    缺少运行库时，以管理员身份运行包内 `DependencySetup_依赖库安装_win.bat` 可自动安装。
 3. 打开 `MFAAvalonia.exe`，添加你的模拟器设备；确认设备“输入模式”为 Default（打歌必需）。
